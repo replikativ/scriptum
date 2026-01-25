@@ -290,6 +290,17 @@ basePath/                    -- trunk (main branch)
 
 Branches share base segments via read-only references. Only new writes create branch-specific segment files.
 
+## Technical Documentation
+
+See [docs/LUCENE_EXTENSION.md](docs/LUCENE_EXTENSION.md) for a deep-dive into how Scriptum extends Lucene:
+
+- How Lucene segments and commit points work
+- BranchedDirectory: overlay pattern for COW reads/writes
+- BranchDeletionPolicy: retaining all commits until explicit GC
+- BranchAwareMergePolicy: preventing merge of shared segments
+- Fork operation mechanics and performance analysis
+- GC with branch protection
+
 ## Project Structure
 
 ```
@@ -302,6 +313,8 @@ src/
     BranchedDirectory.java   # COW directory overlay
     BranchAwareMergePolicy.java  # Prevents merging shared segments
     BranchDeletionPolicy.java    # Retains all commits until GC
+docs/
+  LUCENE_EXTENSION.md        # Technical deep-dive
 test/scriptum/
   core_test.clj              # Unit tests
   yggdrasil_test.clj         # Compliance tests
