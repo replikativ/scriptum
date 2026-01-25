@@ -77,6 +77,16 @@ jobs:
       - run:
           name: Run tests
           command: clojure -M:test
+
+  build:
+    executor: clojure-java22
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Build JAR
+          command: clojure -T:build jar
       - persist_to_workspace:
           root: ~/
           paths:
@@ -139,6 +149,9 @@ workflows:
       - build-and-test:
           requires:
             - setup
+      - build:
+          requires:
+            - setup
       - deploy:
           context:
             - clojars-deploy
@@ -148,6 +161,7 @@ workflows:
           requires:
             - build-and-test
             - format
+            - build
       - release:
           context:
             - github-token
