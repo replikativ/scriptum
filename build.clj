@@ -50,6 +50,7 @@
 (defn deploy
   "Deploy to Clojars. Set CLOJARS_USERNAME and CLOJARS_PASSWORD env vars."
   [_]
+  (jar nil)
   (dd/deploy {:installer :remote
               :artifact jar-file
               :pom-file (b/pom-path {:lib lib :class-dir class-dir})}))
