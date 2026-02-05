@@ -13,6 +13,18 @@ Built on Lucene 10.3.2. Forking a branch takes 3-5ms regardless of index size by
 - **Fork**: Creates a new branch by copying segment metadata only (not data). Near-instant regardless of index size.
 - **GC**: Explicit garbage collection of old snapshots, respecting branch references to shared segments.
 
+## Cryptographic Hashing (Optional)
+
+Scriptum supports **optional SHA-512 merkle tree hashing** for content-addressable commits and tamper detection:
+
+- **Dual UUID System**: Each commit has both a random `commit-id` (Lucene internal) and a `content-hash` (merkle root)
+- **Content-Hash**: Computed as `hash(parent-content-hash + all-segment-file-hashes)` for complete integrity verification
+- **Tamper Detection**: Any file modification breaks the merkle chain
+- **Parent Chaining**: Content-hashes link to parent's content-hash (not commit-id) for true merkle tree
+- **Yggdrasil Integration**: Content-hash can be used as snapshot-id for distributed systems
+
+Enable with `:crypto-hash? true` when creating an index. Metadata stored in external `scriptum-hashes/*.json` files.
+
 ## API Layers
 
 | Layer | Namespace | Use Case |
@@ -53,13 +65,22 @@ clj -T:build compile-java
 ```clojure
 (require '[scriptum.core :as sc])
 
-;; Create an index
-(def writer (sc/create-index "/tmp/my-index"))
+;; Create an index (with optional crypto-hash for content-addressable commits)
+(def writer (sc/create-index "/tmp/my-index" "main" {:crypto-hash? true}))
 
 ;; Add documents
 (sc/add-doc writer {:title {:type :text :value "Hello World"}
                     :id    {:type :string :value "doc-1"}})
+
+;; Commit returns detailed info when crypto-hash enabled
 (sc/commit! writer "Initial commit")
+;; => {:generation 4
+;;     :commit-id "27e31528-909b-4bdc-a287-57ed2cec1e6a"
+;;     :content-hash "0903b0d6-418c-55b3-9e6b-2c910704edeb"}
+
+;; Verify commit integrity
+(sc/verify-commit writer)
+;; => {:valid? true, :commit-id "...", :errors []}
 
 ;; Search
 (sc/search writer {:match-all {}} 10)
@@ -91,11 +112,12 @@ clj -T:build compile-java
 ### Lifecycle
 
 ```clojure
-(sc/create-index path)              ; create new index at path
-(sc/open-branch path branch-name)   ; open existing branch
-(sc/fork writer "branch-name")      ; fast fork from writer
-(sc/close! writer)                  ; close writer and release resources
-(sc/discover-branches path)         ; => ["main" "feature" ...]
+(sc/create-index path branch-name)                    ; create new index at path
+(sc/create-index path branch-name {:crypto-hash? true}) ; with content-addressable commits
+(sc/open-branch path branch-name)                     ; open existing branch
+(sc/fork writer "branch-name")                        ; fast fork from writer
+(sc/close! writer)                                    ; close writer and release resources
+(sc/discover-branches path)                           ; => ["main" "feature" ...]
 
 ;; Accessors
 (sc/num-docs writer)                ; document count (excluding deletions)
@@ -122,7 +144,15 @@ Field types: `:text` (analyzed, searchable), `:string` (exact match), `:vector` 
 ### Commit & History
 
 ```clojure
-(sc/commit! writer "commit message")    ; persist changes
+;; Commit (returns generation number by default)
+(sc/commit! writer "commit message")    ; => 4
+
+;; With crypto-hash enabled, returns detailed map
+(sc/commit! writer "commit message")
+;; => {:generation 4
+;;     :commit-id "27e31528-..."
+;;     :content-hash "0903b0d6-..."}  ; merkle root
+
 (sc/flush! writer)                      ; flush without new commit point
 (sc/merge-from! writer source-writer)   ; merge segments from another branch
 
@@ -130,6 +160,30 @@ Field types: `:text` (analyzed, searchable), `:string` (exact match), `:vector` 
 ;; => [{:generation 1 :uuid "..." :timestamp "..." :message "..." :branch "main"}
 ;;     {:generation 2 :uuid "..." :timestamp "..." :message "..." :branch "main"}]
 ```
+
+### Cryptographic Verification
+
+When `:crypto-hash?` is enabled, you can verify commit integrity:
+
+```clojure
+;; Verify current commit
+(sc/verify-commit writer)
+;; => {:valid? true
+;;     :commit-id "27e31528-909b-4bdc-a287-57ed2cec1e6a"
+;;     :errors []}
+
+;; Verify specific generation
+(sc/verify-commit writer {:generation 5})
+;; => {:valid? false
+;;     :commit-id "..."
+;;     :errors ["Segment file not found: _0.cfs"]}
+
+;; Extract content-hash from commit result
+(let [{:keys [content-hash]} (sc/commit! writer "msg")]
+  (println "Snapshot ID:" content-hash))  ; Use as snapshot-id in Yggdrasil
+```
+
+**Note**: Verification recomputes hashes of all segment files and compares with stored metadata. Returns `:valid? true` only if all hashes match.
 
 ### Search
 
@@ -181,12 +235,19 @@ For Java users, `BranchIndexWriter` provides the complete API:
 ```java
 import org.replikativ.scriptum.BranchIndexWriter;
 import org.apache.lucene.document.*;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 
-// Create an index
-BranchIndexWriter main = BranchIndexWriter.create(Path.of("/tmp/my-index"), "main");
+// Create an index (with optional crypto-hash)
+BranchIndexWriter main = BranchIndexWriter.create(
+    Path.of("/tmp/my-index"),
+    "main",
+    new StandardAnalyzer(),
+    true  // enable crypto-hash for content-addressable commits
+);
 
 // Add documents
 Document doc = new Document();
@@ -194,6 +255,18 @@ doc.add(new TextField("title", "Hello World", Field.Store.YES));
 doc.add(new StringField("id", "doc-1", Field.Store.YES));
 main.addDocument(doc);
 main.commit("Initial commit");
+
+// Get content-hash and commit-id
+String contentHash = main.getLastContentHash();  // Merkle root (content-addressable)
+String commitId = main.getLastCommitId();        // Lucene's random UUID
+
+// Verify commit integrity
+Map<String, Object> result = main.verifyCommit(-1);  // -1 = current HEAD
+boolean valid = (Boolean) result.get("valid");
+if (!valid) {
+    List<String> errors = (List<String>) result.get("errors");
+    System.err.println("Integrity check failed: " + errors);
+}
 
 // Fork a branch (3-5ms regardless of index size)
 BranchIndexWriter feature = main.fork("experiment");
@@ -227,13 +300,16 @@ main.close();
 
 | Method | Description |
 |--------|-------------|
-| `create(path, branchName)` | Create new index |
+| `create(path, branchName, analyzer, cryptoHash)` | Create new index with optional crypto-hash |
 | `open(path, branchName)` | Open existing branch |
 | `fork(branchName)` | Fast fork (copies metadata only) |
 | `addDocument(doc)` | Add a document |
 | `deleteDocuments(terms...)` | Delete by terms |
 | `updateDocument(term, doc)` | Atomic delete+add |
 | `commit()` / `commit(message)` | Persist changes |
+| `getLastCommitId()` | Get last commit's UUID (Lucene internal) |
+| `getLastContentHash()` | Get last commit's merkle root (if crypto-hash enabled) |
+| `verifyCommit(generation)` | Verify commit integrity (returns Map with "valid", "errors") |
 | `openReader()` | NRT reader (sees uncommitted) |
 | `openCommittedReader()` | Reader on committed state |
 | `openReaderAt(generation)` | Time travel to specific commit |
@@ -282,6 +358,8 @@ On disk, scriptum uses this structure:
 basePath/                    -- trunk (main branch)
   _0.cfs, _1.cfs, ...       -- shared segment files
   segments_N                 -- main's commit points
+  scriptum-hashes/           -- crypto-hash metadata (if enabled)
+    <commit-uuid>.json       -- merkle tree data per commit
   branches/
     feature/                 -- branch overlay
       _10000.cfs, ...        -- branch-specific segments
@@ -289,6 +367,11 @@ basePath/                    -- trunk (main branch)
 ```
 
 Branches share base segments via read-only references. Only new writes create branch-specific segment files.
+
+When crypto-hash is enabled, each commit generates a JSON metadata file containing:
+- `content-hash`: The merkle root (content-addressable commit ID)
+- `parent-content-hash`: Parent commit's content-hash (for merkle chain)
+- `segments`: Map of segment names to file hashes (SHA-512 of each segment file)
 
 ## Technical Documentation
 
@@ -313,10 +396,12 @@ src/
     BranchedDirectory.java   # COW directory overlay
     BranchAwareMergePolicy.java  # Prevents merging shared segments
     BranchDeletionPolicy.java    # Retains all commits until GC
+    ContentHash.java         # SHA-512 hashing for merkle trees
 docs/
   LUCENE_EXTENSION.md        # Technical deep-dive
 test/scriptum/
   core_test.clj              # Unit tests
+  crypto_test.clj            # Crypto-hash integrity tests
   yggdrasil_test.clj         # Compliance tests
 ```
 
