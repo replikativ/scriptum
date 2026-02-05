@@ -4,3 +4,6 @@ target/
 .nrepl-port
 *.class
 .DS_Store
+CLAUDE.md
+.lsp/
+.clj-kondo/

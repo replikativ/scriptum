@@ -36,14 +36,16 @@
 
   Options:
     :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)
+    :crypto-hash? - enable merkle hashing for commits (default: false)
 
   Returns a BranchIndexWriter for the given branch."
   ([^String path ^String branch-name]
    (create-index path branch-name {}))
-  ([^String path ^String branch-name {:keys [analyzer]}]
+  ([^String path ^String branch-name {:keys [analyzer crypto-hash?]}]
    (let [base-path (->path path)
-         analyzer (or analyzer (StandardAnalyzer.))]
-     (BranchIndexWriter/create base-path branch-name analyzer))))
+         analyzer (or analyzer (StandardAnalyzer.))
+         crypto-hash (boolean crypto-hash?)]
+     (BranchIndexWriter/create base-path branch-name analyzer crypto-hash))))
 
 (defn open-branch
   "Open an existing branch writer (for out-of-process branch access).
@@ -125,11 +127,50 @@
   "Commit changes on a branch. Stores timestamp in commit user-data.
 
   Optional message is stored for history/log purposes.
-  Returns the commit generation."
+
+  Returns a map with:
+    :generation - the commit generation number
+    :commit-id - Lucene's internal commit UUID
+    :content-hash - content-addressable merkle root (only when :crypto-hash? enabled)
+
+  When :crypto-hash? is not enabled, returns just the generation number for backward compatibility."
   ([^BranchIndexWriter writer]
-   (.commit writer))
+   (commit! writer nil))
   ([^BranchIndexWriter writer ^String message]
-   (.commit writer message)))
+   (let [gen (if message
+               (.commit writer message)
+               (.commit writer))
+         commit-id (.getLastCommitId writer)
+         content-hash (.getLastContentHash writer)]
+     (if content-hash
+       {:generation gen
+        :commit-id commit-id
+        :content-hash content-hash}
+       gen))))
+
+(defn verify-commit
+  "Verify the cryptographic integrity of a commit by recomputing its merkle hash.
+
+  Requires that the index was created with :crypto-hash? true.
+
+  Options:
+    :generation - commit generation to verify (default: -1 for current HEAD)
+
+  Returns a map with:
+    :valid? - boolean indicating if verification passed
+    :commit-id - the commit UUID that was verified
+    :errors - vector of error messages (empty if valid)
+
+  Example:
+    (verify-commit writer)                    ; verify current commit
+    (verify-commit writer {:generation 5})    ; verify specific generation"
+  ([^BranchIndexWriter writer]
+   (verify-commit writer {}))
+  ([^BranchIndexWriter writer {:keys [generation] :or {generation -1}}]
+   (let [result (.verifyCommit writer (long generation))]
+     {:valid? (.get result "valid")
+      :commit-id (.get result "commitId")
+      :errors (vec (.get result "errors"))})))
 
 (defn flush!
   "Flush pending changes without committing (no durability, but NRT visible)."

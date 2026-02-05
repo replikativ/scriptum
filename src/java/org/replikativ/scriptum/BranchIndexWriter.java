@@ -2,11 +2,13 @@ package org.replikativ.scriptum;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -71,6 +73,8 @@ public class BranchIndexWriter implements Closeable {
   private static final String COMMIT_BRANCH_KEY = "scriptum.branch";
   private static final String COMMIT_UUID_KEY = "scriptum.uuid";
   private static final String COMMIT_PARENT_IDS_KEY = "scriptum.parent-ids";
+  private static final String COMMIT_CRYPTO_HASH_KEY = "scriptum.crypto-hash";
+  private static final String HASH_METADATA_DIR = "scriptum-hashes";
 
   private final IndexWriter writer;
   private final Directory directory;
@@ -80,15 +84,20 @@ public class BranchIndexWriter implements Closeable {
   private final Path basePath;
   private final Analyzer analyzer;
   private final boolean isMainBranch;
+  private final boolean cryptoHash;
 
   // Optional message for the next commit
   private volatile String pendingCommitMessage;
 
   // UUID of the last commit (for parent-id chain)
   private volatile String lastCommitId;
+  private volatile String lastContentHash; // Merkle root hash (when crypto-hash enabled)
 
   // Extra parent UUIDs for merge commits (set before commit, cleared after)
   private volatile String pendingExtraParentIds;
+
+  // Cache of segment name -> file hashes (for crypto-hash mode)
+  private final Map<String, Map<String, UUID>> segmentHashCache;
 
   private BranchIndexWriter(
       IndexWriter writer,
@@ -98,7 +107,8 @@ public class BranchIndexWriter implements Closeable {
       String branchName,
       Path basePath,
       Analyzer analyzer,
-      boolean isMainBranch) {
+      boolean isMainBranch,
+      boolean cryptoHash) {
     this.writer = writer;
     this.directory = directory;
     this.deletionPolicy = deletionPolicy;
@@ -107,6 +117,8 @@ public class BranchIndexWriter implements Closeable {
     this.basePath = basePath;
     this.analyzer = analyzer;
     this.isMainBranch = isMainBranch;
+    this.cryptoHash = cryptoHash;
+    this.segmentHashCache = cryptoHash ? new java.util.concurrent.ConcurrentHashMap<>() : null;
   }
 
   /** Initialize lastCommitId from the latest existing commit's UUID. */
@@ -130,7 +142,7 @@ public class BranchIndexWriter implements Closeable {
    * @return a new BranchIndexWriter
    */
   public static BranchIndexWriter create(Path basePath, String branchName) throws IOException {
-    return create(basePath, branchName, new StandardAnalyzer());
+    return create(basePath, branchName, new StandardAnalyzer(), false);
   }
 
   /**
@@ -146,6 +158,24 @@ public class BranchIndexWriter implements Closeable {
    */
   public static BranchIndexWriter create(Path basePath, String branchName, Analyzer analyzer)
       throws IOException {
+    return create(basePath, branchName, analyzer, false);
+  }
+
+  /**
+   * Create a new BranchIndexWriter with optional crypto-hash support.
+   *
+   * <p>When cryptoHash is true, commits use content-addressable merkle hashing where the commit
+   * UUID is derived from the hash of all segment file contents plus the parent commit hash. This
+   * enables tamper detection and auditability.
+   *
+   * @param basePath the root path for the index
+   * @param branchName the name of the branch
+   * @param analyzer the analyzer to use for text processing
+   * @param cryptoHash if true, use merkle hashing for commits
+   * @return a new BranchIndexWriter
+   */
+  public static BranchIndexWriter create(
+      Path basePath, String branchName, Analyzer analyzer, boolean cryptoHash) throws IOException {
     Files.createDirectories(basePath);
 
     Directory dir = MMapDirectory.open(basePath);
@@ -163,7 +193,8 @@ public class BranchIndexWriter implements Closeable {
 
     BranchIndexWriter biw =
         new BranchIndexWriter(
-            writer, dir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, true);
+            writer, dir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, true,
+            cryptoHash);
 
     // Initialize parent tracking from existing commits
     biw.initLastCommitId();
@@ -226,9 +257,19 @@ public class BranchIndexWriter implements Closeable {
 
     IndexWriter writer = new IndexWriter(branchDir, config);
 
+    // Detect crypto-hash from existing commits
+    boolean cryptoHash = false;
+    try {
+      Map<String, String> userData = branchInfos.getUserData();
+      cryptoHash = "true".equals(userData.get(COMMIT_CRYPTO_HASH_KEY));
+    } catch (Exception e) {
+      // No user data or error reading, default to false
+    }
+
     BranchIndexWriter biw =
         new BranchIndexWriter(
-            writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, false);
+            writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, false,
+            cryptoHash);
     biw.initLastCommitId();
     return biw;
   }
@@ -356,7 +397,7 @@ public class BranchIndexWriter implements Closeable {
     BranchIndexWriter forked =
         new BranchIndexWriter(
             newWriter, newBranchDir, newDeletionPolicy, newMergePolicy, newBranchName, basePath,
-            analyzer, false);
+            analyzer, false, this.cryptoHash);
     forked.lastCommitId = this.lastCommitId;
     return forked;
   }
@@ -414,12 +455,16 @@ public class BranchIndexWriter implements Closeable {
   /**
    * Set commit user-data (timestamp + message + branch + parents) on the writer.
    */
-  private String setCommitData(String message) {
+  private String setCommitData(String message) throws IOException {
     String uuid = UUID.randomUUID().toString();
     Map<String, String> userData = new LinkedHashMap<>();
+
     userData.put(COMMIT_UUID_KEY, uuid);
     userData.put(COMMIT_TIMESTAMP_KEY, Instant.now().toString());
     userData.put(COMMIT_BRANCH_KEY, branchName);
+    if (cryptoHash) {
+      userData.put(COMMIT_CRYPTO_HASH_KEY, "true");
+    }
     if (message != null && !message.isEmpty()) {
       userData.put(COMMIT_MESSAGE_KEY, message);
     }
@@ -447,11 +492,15 @@ public class BranchIndexWriter implements Closeable {
    * @return the commit generation
    */
   public long commit() throws IOException {
-    String uuid = setCommitData(pendingCommitMessage);
-    pendingCommitMessage = null;
-    long gen = writer.commit();
-    lastCommitId = uuid;
-    return gen;
+    if (cryptoHash) {
+      return commitWithCryptoHash(pendingCommitMessage);
+    } else {
+      String uuid = setCommitData(pendingCommitMessage);
+      pendingCommitMessage = null;
+      long gen = writer.commit();
+      lastCommitId = uuid;
+      return gen;
+    }
   }
 
   /**
@@ -461,11 +510,86 @@ public class BranchIndexWriter implements Closeable {
    * @return the commit generation
    */
   public long commit(String message) throws IOException {
-    String uuid = setCommitData(message);
+    if (cryptoHash) {
+      return commitWithCryptoHash(message);
+    } else {
+      String uuid = setCommitData(message);
+      pendingCommitMessage = null;
+      long gen = writer.commit();
+      lastCommitId = uuid;
+      return gen;
+    }
+  }
+
+  /**
+   * Commit with crypto-hash: first commit normally, then hash segments and store metadata.
+   *
+   * @param message commit message
+   * @return commit generation
+   */
+  private long commitWithCryptoHash(String message) throws IOException {
+    // Phase 1: Commit with Lucene's random UUID
+    String luceneUuid = setCommitData(message);
     pendingCommitMessage = null;
     long gen = writer.commit();
-    lastCommitId = uuid;
+    lastCommitId = luceneUuid;
+
+    // Phase 2: Compute complete merkle root
+    try {
+      SegmentInfos infos = SegmentInfos.readLatestCommit(directory);
+
+      // Step 1: Hash all segment files (leaf level of merkle tree)
+      Map<String, Map<String, UUID>> segmentHashes = new HashMap<>();
+      for (SegmentCommitInfo sci : infos) {
+        Map<String, UUID> fileHashes = getSegmentFileHashes(sci);
+        if (fileHashes != null) {
+          segmentHashes.put(sci.info.name, fileHashes);
+        }
+      }
+
+      // Step 2: Get parent's content-hash (not Lucene's random UUID!)
+      UUID parentContentHash = loadParentContentHash();
+
+      // Step 3: Compute merkle root = hash(parent-hash + all-segment-hashes)
+      UUID contentHash = ContentHash.computeCommitHash(parentContentHash, segmentHashes);
+
+      // Step 4: Store for API access
+      lastContentHash = contentHash.toString();
+
+      // Step 5: Store the mapping and merkle tree
+      storeContentHashMetadata(luceneUuid, contentHash, segmentHashes, parentContentHash);
+
+    } catch (IOException e) {
+      // Log error but don't fail the commit
+      System.err.println("Warning: Failed to store crypto-hash metadata: " + e.getMessage());
+    }
+
     return gen;
+  }
+
+  /**
+   * Load the content-hash of the parent commit (for merkle chain).
+   *
+   * @return parent's content-hash UUID, or null if no parent or parent didn't have crypto-hash
+   */
+  private UUID loadParentContentHash() throws IOException {
+    if (lastCommitId == null) {
+      return null; // Root commit, no parent
+    }
+
+    // Load previous commit's metadata
+    Map<String, Object> parentMetadata = loadSegmentHashMetadata(lastCommitId);
+    if (parentMetadata == null) {
+      return null; // Parent didn't have crypto-hash enabled
+    }
+
+    // Get the content-hash (NOT the lucene-id!)
+    String contentHashStr = (String) parentMetadata.get("content-hash");
+    if (contentHashStr == null) {
+      return null; // Old format without content-hash
+    }
+
+    return UUID.fromString(contentHashStr);
   }
 
   /** Flush pending changes without committing. */
@@ -579,20 +703,30 @@ public class BranchIndexWriter implements Closeable {
       throw new IOException("gc() can only be called on the main branch writer");
     }
 
-    Set<String> protectedFiles = collectBranchReferencedFiles(before);
+    Set<String> protectedCommitIds = new HashSet<>();
+    Set<String> protectedFiles = collectBranchReferencedFiles(before, protectedCommitIds);
     deletionPolicy.setGcCutoff(before, protectedFiles);
 
     String gcUuid = setCommitData("GC pass");
     writer.commit();
     lastCommitId = gcUuid;
 
+    // Cleanup old hash metadata files
+    protectedCommitIds.add(gcUuid); // Protect the GC commit itself
+    gcHashMetadataFiles(protectedCommitIds);
+
     return deletionPolicy.getLastGcDeleted();
   }
 
   /**
-   * Collect segment files referenced by branch commits within the grace window.
+   * Collect segment files and commit IDs referenced by branch commits within the grace window.
+   *
+   * @param before the cutoff timestamp
+   * @param protectedCommitIds output set to populate with protected commit UUIDs
+   * @return set of protected segment filenames
    */
-  private Set<String> collectBranchReferencedFiles(Instant before) throws IOException {
+  private Set<String> collectBranchReferencedFiles(Instant before, Set<String> protectedCommitIds)
+      throws IOException {
     Set<String> protectedFiles = new HashSet<>();
     Path branchesDir = basePath.resolve("branches");
     if (!Files.isDirectory(branchesDir)) {
@@ -633,6 +767,11 @@ public class BranchIndexWriter implements Closeable {
                   for (SegmentCommitInfo sci : infos) {
                     protectedFiles.addAll(sci.files());
                   }
+                  // Track commit UUID for hash metadata cleanup
+                  String commitUuid = infos.getUserData().get(COMMIT_UUID_KEY);
+                  if (commitUuid != null) {
+                    protectedCommitIds.add(commitUuid);
+                  }
                 }
               } catch (IOException e) {
                 // Corrupted commit point, skip
@@ -670,6 +809,15 @@ public class BranchIndexWriter implements Closeable {
   /** Returns the UUID of the last commit, or null if no commits yet. */
   public String getLastCommitId() {
     return lastCommitId;
+  }
+
+  /**
+   * Get the content-hash (merkle root) of the last commit.
+   *
+   * @return content-hash UUID as string, or null if crypto-hash not enabled or no commits yet
+   */
+  public String getLastContentHash() {
+    return lastContentHash;
   }
 
   /** Returns the branch name. */
@@ -715,6 +863,468 @@ public class BranchIndexWriter implements Closeable {
   /** Returns the deletion policy for this writer. */
   public BranchDeletionPolicy getDeletionPolicy() {
     return deletionPolicy;
+  }
+
+  // ============================================================================
+  // Crypto-hash Support
+  // ============================================================================
+
+  /**
+   * Get or compute hashes for all files in a segment.
+   *
+   * <p>Uses cache to avoid rehashing shared segments from parent commits.
+   */
+  private Map<String, UUID> getSegmentFileHashes(SegmentCommitInfo sci) throws IOException {
+    if (!cryptoHash) {
+      return null;
+    }
+
+    String segmentName = sci.info.name;
+
+    return segmentHashCache.computeIfAbsent(
+        segmentName,
+        k -> {
+          try {
+            // Check if we have this in parent commit
+            Map<String, UUID> parentHash = lookupParentSegmentHash(segmentName);
+            if (parentHash != null) {
+              return parentHash; // Reuse from parent (immutable segment)
+            }
+
+            // New segment - compute hash
+            Map<String, Path> filePaths = new LinkedHashMap<>();
+            for (String fileName : sci.files()) {
+              // For main branch, files are in basePath directly
+              // For other branches, check branch overlay first, then basePath
+              Path filePath;
+              if (isMainBranch) {
+                filePath = basePath.resolve(fileName);
+              } else {
+                filePath = basePath.resolve("branches").resolve(branchName).resolve(fileName);
+                if (!Files.exists(filePath)) {
+                  // Try base directory for shared segments
+                  filePath = basePath.resolve(fileName);
+                }
+              }
+
+              if (Files.exists(filePath)) {
+                filePaths.put(fileName, filePath);
+              }
+            }
+
+            return ContentHash.hashSegmentFiles(filePaths);
+          } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+          }
+        });
+  }
+
+  /**
+   * Look up segment hashes from parent commit.
+   *
+   * @return cached hashes if segment exists in parent, null otherwise
+   */
+  private Map<String, UUID> lookupParentSegmentHash(String segmentName) {
+    if (lastCommitId == null) {
+      return null;
+    }
+
+    try {
+      Map<String, Object> metadata = loadSegmentHashMetadata(lastCommitId);
+      if (metadata == null) {
+        return null;
+      }
+
+      @SuppressWarnings("unchecked")
+      Map<String, Map<String, UUID>> parentHashes =
+          (Map<String, Map<String, UUID>>) metadata.get("segments");
+      if (parentHashes == null) {
+        return null;
+      }
+
+      return parentHashes.get(segmentName);
+    } catch (IOException e) {
+      return null;
+    }
+  }
+
+  /**
+   * Store segment hashes in external metadata file.
+   *
+   * <p>File: basePath/scriptum-hashes/&lt;commit-uuid&gt;.json
+   */
+  /**
+   * Store content-hash metadata including merkle root and segment hashes.
+   *
+   * @param luceneUuid Lucene's random commit UUID
+   * @param contentHash The merkle root hash (content-addressable)
+   * @param segmentHashes Map of segment name -> file hashes
+   * @param parentContentHash Parent commit's content-hash (or null for root)
+   */
+  private void storeContentHashMetadata(
+      String luceneUuid,
+      UUID contentHash,
+      Map<String, Map<String, UUID>> segmentHashes,
+      UUID parentContentHash)
+      throws IOException {
+    Path hashDir = basePath.resolve(HASH_METADATA_DIR);
+    Files.createDirectories(hashDir);
+
+    Path hashFile = hashDir.resolve(luceneUuid + ".json");
+
+    // Build complete metadata JSON
+    Map<String, Object> metadata = new LinkedHashMap<>();
+    metadata.put("lucene-id", luceneUuid);
+    metadata.put("content-hash", contentHash.toString());
+    metadata.put("parent-content-hash", parentContentHash != null ? parentContentHash.toString() : null);
+    metadata.put("timestamp", Instant.now().toString());
+    metadata.put("segments", segmentHashes);
+
+    String json = encodeMetadataJson(metadata);
+    Files.writeString(hashFile, json, StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Load content-hash metadata from external file.
+   *
+   * @return metadata map with keys: lucene-id, content-hash, parent-content-hash, timestamp, segments
+   */
+  private Map<String, Object> loadSegmentHashMetadata(String commitUuid) throws IOException {
+    Path hashFile = basePath.resolve(HASH_METADATA_DIR).resolve(commitUuid + ".json");
+
+    if (!Files.exists(hashFile)) {
+      return null;
+    }
+
+    String json = Files.readString(hashFile, StandardCharsets.UTF_8);
+    return decodeMetadataJson(json);
+  }
+
+  /**
+   * Encode segment hashes to JSON.
+   *
+   * <p>Format: {"_0": {"_0.cfs": "uuid1", "_0.si": "uuid2"}, ...}
+   */
+  private String encodeSegmentHashesJson(Map<String, Map<String, UUID>> segmentHashes) {
+    StringBuilder sb = new StringBuilder("{");
+    boolean first = true;
+
+    for (Map.Entry<String, Map<String, UUID>> segEntry : segmentHashes.entrySet()) {
+      if (!first) sb.append(",");
+      first = false;
+
+      sb.append("\"").append(segEntry.getKey()).append("\":{");
+      boolean firstFile = true;
+
+      for (Map.Entry<String, UUID> fileEntry : segEntry.getValue().entrySet()) {
+        if (!firstFile) sb.append(",");
+        firstFile = false;
+
+        sb.append("\"")
+            .append(fileEntry.getKey())
+            .append("\":\"")
+            .append(fileEntry.getValue().toString())
+            .append("\"");
+      }
+      sb.append("}");
+    }
+    sb.append("}");
+
+    return sb.toString();
+  }
+
+  /**
+   * Decode segment hashes from JSON.
+   */
+  private Map<String, Map<String, UUID>> decodeSegmentHashesJson(String json) {
+    Map<String, Map<String, UUID>> result = new HashMap<>();
+
+    // Strip outer braces
+    json = json.substring(1, json.length() - 1).trim();
+    if (json.isEmpty()) {
+      return result;
+    }
+
+    // Simple JSON parsing
+    String[] segments = json.split("},");
+
+    for (String segmentPart : segments) {
+      int colonPos = segmentPart.indexOf("\":{");
+      if (colonPos < 0) continue;
+
+      String segName = segmentPart.substring(1, colonPos);
+      String filesJson = segmentPart.substring(colonPos + 3);
+
+      // Remove trailing }
+      if (filesJson.endsWith("}")) {
+        filesJson = filesJson.substring(0, filesJson.length() - 1);
+      }
+
+      // Parse file entries
+      Map<String, UUID> fileHashes = new HashMap<>();
+      String[] fileParts = filesJson.split(",");
+
+      for (String filePart : fileParts) {
+        String[] kv = filePart.split("\":\"");
+        if (kv.length == 2) {
+          String fileName = kv[0].substring(1);
+          String uuidStr = kv[1].replace("\"", "");
+          fileHashes.put(fileName, UUID.fromString(uuidStr));
+        }
+      }
+
+      result.put(segName, fileHashes);
+    }
+
+    return result;
+  }
+
+  /**
+   * Encode complete metadata to JSON (including content-hash).
+   *
+   * <p>Format: {"lucene-id": "...", "content-hash": "...", "parent-content-hash": "...",
+   * "timestamp": "...", "segments": {...}}
+   */
+  private String encodeMetadataJson(Map<String, Object> metadata) {
+    StringBuilder sb = new StringBuilder("{");
+
+    sb.append("\"lucene-id\":\"").append(metadata.get("lucene-id")).append("\",");
+    sb.append("\"content-hash\":\"").append(metadata.get("content-hash")).append("\",");
+
+    Object parentHash = metadata.get("parent-content-hash");
+    if (parentHash != null) {
+      sb.append("\"parent-content-hash\":\"").append(parentHash).append("\",");
+    } else {
+      sb.append("\"parent-content-hash\":null,");
+    }
+
+    sb.append("\"timestamp\":\"").append(metadata.get("timestamp")).append("\",");
+    sb.append("\"segments\":");
+
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, UUID>> segments =
+        (Map<String, Map<String, UUID>>) metadata.get("segments");
+    sb.append(encodeSegmentHashesJson(segments));
+
+    sb.append("}");
+    return sb.toString();
+  }
+
+  /**
+   * Decode complete metadata from JSON.
+   */
+  private Map<String, Object> decodeMetadataJson(String json) {
+    Map<String, Object> result = new HashMap<>();
+
+    // Extract top-level fields
+    String luceneId = extractJsonString(json, "lucene-id");
+    String contentHash = extractJsonString(json, "content-hash");
+    String parentHash = extractJsonString(json, "parent-content-hash");
+    String timestamp = extractJsonString(json, "timestamp");
+
+    if (luceneId != null) result.put("lucene-id", luceneId);
+    if (contentHash != null) result.put("content-hash", contentHash);
+    if (parentHash != null && !parentHash.equals("null")) result.put("parent-content-hash", parentHash);
+    if (timestamp != null) result.put("timestamp", timestamp);
+
+    // Extract segments object
+    int segmentsStart = json.indexOf("\"segments\":");
+    if (segmentsStart >= 0) {
+      String segmentsJson = json.substring(segmentsStart + 11);
+      // Find matching closing brace
+      int braceCount = 0;
+      int endPos = -1;
+      for (int i = 0; i < segmentsJson.length(); i++) {
+        char c = segmentsJson.charAt(i);
+        if (c == '{') braceCount++;
+        else if (c == '}') {
+          braceCount--;
+          if (braceCount == 0) {
+            endPos = i + 1;
+            break;
+          }
+        }
+      }
+      if (endPos > 0) {
+        String segmentsOnly = segmentsJson.substring(0, endPos);
+        Map<String, Map<String, UUID>> segments = decodeSegmentHashesJson(segmentsOnly);
+        result.put("segments", segments);
+      }
+    }
+
+    return result;
+  }
+
+  /** Helper to extract a JSON string value. */
+  private String extractJsonString(String json, String key) {
+    String pattern = "\"" + key + "\":\"";
+    int start = json.indexOf(pattern);
+    if (start < 0) {
+      // Try for null value
+      pattern = "\"" + key + "\":null";
+      if (json.indexOf(pattern) >= 0) {
+        return "null";
+      }
+      return null;
+    }
+    start += pattern.length();
+    int end = json.indexOf("\"", start);
+    if (end < 0) return null;
+    return json.substring(start, end);
+  }
+
+  /**
+   * Cleanup old hash metadata files during GC.
+   *
+   * @param protectedCommitIds Set of commit UUIDs to protect from deletion
+   */
+  private void gcHashMetadataFiles(Set<String> protectedCommitIds) throws IOException {
+    if (!cryptoHash) {
+      return;
+    }
+
+    Path hashDir = basePath.resolve(HASH_METADATA_DIR);
+    if (!Files.exists(hashDir)) {
+      return;
+    }
+
+    try (DirectoryStream<Path> stream = Files.newDirectoryStream(hashDir, "*.json")) {
+      for (Path hashFile : stream) {
+        String fileName = hashFile.getFileName().toString();
+        // Extract UUID from filename: 550e8400-....json
+        String commitId = fileName.substring(0, fileName.length() - 5);
+
+        if (!protectedCommitIds.contains(commitId)) {
+          Files.delete(hashFile);
+        }
+      }
+    }
+  }
+
+  /**
+   * Verify the integrity of a commit by recomputing its merkle hash.
+   *
+   * @param generation The commit generation to verify (-1 for current HEAD)
+   * @return Map with verification results: {valid: boolean, commitId: String, errors: List<String>}
+   * @throws IOException if commit cannot be read or crypto-hash is not enabled
+   */
+  public Map<String, Object> verifyCommit(long generation) throws IOException {
+    if (!cryptoHash) {
+      throw new IllegalStateException("Crypto-hash is not enabled for this index");
+    }
+
+    Map<String, Object> result = new HashMap<>();
+    List<String> errors = new ArrayList<>();
+
+    // Get the commit to verify
+    SegmentInfos infos;
+    if (generation < 0) {
+      infos = SegmentInfos.readLatestCommit(directory);
+    } else {
+      List<IndexCommit> commits = DirectoryReader.listCommits(directory);
+      IndexCommit commit = commits.stream()
+          .filter(c -> c.getGeneration() == generation)
+          .findFirst()
+          .orElseThrow(() -> new IOException("Commit generation " + generation + " not found"));
+      infos = SegmentInfos.readCommit(directory, commit.getSegmentsFileName());
+    }
+
+    Map<String, String> userData = infos.getUserData();
+    String commitUuid = userData.get(COMMIT_UUID_KEY);
+    result.put("commitId", commitUuid);
+
+    // Load stored metadata
+    Map<String, Object> metadata = loadSegmentHashMetadata(commitUuid);
+    if (metadata == null) {
+      errors.add("Hash metadata file not found for commit " + commitUuid);
+      result.put("valid", false);
+      result.put("errors", errors);
+      return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, UUID>> storedHashes =
+        (Map<String, Map<String, UUID>>) metadata.get("segments");
+    if (storedHashes == null) {
+      storedHashes = new HashMap<>();
+    }
+
+    // Recompute segment hashes
+    Map<String, Map<String, UUID>> computedHashes = new HashMap<>();
+
+    for (SegmentCommitInfo sci : infos) {
+      String segName = sci.info.name;
+      Map<String, Path> filePaths = new LinkedHashMap<>();
+
+      for (String fileName : sci.files()) {
+        // For main branch, files are in basePath directly
+        // For other branches, check branch overlay first, then basePath
+        Path filePath;
+        if (isMainBranch) {
+          filePath = basePath.resolve(fileName);
+        } else {
+          filePath = basePath.resolve("branches").resolve(branchName).resolve(fileName);
+          if (!Files.exists(filePath)) {
+            // Try base directory for shared segments
+            filePath = basePath.resolve(fileName);
+          }
+        }
+
+        if (Files.exists(filePath)) {
+          filePaths.put(fileName, filePath);
+        } else {
+          errors.add("Segment file not found: " + fileName);
+        }
+      }
+
+      if (!filePaths.isEmpty()) {
+        try {
+          Map<String, UUID> fileHashes = ContentHash.hashSegmentFiles(filePaths);
+          computedHashes.put(segName, fileHashes);
+        } catch (IOException e) {
+          errors.add("Failed to hash segment " + segName + ": " + e.getMessage());
+        }
+      }
+    }
+
+    // Compare stored vs computed hashes
+    for (Map.Entry<String, Map<String, UUID>> entry : storedHashes.entrySet()) {
+      String segName = entry.getKey();
+      Map<String, UUID> storedSegHashes = entry.getValue();
+      Map<String, UUID> computedSegHashes = computedHashes.get(segName);
+
+      if (computedSegHashes == null) {
+        errors.add("Segment " + segName + " missing in current commit");
+        continue;
+      }
+
+      for (Map.Entry<String, UUID> fileEntry : storedSegHashes.entrySet()) {
+        String fileName = fileEntry.getKey();
+        UUID storedHash = fileEntry.getValue();
+        UUID computedHash = computedSegHashes.get(fileName);
+
+        if (computedHash == null) {
+          errors.add("File " + fileName + " in segment " + segName + " is missing");
+        } else if (!storedHash.equals(computedHash)) {
+          errors.add(
+              "Hash mismatch for "
+                  + fileName
+                  + " in segment "
+                  + segName
+                  + ": expected "
+                  + storedHash
+                  + ", got "
+                  + computedHash);
+        }
+      }
+    }
+
+    // Note: Commit UUID is random (not content-addressed) in current implementation
+    // Verification only checks that segment hashes match stored metadata
+
+    result.put("valid", errors.isEmpty());
+    result.put("errors", errors);
+    return result;
   }
 
   @Override
