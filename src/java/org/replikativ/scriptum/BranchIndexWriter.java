@@ -750,13 +750,29 @@ public class BranchIndexWriter implements Closeable {
     Set<String> protectedFiles = collectBranchReferencedFiles(before, protectedCommitIds);
     deletionPolicy.setGcCutoff(before, protectedFiles);
 
-    String gcUuid = setCommitData("GC pass");
-    writer.commit();
-    lastCommitId = gcUuid;
+    // Use crypto-hash commit path so GC commit gets proper metadata
+    if (cryptoHash) {
+      commitWithCryptoHash("GC pass");
+    } else {
+      String gcUuid = setCommitData("GC pass");
+      writer.commit();
+      lastCommitId = gcUuid;
+    }
 
-    // Cleanup old hash metadata files
-    protectedCommitIds.add(gcUuid); // Protect the GC commit itself
-    gcHashMetadataFiles(protectedCommitIds);
+    // Collect surviving main branch commit IDs for hash metadata protection
+    if (cryptoHash) {
+      for (IndexCommit commit : deletionPolicy.getAllCommits()) {
+        try {
+          String uuid = commit.getUserData().get(COMMIT_UUID_KEY);
+          if (uuid != null) {
+            protectedCommitIds.add(uuid);
+          }
+        } catch (IOException e) {
+          // Skip unreadable commits
+        }
+      }
+      gcHashMetadataFiles(protectedCommitIds);
+    }
 
     return deletionPolicy.getLastGcDeleted();
   }
