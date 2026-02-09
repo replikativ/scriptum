@@ -10,12 +10,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
@@ -102,6 +105,11 @@ public class BranchIndexWriter implements Closeable {
 
   // Cache of segment name -> file hashes (for crypto-hash mode)
   private final Map<String, Map<String, UUID>> segmentHashCache;
+
+  // In-memory index of custom metadata key -> (value -> generation) for O(log n) lookups.
+  // Lazily populated on first query by scanning all commits once, then maintained incrementally.
+  private final Map<String, NavigableMap<String, Long>> metadataIndex = new HashMap<>();
+  private volatile boolean metadataIndexInitialized = false;
 
   private BranchIndexWriter(
       IndexWriter writer,
@@ -491,9 +499,23 @@ public class BranchIndexWriter implements Closeable {
   }
 
   /**
-   * Set commit user-data (timestamp + message + branch + parents) on the writer.
+   * Set commit user-data (timestamp + message + branch + parents + custom metadata) on the writer.
    */
   private String setCommitData(String message) throws IOException {
+    return setCommitData(message, null);
+  }
+
+  /**
+   * Set commit user-data with optional custom metadata entries.
+   *
+   * <p>Custom metadata keys must NOT use the "scriptum." prefix (reserved for internal use).
+   *
+   * @param message optional commit message
+   * @param customMetadata optional map of custom key-value pairs to store in commit user-data
+   * @return the generated commit UUID
+   */
+  private String setCommitData(String message, Map<String, String> customMetadata)
+      throws IOException {
     String uuid = UUID.randomUUID().toString();
     Map<String, String> userData = new LinkedHashMap<>();
 
@@ -520,6 +542,15 @@ public class BranchIndexWriter implements Closeable {
     if (parentIds.length() > 0) {
       userData.put(COMMIT_PARENT_IDS_KEY, parentIds.toString());
     }
+    // Merge custom metadata (after internal keys, so internal keys take precedence)
+    if (customMetadata != null) {
+      for (Map.Entry<String, String> entry : customMetadata.entrySet()) {
+        String key = entry.getKey();
+        if (!key.startsWith("scriptum.")) {
+          userData.put(key, entry.getValue());
+        }
+      }
+    }
     writer.setLiveCommitData(userData.entrySet());
     return uuid;
   }
@@ -530,15 +561,7 @@ public class BranchIndexWriter implements Closeable {
    * @return the commit generation
    */
   public long commit() throws IOException {
-    if (cryptoHash) {
-      return commitWithCryptoHash(pendingCommitMessage);
-    } else {
-      String uuid = setCommitData(pendingCommitMessage);
-      pendingCommitMessage = null;
-      long gen = writer.commit();
-      lastCommitId = uuid;
-      return gen;
-    }
+    return commit(pendingCommitMessage, null);
   }
 
   /**
@@ -548,13 +571,32 @@ public class BranchIndexWriter implements Closeable {
    * @return the commit generation
    */
   public long commit(String message) throws IOException {
+    return commit(message, null);
+  }
+
+  /**
+   * Commit with a message and custom metadata.
+   *
+   * <p>Custom metadata entries are stored in the commit's user-data alongside internal fields.
+   * Keys must NOT use the "scriptum." prefix (reserved for internal use). Values must be strings.
+   *
+   * <p>Example use case: storing a database transaction ID for secondary index synchronization.
+   *
+   * @param message the commit message (may be null)
+   * @param customMetadata optional map of custom key-value pairs (may be null)
+   * @return the commit generation
+   */
+  public long commit(String message, Map<String, String> customMetadata) throws IOException {
     if (cryptoHash) {
-      return commitWithCryptoHash(message);
+      long gen = commitWithCryptoHash(message, customMetadata);
+      updateMetadataIndex(customMetadata, gen);
+      return gen;
     } else {
-      String uuid = setCommitData(message);
+      String uuid = setCommitData(message, customMetadata);
       pendingCommitMessage = null;
       long gen = writer.commit();
       lastCommitId = uuid;
+      updateMetadataIndex(customMetadata, gen);
       return gen;
     }
   }
@@ -563,14 +605,16 @@ public class BranchIndexWriter implements Closeable {
    * Commit with crypto-hash: first commit normally, then hash segments and store metadata.
    *
    * @param message commit message
+   * @param customMetadata optional custom metadata
    * @return commit generation
    */
-  private long commitWithCryptoHash(String message) throws IOException {
+  private long commitWithCryptoHash(String message, Map<String, String> customMetadata)
+      throws IOException {
     // Save previous commit ID for parent chain lookup BEFORE overwriting
     String previousCommitId = lastCommitId;
 
     // Phase 1: Commit with Lucene's random UUID
-    String luceneUuid = setCommitData(message);
+    String luceneUuid = setCommitData(message, customMetadata);
     pendingCommitMessage = null;
     long gen = writer.commit();
     lastCommitId = luceneUuid;
@@ -670,33 +714,57 @@ public class BranchIndexWriter implements Closeable {
   /**
    * Open a reader at a specific commit point (snapshot/time-travel).
    *
+   * <p>Uses binary search on the sorted commit list for O(log n) lookup.
+   *
    * @param generation the commit generation to open
    * @return a DirectoryReader at that commit point
    * @throws IOException if the generation is not found (may have been GC'd)
    */
   public DirectoryReader openReaderAt(long generation) throws IOException {
-    for (IndexCommit commit : deletionPolicy.getAllCommits()) {
-      if (commit.getGeneration() == generation) {
-        return DirectoryReader.open(commit);
-      }
+    IndexCommit commit = findCommitByGeneration(generation);
+    if (commit == null) {
+      throw new IOException(
+          "Commit generation " + generation + " not found (may have been garbage collected)");
     }
-    throw new IOException(
-        "Commit generation " + generation + " not found (may have been garbage collected)");
+    return DirectoryReader.open(commit);
   }
 
   /**
    * Check if a specific commit generation is still available (not GC'd).
    *
+   * <p>Uses binary search for O(log n) lookup.
+   *
    * @param generation the commit generation to check
    * @return true if the commit is still retained, false if it has been GC'd
    */
   public boolean isCommitAvailable(long generation) {
-    for (IndexCommit commit : deletionPolicy.getAllCommits()) {
-      if (commit.getGeneration() == generation) {
-        return true;
+    return findCommitByGeneration(generation) != null;
+  }
+
+  /**
+   * Binary search for a commit by generation in the sorted commit list.
+   *
+   * <p>The commit list from BranchDeletionPolicy is guaranteed to be sorted by generation
+   * (ascending), so binary search is safe and gives O(log n) lookup.
+   *
+   * @param generation the commit generation to find
+   * @return the IndexCommit, or null if not found
+   */
+  private IndexCommit findCommitByGeneration(long generation) {
+    List<IndexCommit> commits = deletionPolicy.getAllCommits();
+    int lo = 0, hi = commits.size() - 1;
+    while (lo <= hi) {
+      int mid = (lo + hi) >>> 1;
+      long midGen = commits.get(mid).getGeneration();
+      if (midGen < generation) {
+        lo = mid + 1;
+      } else if (midGen > generation) {
+        hi = mid - 1;
+      } else {
+        return commits.get(mid);
       }
     }
-    return false;
+    return null;
   }
 
   /**
@@ -728,9 +796,119 @@ public class BranchIndexWriter implements Closeable {
         info.put("parentIds", userData.get(COMMIT_PARENT_IDS_KEY));
       }
 
+      // Expose custom (non-scriptum.) metadata
+      Map<String, String> customData = new LinkedHashMap<>();
+      for (Map.Entry<String, String> entry : userData.entrySet()) {
+        if (!entry.getKey().startsWith("scriptum.")) {
+          customData.put(entry.getKey(), entry.getValue());
+        }
+      }
+      if (!customData.isEmpty()) {
+        info.put("customMetadata", customData);
+      }
+
       snapshots.add(info);
     }
     return snapshots;
+  }
+
+  // ============================================================================
+  // Custom Metadata Index — O(log n) lookup for T→generation mapping
+  // ============================================================================
+
+  /**
+   * Lazily build the in-memory metadata index from all existing commits.
+   *
+   * <p>Scans all commits once (O(n)), reading userData from each. Subsequent commits are indexed
+   * incrementally in setCommitData(). After GC, the index is rebuilt to remove stale entries.
+   */
+  private synchronized void ensureMetadataIndex() throws IOException {
+    if (metadataIndexInitialized) {
+      return;
+    }
+    metadataIndex.clear();
+    for (IndexCommit commit : deletionPolicy.getAllCommits()) {
+      Map<String, String> userData = commit.getUserData();
+      long gen = commit.getGeneration();
+      for (Map.Entry<String, String> entry : userData.entrySet()) {
+        if (!entry.getKey().startsWith("scriptum.")) {
+          metadataIndex
+              .computeIfAbsent(entry.getKey(), k -> new TreeMap<>())
+              .put(entry.getValue(), gen);
+        }
+      }
+    }
+    metadataIndexInitialized = true;
+  }
+
+  /**
+   * Incrementally update the metadata index after a commit.
+   *
+   * @param customMetadata the custom metadata from the commit (may be null)
+   * @param generation the generation of the commit
+   */
+  private void updateMetadataIndex(Map<String, String> customMetadata, long generation) {
+    if (customMetadata == null || !metadataIndexInitialized) {
+      return;
+    }
+    synchronized (this) {
+      for (Map.Entry<String, String> entry : customMetadata.entrySet()) {
+        if (!entry.getKey().startsWith("scriptum.")) {
+          metadataIndex
+              .computeIfAbsent(entry.getKey(), k -> new TreeMap<>())
+              .put(entry.getValue(), generation);
+        }
+      }
+    }
+  }
+
+  /**
+   * Find the commit generation for an exact custom metadata value.
+   *
+   * <p>O(log n) lookup using the in-memory metadata index.
+   *
+   * @param key the custom metadata key (e.g. "datahike/tx")
+   * @param value the exact value to find
+   * @return the commit generation, or -1 if not found
+   */
+  public long findGenerationByMetadata(String key, String value) throws IOException {
+    ensureMetadataIndex();
+    NavigableMap<String, Long> index = metadataIndex.get(key);
+    if (index == null) {
+      return -1;
+    }
+    Long gen = index.get(value);
+    return gen != null ? gen : -1;
+  }
+
+  /**
+   * Find the commit generation for a custom metadata value using floor lookup.
+   *
+   * <p>Returns the generation of the latest commit whose metadata value for the given key is
+   * less than or equal to the target value (using natural string ordering). This is ideal for
+   * monotonically increasing values like transaction IDs.
+   *
+   * <p>O(log n) lookup using the in-memory metadata index.
+   *
+   * @param key the custom metadata key (e.g. "datahike/tx")
+   * @param value the target value (finds the latest entry &lt;= this value)
+   * @return a map with "generation" and "indexedValue", or null if no matching commit exists
+   */
+  public Map<String, Object> findGenerationFloorByMetadata(String key, String value)
+      throws IOException {
+    ensureMetadataIndex();
+    NavigableMap<String, Long> index = metadataIndex.get(key);
+    if (index == null) {
+      return null;
+    }
+    Map.Entry<String, Long> floor = index.floorEntry(value);
+    if (floor == null) {
+      return null;
+    }
+    Map<String, Object> result = new LinkedHashMap<>();
+    result.put("generation", floor.getValue());
+    result.put("indexedValue", floor.getKey());
+    return result;
   }
 
   /**
@@ -752,7 +930,7 @@ public class BranchIndexWriter implements Closeable {
 
     // Use crypto-hash commit path so GC commit gets proper metadata
     if (cryptoHash) {
-      commitWithCryptoHash("GC pass");
+      commitWithCryptoHash("GC pass", null);
     } else {
       String gcUuid = setCommitData("GC pass");
       writer.commit();
@@ -773,6 +951,9 @@ public class BranchIndexWriter implements Closeable {
       }
       gcHashMetadataFiles(protectedCommitIds);
     }
+
+    // Invalidate metadata index so it's rebuilt on next query
+    metadataIndexInitialized = false;
 
     return deletionPolicy.getLastGcDeleted();
   }

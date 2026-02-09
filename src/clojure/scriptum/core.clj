@@ -127,19 +127,26 @@
   "Commit changes on a branch. Stores timestamp in commit user-data.
 
   Optional message is stored for history/log purposes.
+  Optional metadata is a map of string keys to string values stored in commit user-data.
+  Metadata keys must NOT use the \"scriptum.\" prefix (reserved for internal use).
 
   Returns a map with:
     :generation - the commit generation number
     :commit-id - Lucene's internal commit UUID
     :content-hash - content-addressable merkle root (only when :crypto-hash? enabled)
 
-  When :crypto-hash? is not enabled, returns just the generation number for backward compatibility."
+  When :crypto-hash? is not enabled, returns just the generation number for backward compatibility.
+
+  Example with metadata (for secondary index sync):
+    (commit! writer \"Indexed tx\" {\"datahike.tx\" \"536870915\"})"
   ([^BranchIndexWriter writer]
    (commit! writer nil))
   ([^BranchIndexWriter writer ^String message]
-   (let [gen (if message
-               (.commit writer message)
-               (.commit writer))
+   (commit! writer message nil))
+  ([^BranchIndexWriter writer ^String message metadata]
+   (let [gen (.commit writer message
+                      (when metadata
+                        (java.util.HashMap. ^java.util.Map metadata)))
          commit-id (.getLastCommitId writer)
          content-hash (.getLastContentHash writer)]
      (if content-hash
@@ -225,16 +232,22 @@
   "List all available snapshots (commit points) for this branch.
 
   Returns a vector of maps with :generation, :snapshot-id, :timestamp,
-  :message, :branch, :segment-count, and :parent-ids."
+  :message, :branch, :segment-count, :parent-ids, and :custom-metadata.
+
+  :custom-metadata is a map of any non-scriptum keys stored in commit user-data."
   [^BranchIndexWriter writer]
   (mapv (fn [m]
-          {:generation (.get m "generation")
-           :snapshot-id (.get m "snapshotId")
-           :segment-count (.get m "segmentCount")
-           :timestamp (.get m "timestamp")
-           :message (.get m "message")
-           :branch (.get m "branch")
-           :parent-ids (.get m "parentIds")})
+          (let [base {:generation (.get m "generation")
+                      :snapshot-id (.get m "snapshotId")
+                      :segment-count (.get m "segmentCount")
+                      :timestamp (.get m "timestamp")
+                      :message (.get m "message")
+                      :branch (.get m "branch")
+                      :parent-ids (.get m "parentIds")}
+                custom (.get m "customMetadata")]
+            (if custom
+              (assoc base :custom-metadata (into {} custom))
+              base)))
         (.listSnapshots writer)))
 
 (defn open-reader-at
@@ -249,6 +262,28 @@
   "Check if a specific commit generation is still available (not GC'd)."
   [^BranchIndexWriter writer ^long generation]
   (.isCommitAvailable writer generation))
+
+(defn find-generation
+  "Find the commit generation matching a custom metadata key/value.
+
+  mode can be:
+    :exact - exact match (default)
+    :floor - latest commit whose metadata value <= target (for monotonic values like tx IDs)
+
+  Returns nil if no match, or a map with :generation (and :indexed-value for :floor mode).
+
+  Example:
+    (find-generation writer \"datahike/tx\" \"536870915\")
+    (find-generation writer \"datahike/tx\" \"536870915\" :floor)"
+  ([^BranchIndexWriter writer ^String key ^String value]
+   (find-generation writer key value :exact))
+  ([^BranchIndexWriter writer ^String key ^String value mode]
+   (case mode
+     :exact (let [gen (.findGenerationByMetadata writer key value)]
+              (when (>= gen 0) {:generation gen}))
+     :floor (when-let [result (.findGenerationFloorByMetadata writer key value)]
+              {:generation (.get result "generation")
+               :indexed-value (.get result "indexedValue")}))))
 
 (defn snapshot
   "Take an immutable snapshot (DirectoryReader) of the current branch.
