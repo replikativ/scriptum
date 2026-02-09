@@ -1,5 +1,7 @@
 package org.replikativ.scriptum;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -67,6 +69,8 @@ import org.apache.lucene.store.MMapDirectory;
  * </pre>
  */
 public class BranchIndexWriter implements Closeable {
+
+  private static final ObjectMapper JSON = new ObjectMapper();
 
   private static final String COMMIT_TIMESTAMP_KEY = "scriptum.timestamp";
   private static final String COMMIT_MESSAGE_KEY = "scriptum.message";
@@ -223,55 +227,72 @@ public class BranchIndexWriter implements Closeable {
     }
 
     Directory baseDir = MMapDirectory.open(basePath);
-    Directory overlayDir = MMapDirectory.open(branchPath);
-    BranchedDirectory branchDir = new BranchedDirectory(baseDir, overlayDir, branchName);
-
-    BranchDeletionPolicy deletionPolicy = new BranchDeletionPolicy();
-    BranchAwareMergePolicy mergePolicy =
-        new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
-
-    // Determine shared segments (those in base that this branch references)
-    SegmentInfos branchInfos = SegmentInfos.readLatestCommit(branchDir);
-    Set<String> sharedNames = new HashSet<>();
-    for (SegmentCommitInfo sci : branchInfos) {
-      // A segment is shared if its files exist in the base directory
-      try {
-        baseDir.fileLength(sci.info.name + ".cfs");
-        sharedNames.add(sci.info.name);
-      } catch (IOException e) {
-        // Check individual files for non-compound segments
-        try {
-          baseDir.fileLength(sci.info.name + ".si");
-          sharedNames.add(sci.info.name);
-        } catch (IOException e2) {
-          // Not in base, branch-specific
-        }
-      }
-    }
-    mergePolicy.setSharedSegmentNames(sharedNames);
-
-    IndexWriterConfig config = new IndexWriterConfig(analyzer);
-    config.setIndexDeletionPolicy(deletionPolicy);
-    config.setMergePolicy(mergePolicy);
-    config.setOpenMode(IndexWriterConfig.OpenMode.APPEND);
-
-    IndexWriter writer = new IndexWriter(branchDir, config);
-
-    // Detect crypto-hash from existing commits
-    boolean cryptoHash = false;
     try {
-      Map<String, String> userData = branchInfos.getUserData();
-      cryptoHash = "true".equals(userData.get(COMMIT_CRYPTO_HASH_KEY));
-    } catch (Exception e) {
-      // No user data or error reading, default to false
-    }
+      Directory overlayDir = MMapDirectory.open(branchPath);
+      try {
+        BranchedDirectory branchDir = new BranchedDirectory(baseDir, overlayDir, branchName);
+        // branchDir now owns baseDir and overlayDir (closes them in its close())
 
-    BranchIndexWriter biw =
-        new BranchIndexWriter(
-            writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, false,
-            cryptoHash);
-    biw.initLastCommitId();
-    return biw;
+        BranchDeletionPolicy deletionPolicy = new BranchDeletionPolicy();
+        BranchAwareMergePolicy mergePolicy =
+            new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
+
+        // Determine shared segments (those in base that this branch references)
+        SegmentInfos branchInfos = SegmentInfos.readLatestCommit(branchDir);
+        Set<String> sharedNames = new HashSet<>();
+        for (SegmentCommitInfo sci : branchInfos) {
+          // A segment is shared if its files exist in the base directory
+          try {
+            baseDir.fileLength(sci.info.name + ".cfs");
+            sharedNames.add(sci.info.name);
+          } catch (IOException e) {
+            // Check individual files for non-compound segments
+            try {
+              baseDir.fileLength(sci.info.name + ".si");
+              sharedNames.add(sci.info.name);
+            } catch (IOException e2) {
+              // Not in base, branch-specific
+            }
+          }
+        }
+        mergePolicy.setSharedSegmentNames(sharedNames);
+
+        IndexWriterConfig config = new IndexWriterConfig(analyzer);
+        config.setIndexDeletionPolicy(deletionPolicy);
+        config.setMergePolicy(mergePolicy);
+        config.setOpenMode(IndexWriterConfig.OpenMode.APPEND);
+
+        IndexWriter writer;
+        try {
+          writer = new IndexWriter(branchDir, config);
+        } catch (IOException e) {
+          branchDir.close();
+          throw e;
+        }
+
+        // Detect crypto-hash from existing commits
+        boolean cryptoHash = false;
+        try {
+          Map<String, String> userData = branchInfos.getUserData();
+          cryptoHash = "true".equals(userData.get(COMMIT_CRYPTO_HASH_KEY));
+        } catch (Exception e) {
+          // No user data or error reading, default to false
+        }
+
+        BranchIndexWriter biw =
+            new BranchIndexWriter(
+                writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer,
+                false, cryptoHash);
+        biw.initLastCommitId();
+        return biw;
+      } catch (IOException e) {
+        overlayDir.close();
+        throw e;
+      }
+    } catch (IOException e) {
+      baseDir.close();
+      throw e;
+    }
   }
 
   /** Convenience overload with StandardAnalyzer. */
@@ -364,42 +385,59 @@ public class BranchIndexWriter implements Closeable {
     Files.createDirectories(newOverlayPath);
 
     Directory baseDir = MMapDirectory.open(basePath);
-    Directory overlayDir = MMapDirectory.open(newOverlayPath);
-    BranchedDirectory newBranchDir = new BranchedDirectory(baseDir, overlayDir, newBranchName);
+    try {
+      Directory overlayDir = MMapDirectory.open(newOverlayPath);
+      try {
+        BranchedDirectory newBranchDir = new BranchedDirectory(baseDir, overlayDir, newBranchName);
+        // newBranchDir now owns baseDir and overlayDir
 
-    // 4. Clone SegmentInfos and bump counter to avoid segment name collisions
-    SegmentInfos cloned = currentInfos.clone();
-    cloned.counter = currentInfos.counter + 10000;
+        // 4. Clone SegmentInfos and bump counter to avoid segment name collisions
+        SegmentInfos cloned = currentInfos.clone();
+        cloned.counter = currentInfos.counter + 10000;
 
-    // 5. Write cloned SegmentInfos to new branch
-    cloned.commit(newBranchDir);
+        // 5. Write cloned SegmentInfos to new branch
+        cloned.commit(newBranchDir);
 
-    // 6. Track shared segments for merge policy (on both sides)
-    Set<String> sharedNames = new HashSet<>();
-    for (SegmentCommitInfo sci : currentInfos) {
-      sharedNames.add(sci.info.name);
+        // 6. Track shared segments for merge policy (on both sides)
+        Set<String> sharedNames = new HashSet<>();
+        for (SegmentCommitInfo sci : currentInfos) {
+          sharedNames.add(sci.info.name);
+        }
+        mergePolicy.setSharedSegmentNames(sharedNames);
+
+        // 7. Create new writer on the fork
+        BranchDeletionPolicy newDeletionPolicy = new BranchDeletionPolicy();
+        BranchAwareMergePolicy newMergePolicy =
+            new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
+        newMergePolicy.setSharedSegmentNames(sharedNames);
+
+        IndexWriterConfig newConfig = new IndexWriterConfig(analyzer);
+        newConfig.setIndexDeletionPolicy(newDeletionPolicy);
+        newConfig.setMergePolicy(newMergePolicy);
+        newConfig.setOpenMode(IndexWriterConfig.OpenMode.APPEND);
+
+        IndexWriter newWriter;
+        try {
+          newWriter = new IndexWriter(newBranchDir, newConfig);
+        } catch (IOException e) {
+          newBranchDir.close();
+          throw e;
+        }
+
+        BranchIndexWriter forked =
+            new BranchIndexWriter(
+                newWriter, newBranchDir, newDeletionPolicy, newMergePolicy, newBranchName, basePath,
+                analyzer, false, this.cryptoHash);
+        forked.lastCommitId = this.lastCommitId;
+        return forked;
+      } catch (IOException e) {
+        overlayDir.close();
+        throw e;
+      }
+    } catch (IOException e) {
+      baseDir.close();
+      throw e;
     }
-    mergePolicy.setSharedSegmentNames(sharedNames);
-
-    // 7. Create new writer on the fork
-    BranchDeletionPolicy newDeletionPolicy = new BranchDeletionPolicy();
-    BranchAwareMergePolicy newMergePolicy =
-        new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
-    newMergePolicy.setSharedSegmentNames(sharedNames);
-
-    IndexWriterConfig newConfig = new IndexWriterConfig(analyzer);
-    newConfig.setIndexDeletionPolicy(newDeletionPolicy);
-    newConfig.setMergePolicy(newMergePolicy);
-    newConfig.setOpenMode(IndexWriterConfig.OpenMode.APPEND);
-
-    IndexWriter newWriter = new IndexWriter(newBranchDir, newConfig);
-
-    BranchIndexWriter forked =
-        new BranchIndexWriter(
-            newWriter, newBranchDir, newDeletionPolicy, newMergePolicy, newBranchName, basePath,
-            analyzer, false, this.cryptoHash);
-    forked.lastCommitId = this.lastCommitId;
-    return forked;
   }
 
   /**
@@ -528,6 +566,9 @@ public class BranchIndexWriter implements Closeable {
    * @return commit generation
    */
   private long commitWithCryptoHash(String message) throws IOException {
+    // Save previous commit ID for parent chain lookup BEFORE overwriting
+    String previousCommitId = lastCommitId;
+
     // Phase 1: Commit with Lucene's random UUID
     String luceneUuid = setCommitData(message);
     pendingCommitMessage = null;
@@ -548,7 +589,7 @@ public class BranchIndexWriter implements Closeable {
       }
 
       // Step 2: Get parent's content-hash (not Lucene's random UUID!)
-      UUID parentContentHash = loadParentContentHash();
+      UUID parentContentHash = loadParentContentHash(previousCommitId);
 
       // Step 3: Compute merkle root = hash(parent-hash + all-segment-hashes)
       UUID contentHash = ContentHash.computeCommitHash(parentContentHash, segmentHashes);
@@ -560,8 +601,9 @@ public class BranchIndexWriter implements Closeable {
       storeContentHashMetadata(luceneUuid, contentHash, segmentHashes, parentContentHash);
 
     } catch (IOException e) {
-      // Log error but don't fail the commit
+      // Log error but don't fail the commit - the Lucene commit already succeeded
       System.err.println("Warning: Failed to store crypto-hash metadata: " + e.getMessage());
+      lastContentHash = null;
     }
 
     return gen;
@@ -570,15 +612,16 @@ public class BranchIndexWriter implements Closeable {
   /**
    * Load the content-hash of the parent commit (for merkle chain).
    *
+   * @param parentCommitId the Lucene UUID of the parent commit
    * @return parent's content-hash UUID, or null if no parent or parent didn't have crypto-hash
    */
-  private UUID loadParentContentHash() throws IOException {
-    if (lastCommitId == null) {
+  private UUID loadParentContentHash(String parentCommitId) throws IOException {
+    if (parentCommitId == null) {
       return null; // Root commit, no parent
     }
 
     // Load previous commit's metadata
-    Map<String, Object> parentMetadata = loadSegmentHashMetadata(lastCommitId);
+    Map<String, Object> parentMetadata = loadSegmentHashMetadata(parentCommitId);
     if (parentMetadata == null) {
       return null; // Parent didn't have crypto-hash enabled
     }
@@ -949,11 +992,6 @@ public class BranchIndexWriter implements Closeable {
   }
 
   /**
-   * Store segment hashes in external metadata file.
-   *
-   * <p>File: basePath/scriptum-hashes/&lt;commit-uuid&gt;.json
-   */
-  /**
    * Store content-hash metadata including merkle root and segment hashes.
    *
    * @param luceneUuid Lucene's random commit UUID
@@ -1001,176 +1039,77 @@ public class BranchIndexWriter implements Closeable {
   }
 
   /**
-   * Encode segment hashes to JSON.
+   * Encode complete metadata to JSON using Jackson.
    *
-   * <p>Format: {"_0": {"_0.cfs": "uuid1", "_0.si": "uuid2"}, ...}
+   * <p>Converts UUID values to strings for JSON serialization.
    */
-  private String encodeSegmentHashesJson(Map<String, Map<String, UUID>> segmentHashes) {
-    StringBuilder sb = new StringBuilder("{");
-    boolean first = true;
-
-    for (Map.Entry<String, Map<String, UUID>> segEntry : segmentHashes.entrySet()) {
-      if (!first) sb.append(",");
-      first = false;
-
-      sb.append("\"").append(segEntry.getKey()).append("\":{");
-      boolean firstFile = true;
-
-      for (Map.Entry<String, UUID> fileEntry : segEntry.getValue().entrySet()) {
-        if (!firstFile) sb.append(",");
-        firstFile = false;
-
-        sb.append("\"")
-            .append(fileEntry.getKey())
-            .append("\":\"")
-            .append(fileEntry.getValue().toString())
-            .append("\"");
-      }
-      sb.append("}");
-    }
-    sb.append("}");
-
-    return sb.toString();
-  }
-
-  /**
-   * Decode segment hashes from JSON.
-   */
-  private Map<String, Map<String, UUID>> decodeSegmentHashesJson(String json) {
-    Map<String, Map<String, UUID>> result = new HashMap<>();
-
-    // Strip outer braces
-    json = json.substring(1, json.length() - 1).trim();
-    if (json.isEmpty()) {
-      return result;
-    }
-
-    // Simple JSON parsing
-    String[] segments = json.split("},");
-
-    for (String segmentPart : segments) {
-      int colonPos = segmentPart.indexOf("\":{");
-      if (colonPos < 0) continue;
-
-      String segName = segmentPart.substring(1, colonPos);
-      String filesJson = segmentPart.substring(colonPos + 3);
-
-      // Remove trailing }
-      if (filesJson.endsWith("}")) {
-        filesJson = filesJson.substring(0, filesJson.length() - 1);
-      }
-
-      // Parse file entries
-      Map<String, UUID> fileHashes = new HashMap<>();
-      String[] fileParts = filesJson.split(",");
-
-      for (String filePart : fileParts) {
-        String[] kv = filePart.split("\":\"");
-        if (kv.length == 2) {
-          String fileName = kv[0].substring(1);
-          String uuidStr = kv[1].replace("\"", "");
-          fileHashes.put(fileName, UUID.fromString(uuidStr));
-        }
-      }
-
-      result.put(segName, fileHashes);
-    }
-
-    return result;
-  }
-
-  /**
-   * Encode complete metadata to JSON (including content-hash).
-   *
-   * <p>Format: {"lucene-id": "...", "content-hash": "...", "parent-content-hash": "...",
-   * "timestamp": "...", "segments": {...}}
-   */
-  private String encodeMetadataJson(Map<String, Object> metadata) {
-    StringBuilder sb = new StringBuilder("{");
-
-    sb.append("\"lucene-id\":\"").append(metadata.get("lucene-id")).append("\",");
-    sb.append("\"content-hash\":\"").append(metadata.get("content-hash")).append("\",");
+  private String encodeMetadataJson(Map<String, Object> metadata) throws IOException {
+    // Convert UUID values to strings for JSON
+    Map<String, Object> jsonMap = new LinkedHashMap<>();
+    jsonMap.put("lucene-id", metadata.get("lucene-id"));
+    jsonMap.put("content-hash", String.valueOf(metadata.get("content-hash")));
 
     Object parentHash = metadata.get("parent-content-hash");
-    if (parentHash != null) {
-      sb.append("\"parent-content-hash\":\"").append(parentHash).append("\",");
-    } else {
-      sb.append("\"parent-content-hash\":null,");
-    }
+    jsonMap.put("parent-content-hash", parentHash != null ? parentHash.toString() : null);
 
-    sb.append("\"timestamp\":\"").append(metadata.get("timestamp")).append("\",");
-    sb.append("\"segments\":");
+    jsonMap.put("timestamp", String.valueOf(metadata.get("timestamp")));
 
+    // Convert segment hashes: Map<String, Map<String, UUID>> -> Map<String, Map<String, String>>
     @SuppressWarnings("unchecked")
     Map<String, Map<String, UUID>> segments =
         (Map<String, Map<String, UUID>>) metadata.get("segments");
-    sb.append(encodeSegmentHashesJson(segments));
+    Map<String, Map<String, String>> segStrings = new LinkedHashMap<>();
+    if (segments != null) {
+      for (Map.Entry<String, Map<String, UUID>> segEntry : segments.entrySet()) {
+        Map<String, String> fileStrings = new LinkedHashMap<>();
+        for (Map.Entry<String, UUID> fileEntry : segEntry.getValue().entrySet()) {
+          fileStrings.put(fileEntry.getKey(), fileEntry.getValue().toString());
+        }
+        segStrings.put(segEntry.getKey(), fileStrings);
+      }
+    }
+    jsonMap.put("segments", segStrings);
 
-    sb.append("}");
-    return sb.toString();
+    return JSON.writerWithDefaultPrettyPrinter().writeValueAsString(jsonMap);
   }
 
   /**
-   * Decode complete metadata from JSON.
+   * Decode complete metadata from JSON using Jackson.
+   *
+   * <p>Converts string values back to UUIDs for segment hashes.
    */
-  private Map<String, Object> decodeMetadataJson(String json) {
+  private Map<String, Object> decodeMetadataJson(String json) throws IOException {
+    Map<String, Object> raw =
+        JSON.readValue(json, new TypeReference<Map<String, Object>>() {});
+
     Map<String, Object> result = new HashMap<>();
 
-    // Extract top-level fields
-    String luceneId = extractJsonString(json, "lucene-id");
-    String contentHash = extractJsonString(json, "content-hash");
-    String parentHash = extractJsonString(json, "parent-content-hash");
-    String timestamp = extractJsonString(json, "timestamp");
+    if (raw.containsKey("lucene-id")) result.put("lucene-id", raw.get("lucene-id"));
+    if (raw.containsKey("content-hash")) result.put("content-hash", raw.get("content-hash"));
+    if (raw.containsKey("timestamp")) result.put("timestamp", raw.get("timestamp"));
 
-    if (luceneId != null) result.put("lucene-id", luceneId);
-    if (contentHash != null) result.put("content-hash", contentHash);
-    if (parentHash != null && !parentHash.equals("null")) result.put("parent-content-hash", parentHash);
-    if (timestamp != null) result.put("timestamp", timestamp);
+    Object parentHash = raw.get("parent-content-hash");
+    if (parentHash != null) {
+      result.put("parent-content-hash", parentHash.toString());
+    }
 
-    // Extract segments object
-    int segmentsStart = json.indexOf("\"segments\":");
-    if (segmentsStart >= 0) {
-      String segmentsJson = json.substring(segmentsStart + 11);
-      // Find matching closing brace
-      int braceCount = 0;
-      int endPos = -1;
-      for (int i = 0; i < segmentsJson.length(); i++) {
-        char c = segmentsJson.charAt(i);
-        if (c == '{') braceCount++;
-        else if (c == '}') {
-          braceCount--;
-          if (braceCount == 0) {
-            endPos = i + 1;
-            break;
-          }
+    // Convert segments: Map<String, Map<String, String>> -> Map<String, Map<String, UUID>>
+    @SuppressWarnings("unchecked")
+    Map<String, Map<String, String>> segStrings =
+        (Map<String, Map<String, String>>) raw.get("segments");
+    if (segStrings != null) {
+      Map<String, Map<String, UUID>> segments = new HashMap<>();
+      for (Map.Entry<String, Map<String, String>> segEntry : segStrings.entrySet()) {
+        Map<String, UUID> fileHashes = new HashMap<>();
+        for (Map.Entry<String, String> fileEntry : segEntry.getValue().entrySet()) {
+          fileHashes.put(fileEntry.getKey(), UUID.fromString(fileEntry.getValue()));
         }
+        segments.put(segEntry.getKey(), fileHashes);
       }
-      if (endPos > 0) {
-        String segmentsOnly = segmentsJson.substring(0, endPos);
-        Map<String, Map<String, UUID>> segments = decodeSegmentHashesJson(segmentsOnly);
-        result.put("segments", segments);
-      }
+      result.put("segments", segments);
     }
 
     return result;
-  }
-
-  /** Helper to extract a JSON string value. */
-  private String extractJsonString(String json, String key) {
-    String pattern = "\"" + key + "\":\"";
-    int start = json.indexOf(pattern);
-    if (start < 0) {
-      // Try for null value
-      pattern = "\"" + key + "\":null";
-      if (json.indexOf(pattern) >= 0) {
-        return "null";
-      }
-      return null;
-    }
-    start += pattern.length();
-    int end = json.indexOf("\"", start);
-    if (end < 0) return null;
-    return json.substring(start, end);
   }
 
   /**

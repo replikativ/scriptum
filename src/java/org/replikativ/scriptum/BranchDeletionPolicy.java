@@ -21,9 +21,19 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
 
   private static final String TIMESTAMP_KEY = "scriptum.timestamp";
 
+  /** Immutable holder for GC parameters, set atomically via volatile. */
+  private static final class GcConfig {
+    final Instant cutoff;
+    final Set<String> protectedFiles;
+
+    GcConfig(Instant cutoff, Set<String> protectedFiles) {
+      this.cutoff = cutoff;
+      this.protectedFiles = protectedFiles;
+    }
+  }
+
   private volatile List<IndexCommit> commitSnapshot = Collections.emptyList();
-  private volatile Instant gcCutoff;
-  private volatile Set<String> gcProtectedFiles;
+  private volatile GcConfig pendingGc;
   private volatile int lastGcDeleted;
 
   public BranchDeletionPolicy() {}
@@ -35,17 +45,16 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
 
   @Override
   public void onCommit(List<? extends IndexCommit> commits) throws IOException {
-    Instant cutoff = this.gcCutoff;
-    Set<String> protectedFiles = this.gcProtectedFiles;
-    if (cutoff != null && protectedFiles != null) {
+    GcConfig gc = this.pendingGc;
+    if (gc != null) {
       lastGcDeleted = 0;
       List<IndexCommit> surviving = new ArrayList<>();
       for (int i = 0; i < commits.size(); i++) {
         IndexCommit commit = commits.get(i);
         boolean isLast = (i == commits.size() - 1);
         if (!isLast
-            && isBeforeCutoff(commit, cutoff)
-            && !hasProtectedFiles(commit, protectedFiles)) {
+            && isBeforeCutoff(commit, gc.cutoff)
+            && !hasProtectedFiles(commit, gc.protectedFiles)) {
           commit.delete();
           lastGcDeleted++;
         } else {
@@ -53,16 +62,15 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
         }
       }
       commitSnapshot = Collections.unmodifiableList(surviving);
-      this.gcCutoff = null;
-      this.gcProtectedFiles = null;
+      this.pendingGc = null;
     } else {
       commitSnapshot = Collections.unmodifiableList(new ArrayList<>(commits));
     }
   }
 
   public void setGcCutoff(Instant before, Set<String> protectedFiles) {
-    this.gcProtectedFiles = Collections.unmodifiableSet(new HashSet<>(protectedFiles));
-    this.gcCutoff = before;
+    this.pendingGc =
+        new GcConfig(before, Collections.unmodifiableSet(new HashSet<>(protectedFiles)));
   }
 
   public int getLastGcDeleted() {
