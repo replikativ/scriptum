@@ -428,4 +428,4 @@ clj -T:build compile-java && clj -M:repl
 
 Copyright (c) 2026 Christian Weilbach
 
-Licensed under the Eclipse Public License 2.0.
+Licensed under the Apache License, Version 2.0.
