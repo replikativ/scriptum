@@ -11,7 +11,7 @@
 
 (defn- temp-dir []
   (str (Files/createTempDirectory "scriptum-test-"
-         (make-array FileAttribute 0))))
+                                  (make-array FileAttribute 0))))
 
 (defn- delete-dir-recursive [path]
   (let [dir (java.io.File. path)]

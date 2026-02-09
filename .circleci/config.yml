@@ -37,7 +37,7 @@ jobs:
             - v1-dependencies-
       - run:
           name: Download dependencies
-          command: clojure -P -M:test:build
+          command: clojure -P -M:test:build:format
       - save_cache:
           paths:
             - ~/.m2
@@ -57,13 +57,7 @@ jobs:
       - install-clojure
       - run:
           name: Check code formatting
-          command: |
-            # Skip format check if no cljfmt configured
-            if clojure -M:format 2>/dev/null; then
-              echo "Format check passed"
-            else
-              echo "No format alias configured, skipping"
-            fi
+          command: clojure -M:format
 
   build-and-test:
     executor: clojure-java22

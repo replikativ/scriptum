@@ -128,7 +128,7 @@
   (testing "UUID5 version and variant bits are correctly set"
     (let [test-cases ["test" "another test" "yet another" ""]
           test-uuids (map #(ContentHash/hashBytes (.getBytes % StandardCharsets/UTF_8))
-                         test-cases)]
+                          test-cases)]
 
       (doseq [uuid test-uuids]
         ;; Check version = 5

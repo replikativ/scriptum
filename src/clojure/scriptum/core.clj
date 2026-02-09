@@ -14,11 +14,11 @@
            [org.apache.lucene.analysis Analyzer]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
            [org.apache.lucene.document Document Field$Store TextField StringField
-                                       KnnFloatVectorField]
+            KnnFloatVectorField]
            [org.apache.lucene.index DirectoryReader IndexableField Term]
            [org.apache.lucene.search IndexSearcher TermQuery BooleanQuery
-                                     BooleanClause$Occur TopDocs ScoreDoc
-                                     MatchAllDocsQuery KnnFloatVectorQuery]
+            BooleanClause$Occur TopDocs ScoreDoc
+            MatchAllDocsQuery KnnFloatVectorQuery]
            [org.apache.lucene.store FSDirectory]
            [org.replikativ.scriptum BranchIndexWriter BranchedDirectory]))
 
@@ -211,9 +211,9 @@
                (let [doc (.storedFields searcher)
                      stored (.document doc (.-doc sd))
                      field-map (into {}
-                                 (map (fn [^IndexableField f]
-                                        [(.name f) (.stringValue f)]))
-                                 (.getFields stored))]
+                                     (map (fn [^IndexableField f]
+                                            [(.name f) (.stringValue f)]))
+                                     (.getFields stored))]
                  (assoc field-map
                         :doc-id (.-doc sd)
                         :score (.-score sd))))

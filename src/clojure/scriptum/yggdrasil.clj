@@ -30,20 +30,20 @@
   "Build a map of snapshot-id -> snapshot-info from a writer's snapshots."
   [^BranchIndexWriter writer]
   (into {}
-    (map (fn [s]
-           [(:snapshot-id s)
-            (-> s
-                (update :parent-ids parse-parent-ids))]))
-    (pl/list-snapshots writer)))
+        (map (fn [s]
+               [(:snapshot-id s)
+                (-> s
+                    (update :parent-ids parse-parent-ids))]))
+        (pl/list-snapshots writer)))
 
 (defn- all-snapshots
   "Collect snapshot maps from all writers, keyed by snapshot-id."
   [writers]
   (reduce-kv
-    (fn [acc _branch-name writer]
-      (merge acc (snapshot-index writer)))
-    {}
-    writers))
+   (fn [acc _branch-name writer]
+     (merge acc (snapshot-index writer)))
+   {}
+   writers))
 
 (defn- walk-ancestors
   "Walk parent chain from snap-id, collecting all ancestor IDs."
@@ -192,15 +192,15 @@
   (commit-graph [_ _opts]
     (let [index (all-snapshots writers)
           branch-heads (into {}
-                         (map (fn [[bname writer]]
-                                [(keyword bname)
-                                 (.getLastCommitId writer)]))
-                         writers)]
+                             (map (fn [[bname writer]]
+                                    [(keyword bname)
+                                     (.getLastCommitId writer)]))
+                             writers)]
       {:nodes (into {}
-                (map (fn [[id info]]
-                       [id {:parent-ids (:parent-ids info)
-                            :meta (select-keys info [:timestamp :message :branch])}]))
-                index)
+                    (map (fn [[id info]]
+                           [id {:parent-ids (:parent-ids info)
+                                :meta (select-keys info [:timestamp :message :branch])}]))
+                    index)
        :branches branch-heads
        :roots (set (filter #(empty? (get-in index [% :parent-ids])) (keys index)))}))
 
@@ -253,10 +253,10 @@
   ([^String path opts]
    (let [writer (pl/create-index path "main" (select-keys opts [:analyzer]))]
      (->ScriptumSystem
-       path
-       {"main" writer}
-       "main"
-       (:system-name opts)))))
+      path
+      {"main" writer}
+      "main"
+      (:system-name opts)))))
 
 (defn close!
   "Close the system and all its branch writers."
