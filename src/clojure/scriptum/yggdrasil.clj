@@ -11,7 +11,8 @@
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [clojure.string :as str])
-  (:import [org.replikativ.scriptum BranchIndexWriter]))
+  (:import [org.replikativ.scriptum BranchIndexWriter]
+           [java.time Instant]))
 
 (defn- parse-parent-ids
   "Parse comma-separated UUID string into a set of strings."
@@ -83,7 +84,7 @@
   (system-id [_] (or system-name (str "scriptum:" base-path)))
   (system-type [_] :scriptum)
   (capabilities [_]
-    (t/->Capabilities true true true true false false))
+    (t/->Capabilities true true true true false false true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -240,7 +241,21 @@
       {:snapshot-a (str a)
        :snapshot-b (str b)
        :meta-a (select-keys info-a [:timestamp :message :branch])
-       :meta-b (select-keys info-b [:timestamp :message :branch])})))
+       :meta-b (select-keys info-b [:timestamp :message :branch])}))
+
+  p/GarbageCollectable
+  (gc-roots [_]
+    (->> writers
+         vals
+         (keep (fn [^BranchIndexWriter w]
+                 (.getLastCommitId w)))
+         set))
+
+  (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
+  (gc-sweep! [this _snapshot-ids _opts]
+    (when-let [writer (get writers current-branch-name)]
+      (pl/gc! writer (Instant/now)))
+    this))
 
 (defn create
   "Create a ScriptumSystem at the given path.
