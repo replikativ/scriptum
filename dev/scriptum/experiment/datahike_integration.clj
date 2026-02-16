@@ -98,7 +98,7 @@
 (defn generation-for-tx
   "Find the Scriptum generation that corresponds to a given Datahike T.
 
-  Uses Scriptum's in-memory metadata index for O(log n) lookup.
+  Uses Scriptum's durable metadata index (PSS + konserve) for O(log n) lookup.
   Returns {:generation g :indexed-tx t}, or nil if not caught up."
   [sc-writer datahike-tx]
   (when-let [{:keys [generation indexed-value]}
