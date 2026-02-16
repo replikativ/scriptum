@@ -31,6 +31,7 @@ Enable with `:crypto-hash? true` when creating an index. Metadata stored in exte
 |-------|-----------|----------|
 | **Java** | `org.replikativ.scriptum.BranchIndexWriter` | Direct Java usage |
 | **Core** | `scriptum.core` | Low-level Clojure wrapper |
+| **Metadata** | `scriptum.metadata` | Durable metadata index (PSS + konserve) |
 | **Yggdrasil** | `scriptum.yggdrasil` | High-level protocols |
 
 For Clojure users: `scriptum.yggdrasil` for high-level API, `scriptum.core` for lower-level control.
@@ -433,6 +434,7 @@ On disk, scriptum uses this structure:
 basePath/                    -- trunk (main branch)
   _0.cfs, _1.cfs, ...       -- shared segment files
   segments_N                 -- main's commit points
+  scriptum-metadata/         -- durable metadata index (konserve store)
   scriptum-hashes/           -- crypto-hash metadata (if enabled)
     <commit-uuid>.json       -- merkle tree data per commit
   branches/
@@ -465,6 +467,7 @@ See [docs/LUCENE_EXTENSION.md](docs/LUCENE_EXTENSION.md) for a deep-dive into ho
 src/
   clojure/scriptum/
     core.clj                 # Low-level COW branching API
+    metadata.clj             # Durable metadata index (PSS + konserve)
     yggdrasil.clj            # Yggdrasil protocol adapter
   java/org/replikativ/scriptum/
     BranchIndexWriter.java   # Branch-aware Lucene writer (main Java API)

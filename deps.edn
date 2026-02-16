@@ -7,7 +7,7 @@
         org.apache.lucene/lucene-analysis-common {:mvn/version "10.3.2"}
         com.fasterxml.jackson.core/jackson-core {:mvn/version "2.17.2"}
         com.fasterxml.jackson.core/jackson-databind {:mvn/version "2.17.2"}
-        org.replikativ/yggdrasil {:mvn/version "0.1.1"}}
+        org.replikativ/yggdrasil {:mvn/version "0.2.14"}}
 
  :aliases
  {:build

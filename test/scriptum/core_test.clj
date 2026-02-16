@@ -4,8 +4,7 @@
             [scriptum.core :as sc])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
-           [java.time Instant Duration]
-           [org.replikativ.scriptum BranchIndexWriter]))
+           [java.time Instant Duration]))
 
 (defn- temp-dir []
   (str (Files/createTempDirectory "scriptum-core-test-"
@@ -528,4 +527,72 @@
 
       (finally
         (sc/close! writer)
+        (delete-dir-recursive path)))))
+
+(deftest durable-metadata-index
+  (let [path (temp-dir)]
+    (try
+      ;; Create index with custom metadata and commit
+      (let [writer (sc/create-index path "main")]
+        (sc/add-doc writer {:id {:value "doc1" :type :string}
+                            :content "test"})
+        (let [gen1 (sc/commit! writer "First commit" {"test.key" "value1"})]
+
+          (sc/add-doc writer {:id {:value "doc2" :type :string}
+                              :content "test2"})
+          (let [gen2 (sc/commit! writer "Second commit" {"test.key" "value2"})]
+
+            ;; Verify metadata index directory was created
+            (let [meta-dir (java.io.File. (str path "/scriptum-metadata"))]
+              (is (.exists meta-dir) "Metadata directory should exist")
+              (is (.isDirectory meta-dir) "Metadata should be a directory"))
+
+            ;; No old JSON file should exist
+            (let [old-file (java.io.File. (str path "/scriptum-metadata-index.json"))]
+              (is (not (.exists old-file)) "Old JSON metadata file should not exist"))
+
+            (sc/close! writer)
+
+            ;; Reopen index and verify find-generation works from durable PSS index
+            (let [writer2 (sc/create-index path "main")]
+              (testing "find-generation loads from durable index"
+                (let [result (sc/find-generation writer2 "test.key" "value1")]
+                  (is (some? result))
+                  (is (= gen1 (:generation result))))
+
+                (let [result (sc/find-generation writer2 "test.key" "value2")]
+                  (is (some? result))
+                  (is (= gen2 (:generation result)))))
+
+              (testing "floor lookup works with durable index"
+                (let [result (sc/find-generation writer2 "test.key" "value2" :floor)]
+                  (is (some? result))
+                  (is (= gen2 (:generation result)))
+                  (is (= "value2" (:indexed-value result)))))
+
+              (sc/close! writer2)))))
+
+      (finally
+        (delete-dir-recursive path)))))
+
+(deftest fork-shares-metadata-index
+  (let [path (temp-dir)]
+    (try
+      (let [writer (sc/create-index path "main")]
+        (sc/add-doc writer {:content "base"})
+        (sc/commit! writer "base" {"shared.key" "v1"})
+
+        (let [branch (sc/fork writer "feature")]
+          (testing "main can query its own metadata"
+            (is (some? (sc/find-generation writer "shared.key" "v1"))))
+
+          (testing "branch commits index under branch name"
+            (sc/add-doc branch {:content "feature"})
+            (sc/commit! branch "feature" {"feature.key" "fv1"})
+            (is (some? (sc/find-generation branch "feature.key" "fv1"))))
+
+          (sc/close! branch))
+        (sc/close! writer))
+
+      (finally
         (delete-dir-recursive path)))))

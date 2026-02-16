@@ -10,15 +10,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.NavigableMap;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.UUID;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
@@ -105,11 +102,6 @@ public class BranchIndexWriter implements Closeable {
 
   // Cache of segment name -> file hashes (for crypto-hash mode)
   private final Map<String, Map<String, UUID>> segmentHashCache;
-
-  // In-memory index of custom metadata key -> (value -> generation) for O(log n) lookups.
-  // Lazily populated on first query by scanning all commits once, then maintained incrementally.
-  private final Map<String, NavigableMap<String, Long>> metadataIndex = new HashMap<>();
-  private volatile boolean metadataIndexInitialized = false;
 
   private BranchIndexWriter(
       IndexWriter writer,
@@ -588,15 +580,12 @@ public class BranchIndexWriter implements Closeable {
    */
   public long commit(String message, Map<String, String> customMetadata) throws IOException {
     if (cryptoHash) {
-      long gen = commitWithCryptoHash(message, customMetadata);
-      updateMetadataIndex(customMetadata, gen);
-      return gen;
+      return commitWithCryptoHash(message, customMetadata);
     } else {
       String uuid = setCommitData(message, customMetadata);
       pendingCommitMessage = null;
       long gen = writer.commit();
       lastCommitId = uuid;
-      updateMetadataIndex(customMetadata, gen);
       return gen;
     }
   }
@@ -812,105 +801,6 @@ public class BranchIndexWriter implements Closeable {
     return snapshots;
   }
 
-  // ============================================================================
-  // Custom Metadata Index — O(log n) lookup for T→generation mapping
-  // ============================================================================
-
-  /**
-   * Lazily build the in-memory metadata index from all existing commits.
-   *
-   * <p>Scans all commits once (O(n)), reading userData from each. Subsequent commits are indexed
-   * incrementally in setCommitData(). After GC, the index is rebuilt to remove stale entries.
-   */
-  private synchronized void ensureMetadataIndex() throws IOException {
-    if (metadataIndexInitialized) {
-      return;
-    }
-    metadataIndex.clear();
-    for (IndexCommit commit : deletionPolicy.getAllCommits()) {
-      Map<String, String> userData = commit.getUserData();
-      long gen = commit.getGeneration();
-      for (Map.Entry<String, String> entry : userData.entrySet()) {
-        if (!entry.getKey().startsWith("scriptum.")) {
-          metadataIndex
-              .computeIfAbsent(entry.getKey(), k -> new TreeMap<>())
-              .put(entry.getValue(), gen);
-        }
-      }
-    }
-    metadataIndexInitialized = true;
-  }
-
-  /**
-   * Incrementally update the metadata index after a commit.
-   *
-   * @param customMetadata the custom metadata from the commit (may be null)
-   * @param generation the generation of the commit
-   */
-  private void updateMetadataIndex(Map<String, String> customMetadata, long generation) {
-    if (customMetadata == null || !metadataIndexInitialized) {
-      return;
-    }
-    synchronized (this) {
-      for (Map.Entry<String, String> entry : customMetadata.entrySet()) {
-        if (!entry.getKey().startsWith("scriptum.")) {
-          metadataIndex
-              .computeIfAbsent(entry.getKey(), k -> new TreeMap<>())
-              .put(entry.getValue(), generation);
-        }
-      }
-    }
-  }
-
-  /**
-   * Find the commit generation for an exact custom metadata value.
-   *
-   * <p>O(log n) lookup using the in-memory metadata index.
-   *
-   * @param key the custom metadata key (e.g. "datahike/tx")
-   * @param value the exact value to find
-   * @return the commit generation, or -1 if not found
-   */
-  public long findGenerationByMetadata(String key, String value) throws IOException {
-    ensureMetadataIndex();
-    NavigableMap<String, Long> index = metadataIndex.get(key);
-    if (index == null) {
-      return -1;
-    }
-    Long gen = index.get(value);
-    return gen != null ? gen : -1;
-  }
-
-  /**
-   * Find the commit generation for a custom metadata value using floor lookup.
-   *
-   * <p>Returns the generation of the latest commit whose metadata value for the given key is
-   * less than or equal to the target value (using natural string ordering). This is ideal for
-   * monotonically increasing values like transaction IDs.
-   *
-   * <p>O(log n) lookup using the in-memory metadata index.
-   *
-   * @param key the custom metadata key (e.g. "datahike/tx")
-   * @param value the target value (finds the latest entry &lt;= this value)
-   * @return a map with "generation" and "indexedValue", or null if no matching commit exists
-   */
-  public Map<String, Object> findGenerationFloorByMetadata(String key, String value)
-      throws IOException {
-    ensureMetadataIndex();
-    NavigableMap<String, Long> index = metadataIndex.get(key);
-    if (index == null) {
-      return null;
-    }
-    Map.Entry<String, Long> floor = index.floorEntry(value);
-    if (floor == null) {
-      return null;
-    }
-    Map<String, Object> result = new LinkedHashMap<>();
-    result.put("generation", floor.getValue());
-    result.put("indexedValue", floor.getKey());
-    return result;
-  }
-
   /**
    * Garbage collect old commit points and unreferenced segment files.
    *
@@ -951,9 +841,6 @@ public class BranchIndexWriter implements Closeable {
       }
       gcHashMetadataFiles(protectedCommitIds);
     }
-
-    // Invalidate metadata index so it's rebuilt on next query
-    metadataIndexInitialized = false;
 
     return deletionPolicy.getLastGcDeleted();
   }

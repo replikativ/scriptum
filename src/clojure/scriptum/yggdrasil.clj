@@ -11,8 +11,7 @@
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [clojure.string :as str])
-  (:import [org.replikativ.scriptum BranchIndexWriter]
-           [java.time Instant]))
+  (:import [java.time Instant]))
 
 (defn- parse-parent-ids
   "Parse comma-separated UUID string into a set of strings."
@@ -23,13 +22,13 @@
 
 (defn- find-generation-for-uuid
   "Find the commit generation for a given UUID by scanning a writer's snapshots."
-  [^BranchIndexWriter writer uuid]
+  [writer uuid]
   (let [snaps (pl/list-snapshots writer)]
     (:generation (first (filter #(= (:snapshot-id %) uuid) snaps)))))
 
 (defn- snapshot-index
   "Build a map of snapshot-id -> snapshot-info from a writer's snapshots."
-  [^BranchIndexWriter writer]
+  [writer]
   (into {}
         (map (fn [s]
                [(:snapshot-id s)
@@ -89,7 +88,7 @@
   p/Snapshotable
   (snapshot-id [_]
     (let [writer (get writers current-branch-name)]
-      (.getLastCommitId writer)))
+      (.getLastCommitId (pl/->writer writer))))
 
   (parent-ids [_]
     (let [writer (get writers current-branch-name)
@@ -195,7 +194,7 @@
           branch-heads (into {}
                              (map (fn [[bname writer]]
                                     [(keyword bname)
-                                     (.getLastCommitId writer)]))
+                                     (.getLastCommitId (pl/->writer writer))]))
                              writers)]
       {:nodes (into {}
                     (map (fn [[id info]]
@@ -203,7 +202,8 @@
                                 :meta (select-keys info [:timestamp :message :branch])}]))
                     index)
        :branches branch-heads
-       :roots (set (filter #(empty? (get-in index [% :parent-ids])) (keys index)))}))
+       :roots (set (filter #(empty? (get-in index [% :parent-ids]))
+                           (keys index)))}))
 
   (commit-info [this snap-id] (p/commit-info this snap-id nil))
   (commit-info [_ snap-id _opts]
@@ -258,8 +258,8 @@
   (gc-roots [_]
     (->> writers
          vals
-         (keep (fn [^BranchIndexWriter w]
-                 (.getLastCommitId w)))
+         (keep (fn [w]
+                 (.getLastCommitId (pl/->writer w))))
          set))
 
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))

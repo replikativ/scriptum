@@ -9,6 +9,7 @@
   - Snapshot: immutable DirectoryReader at a specific commit point
   - Branch: COW overlay sharing base segments with the trunk
   - GC: explicit cleanup of old snapshots respecting branch references"
+  (:require [scriptum.metadata :as metadata])
   (:import [java.nio.file Path Paths]
            [java.time Instant Duration]
            [org.apache.lucene.analysis Analyzer]
@@ -29,6 +30,23 @@
   ^Path [^String s]
   (Paths/get s (make-array String 0)))
 
+;; --- ScriptumWriter wrapper ---
+
+(defrecord ScriptumWriter [writer metadata-index])
+
+(defn ->writer
+  "Extract the BranchIndexWriter from a ScriptumWriter or pass through a raw writer."
+  ^BranchIndexWriter [sw-or-writer]
+  (if (instance? ScriptumWriter sw-or-writer)
+    (:writer sw-or-writer)
+    sw-or-writer))
+
+(defn- ->metadata-index
+  "Extract the MetadataIndex from a ScriptumWriter, or nil."
+  [sw-or-writer]
+  (when (instance? ScriptumWriter sw-or-writer)
+    (:metadata-index sw-or-writer)))
+
 ;; --- Index Lifecycle ---
 
 (defn create-index
@@ -40,14 +58,16 @@
     :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)
     :crypto-hash? - enable merkle hashing for commits (default: false)
 
-  Returns a BranchIndexWriter for the given branch."
+  Returns a ScriptumWriter wrapping BranchIndexWriter + metadata index."
   ([^String path ^String branch-name]
    (create-index path branch-name {}))
   ([^String path ^String branch-name {:keys [analyzer crypto-hash?]}]
    (let [base-path (->path path)
          analyzer (or analyzer (StandardAnalyzer.))
-         crypto-hash (boolean crypto-hash?)]
-     (BranchIndexWriter/create base-path branch-name analyzer crypto-hash))))
+         crypto-hash (boolean crypto-hash?)
+         writer (BranchIndexWriter/create base-path branch-name analyzer crypto-hash)
+         mi (metadata/create-metadata-index path)]
+     (->ScriptumWriter writer mi))))
 
 (defn open-branch
   "Open an existing branch writer (for out-of-process branch access).
@@ -55,21 +75,27 @@
   Opens a BranchedDirectory with the base as read-only and overlay for writes.
 
   Options:
-    :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)"
+    :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)
+    :metadata-index - shared metadata index (default: creates new one)"
   ([^String path ^String branch-name]
    (open-branch path branch-name {}))
-  ([^String path ^String branch-name {:keys [analyzer]}]
+  ([^String path ^String branch-name {:keys [analyzer metadata-index]}]
    (let [base-path (->path path)
-         analyzer (or analyzer (StandardAnalyzer.))]
-     (BranchIndexWriter/open base-path branch-name analyzer))))
+         analyzer (or analyzer (StandardAnalyzer.))
+         writer (BranchIndexWriter/open base-path branch-name analyzer)
+         mi (or metadata-index (metadata/create-metadata-index path))]
+     (->ScriptumWriter writer mi))))
 
 (defn fork
   "Fork the index into a new branch. Returns the new branch writer.
 
   The new branch shares all existing segments with the parent.
   Cost: ~3-5ms (flush buffer + copy manifest)."
-  ^BranchIndexWriter [^BranchIndexWriter writer ^String new-branch-name]
-  (.fork writer new-branch-name))
+  [sw ^String new-branch-name]
+  (let [w (->writer sw)
+        mi (->metadata-index sw)
+        new-writer (.fork w new-branch-name)]
+    (->ScriptumWriter new-writer mi)))
 
 (defn discover-branches
   "Discover all branch names at the given path.
@@ -121,8 +147,9 @@
       (.add doc (TextField. \"body\" text Field$Store/NO))
       (.add doc (StoredField. \"body\" text))
       (.addDocument writer doc))"
-  [^BranchIndexWriter writer doc-map]
-  (let [doc (Document.)]
+  [sw doc-map]
+  (let [^BranchIndexWriter writer (->writer sw)
+        doc (Document.)]
     (doseq [[field-name value-or-opts] doc-map]
       (let [fname (name field-name)
             opts (if (map? value-or-opts) value-or-opts {:value value-or-opts})
@@ -192,16 +219,18 @@
 
 (defn delete-docs
   "Delete documents matching the given term field and value."
-  [^BranchIndexWriter writer ^String field ^String value]
-  (.deleteDocuments writer (into-array Term [(Term. field value)])))
+  [sw ^String field ^String value]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.deleteDocuments writer (into-array Term [(Term. field value)]))))
 
 (defn update-doc
   "Update a document identified by the given term.
 
   Replaces the document matching (field, value) with the new doc-map.
   doc-map uses the same format as add-doc (supports all field types, multi-valued fields, auto-detection)."
-  [^BranchIndexWriter writer ^String field ^String value doc-map]
-  (let [doc (Document.)]
+  [sw ^String field ^String value doc-map]
+  (let [^BranchIndexWriter writer (->writer sw)
+        doc (Document.)]
     (doseq [[field-name value-or-opts] doc-map]
       (let [fname (name field-name)
             opts (if (map? value-or-opts) value-or-opts {:value value-or-opts})
@@ -287,16 +316,22 @@
 
   Example with metadata (for secondary index sync):
     (commit! writer \"Indexed tx\" {\"datahike.tx\" \"536870915\"})"
-  ([^BranchIndexWriter writer]
-   (commit! writer nil))
-  ([^BranchIndexWriter writer ^String message]
-   (commit! writer message nil))
-  ([^BranchIndexWriter writer ^String message metadata]
-   (let [gen (.commit writer message
+  ([sw]
+   (commit! sw nil))
+  ([sw ^String message]
+   (commit! sw message nil))
+  ([sw ^String message metadata]
+   (let [^BranchIndexWriter writer (->writer sw)
+         mi (->metadata-index sw)
+         gen (.commit writer message
                       (when metadata
                         (java.util.HashMap. ^java.util.Map metadata)))
          commit-id (.getLastCommitId writer)
          content-hash (.getLastContentHash writer)]
+     ;; Index metadata in PSS and flush
+     (when mi
+       (metadata/index! mi (.getBranchName writer) metadata gen)
+       (metadata/flush-index! mi))
      (if content-hash
        {:generation gen
         :commit-id commit-id
@@ -319,18 +354,20 @@
   Example:
     (verify-commit writer)                    ; verify current commit
     (verify-commit writer {:generation 5})    ; verify specific generation"
-  ([^BranchIndexWriter writer]
-   (verify-commit writer {}))
-  ([^BranchIndexWriter writer {:keys [generation] :or {generation -1}}]
-   (let [result (.verifyCommit writer (long generation))]
+  ([sw]
+   (verify-commit sw {}))
+  ([sw {:keys [generation] :or {generation -1}}]
+   (let [^BranchIndexWriter writer (->writer sw)
+         result (.verifyCommit writer (long generation))]
      {:valid? (.get result "valid")
       :commit-id (.get result "commitId")
       :errors (vec (.get result "errors"))})))
 
 (defn flush!
   "Flush pending changes without committing (no durability, but NRT visible)."
-  [^BranchIndexWriter writer]
-  (.flush writer))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.flush writer)))
 
 ;; --- Search ---
 
@@ -345,34 +382,35 @@
   Options:
     :limit - max results (default 10)
     :fields - fields to retrieve (default: all stored fields)"
-  ([^BranchIndexWriter writer query]
-   (search writer query {}))
-  ([^BranchIndexWriter writer query {:keys [limit fields] :or {limit 10}}]
-   (with-open [reader (.openReader writer)]
-     (let [searcher (IndexSearcher. reader)
-           q (cond
-               (instance? org.apache.lucene.search.Query query)
-               query
+  ([sw query]
+   (search sw query {}))
+  ([sw query {:keys [limit fields] :or {limit 10}}]
+   (let [^BranchIndexWriter writer (->writer sw)]
+     (with-open [reader (.openReader writer)]
+       (let [searcher (IndexSearcher. reader)
+             q (cond
+                 (instance? org.apache.lucene.search.Query query)
+                 query
 
-               (map? query)
-               (let [[field value] (:term query)]
-                 (TermQuery. (Term. (name field) (str value))))
+                 (map? query)
+                 (let [[field value] (:term query)]
+                   (TermQuery. (Term. (name field) (str value))))
 
-               :else
-               (MatchAllDocsQuery.))
-           top-docs (.search searcher q (int limit))
-           hits (.-scoreDocs top-docs)]
-       (mapv (fn [^ScoreDoc sd]
-               (let [doc (.storedFields searcher)
-                     stored (.document doc (.-doc sd))
-                     field-map (into {}
-                                     (map (fn [^IndexableField f]
-                                            [(.name f) (.stringValue f)]))
-                                     (.getFields stored))]
-                 (assoc field-map
-                        :doc-id (.-doc sd)
-                        :score (.-score sd))))
-             hits)))))
+                 :else
+                 (MatchAllDocsQuery.))
+             top-docs (.search searcher q (int limit))
+             hits (.-scoreDocs top-docs)]
+         (mapv (fn [^ScoreDoc sd]
+                 (let [doc (.storedFields searcher)
+                       stored (.document doc (.-doc sd))
+                       field-map (into {}
+                                       (map (fn [^IndexableField f]
+                                              [(.name f) (.stringValue f)]))
+                                       (.getFields stored))]
+                   (assoc field-map
+                          :doc-id (.-doc sd)
+                          :score (.-score sd))))
+               hits))))))
 
 ;; --- Snapshots & Time-Travel ---
 
@@ -383,33 +421,36 @@
   :message, :branch, :segment-count, :parent-ids, and :custom-metadata.
 
   :custom-metadata is a map of any non-scriptum keys stored in commit user-data."
-  [^BranchIndexWriter writer]
-  (mapv (fn [m]
-          (let [base {:generation (.get m "generation")
-                      :snapshot-id (.get m "snapshotId")
-                      :segment-count (.get m "segmentCount")
-                      :timestamp (.get m "timestamp")
-                      :message (.get m "message")
-                      :branch (.get m "branch")
-                      :parent-ids (.get m "parentIds")}
-                custom (.get m "customMetadata")]
-            (if custom
-              (assoc base :custom-metadata (into {} custom))
-              base)))
-        (.listSnapshots writer)))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (mapv (fn [m]
+            (let [base {:generation (.get m "generation")
+                        :snapshot-id (.get m "snapshotId")
+                        :segment-count (.get m "segmentCount")
+                        :timestamp (.get m "timestamp")
+                        :message (.get m "message")
+                        :branch (.get m "branch")
+                        :parent-ids (.get m "parentIds")}
+                  custom (.get m "customMetadata")]
+              (if custom
+                (assoc base :custom-metadata (into {} custom))
+                base)))
+          (.listSnapshots writer))))
 
 (defn open-reader-at
   "Open a reader at a specific commit generation (time-travel).
 
   The caller is responsible for closing the reader.
   Throws if the generation has been GC'd."
-  ^DirectoryReader [^BranchIndexWriter writer ^long generation]
-  (.openReaderAt writer generation))
+  ^DirectoryReader [sw ^long generation]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.openReaderAt writer generation)))
 
 (defn commit-available?
   "Check if a specific commit generation is still available (not GC'd)."
-  [^BranchIndexWriter writer ^long generation]
-  (.isCommitAvailable writer generation))
+  [sw ^long generation]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.isCommitAvailable writer generation)))
 
 (defn find-generation
   "Find the commit generation matching a custom metadata key/value.
@@ -423,26 +464,30 @@
   Example:
     (find-generation writer \"datahike/tx\" \"536870915\")
     (find-generation writer \"datahike/tx\" \"536870915\" :floor)"
-  ([^BranchIndexWriter writer ^String key ^String value]
-   (find-generation writer key value :exact))
-  ([^BranchIndexWriter writer ^String key ^String value mode]
-   (case mode
-     :exact (let [gen (.findGenerationByMetadata writer key value)]
-              (when (>= gen 0) {:generation gen}))
-     :floor (when-let [result (.findGenerationFloorByMetadata writer key value)]
-              {:generation (.get result "generation")
-               :indexed-value (.get result "indexedValue")}))))
+  ([sw ^String key ^String value]
+   (find-generation sw key value :exact))
+  ([sw ^String key ^String value mode]
+   (let [^BranchIndexWriter writer (->writer sw)
+         mi (->metadata-index sw)
+         branch (.getBranchName writer)]
+     (if mi
+       (case mode
+         :exact (metadata/find-exact mi branch key value)
+         :floor (metadata/find-floor mi branch key value))
+       ;; Fallback for raw BranchIndexWriter (shouldn't happen normally)
+       nil))))
 
 (defn snapshot
   "Take an immutable snapshot (DirectoryReader) of the current branch.
    The caller is responsible for closing the reader."
-  ^DirectoryReader [^BranchIndexWriter writer]
-  (.openReader writer))
+  ^DirectoryReader [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.openReader writer)))
 
 (defn with-snapshot
   "Execute f with an immutable snapshot reader. Reader is closed after."
-  [^BranchIndexWriter writer f]
-  (with-open [reader (snapshot writer)]
+  [sw f]
+  (with-open [reader (snapshot sw)]
     (f reader)))
 
 ;; --- GC ---
@@ -455,44 +500,86 @@
 
   before: java.time.Instant — delete commits older than this
   Returns the number of commit points removed."
-  [^BranchIndexWriter writer ^Instant before]
-  (.gc writer before))
+  [sw ^Instant before]
+  (let [^BranchIndexWriter writer (->writer sw)
+        mi (->metadata-index sw)
+        removed (.gc writer before)]
+    ;; Rebuild metadata index from surviving snapshots
+    (when mi
+      (let [base-path (str (.getBasePath writer))
+            ;; Collect surviving snapshots from main branch
+            main-snaps (list-snapshots sw)
+            ;; Also collect from all known branches
+            branch-names (discover-branches base-path)
+            snapshots-by-branch
+            (reduce
+             (fn [acc bname]
+               (try
+                 (let [bw (BranchIndexWriter/open (->path base-path) bname (StandardAnalyzer.))
+                       snaps (mapv (fn [m]
+                                     (let [base {:generation (.get m "generation")
+                                                 :custom-metadata
+                                                 (when-let [cm (.get m "customMetadata")]
+                                                   (into {} cm))}]
+                                       base))
+                                   (.listSnapshots bw))]
+                   (.close bw)
+                   (assoc acc bname snaps))
+                 (catch Exception _ acc)))
+             {(.getBranchName writer) (mapv (fn [s] {:generation (:generation s)
+                                                     :custom-metadata (:custom-metadata s)})
+                                            main-snaps)}
+             branch-names)]
+        (metadata/rebuild-from-snapshots! mi snapshots-by-branch)
+        (metadata/flush-index! mi)))
+    removed))
 
 ;; --- Accessors ---
 
 (defn num-docs
   "Returns the number of documents in this branch (excluding deletions)."
-  [^BranchIndexWriter writer]
-  (.numDocs writer))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.numDocs writer)))
 
 (defn max-doc
   "Returns the total number of documents (including deletions)."
-  [^BranchIndexWriter writer]
-  (.maxDoc writer))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.maxDoc writer)))
 
 (defn branch-name
   "Returns the branch name."
-  [^BranchIndexWriter writer]
-  (.getBranchName writer))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.getBranchName writer)))
 
 (defn base-path
   "Returns the base path of the index."
-  [^BranchIndexWriter writer]
-  (str (.getBasePath writer)))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (str (.getBasePath writer))))
 
 (defn main-branch?
   "Returns true if this is the main (trunk) branch."
-  [^BranchIndexWriter writer]
-  (.isMainBranch writer))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.isMainBranch writer)))
 
 (defn merge-from!
   "Merge segments from a source branch into this branch.
 
   Uses reader-based addIndexes to avoid lock conflicts with source writer."
-  [^BranchIndexWriter target ^BranchIndexWriter source]
-  (.mergeFrom target source))
+  [target source]
+  (let [^BranchIndexWriter tw (->writer target)
+        ^BranchIndexWriter sw (->writer source)]
+    (.mergeFrom tw sw)))
 
 (defn close!
   "Close a branch writer and its resources."
-  [^BranchIndexWriter writer]
-  (.close writer))
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)
+        mi (->metadata-index sw)]
+    (when mi
+      (metadata/close-index! mi))
+    (.close writer)))
