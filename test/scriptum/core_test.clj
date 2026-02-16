@@ -83,6 +83,150 @@
         (sc/close! writer)
         (delete-dir-recursive path)))))
 
+(deftest numeric-field-types
+  (let [path (temp-dir)
+        writer (sc/create-index path "main")]
+    (try
+      (testing "int field with range queries and sorting"
+        (sc/add-doc writer {:id "1"
+                            :count {:value 42 :type :int :store? true}})
+        (sc/add-doc writer {:id "2"
+                            :count {:value 100 :type :int :store? true}})
+        (sc/commit! writer)
+
+        (let [results (sc/search writer :all)]
+          (is (= 2 (count results)))
+          ;; Verify stored values are retrievable
+          (is (some #(= "42" (get % "count")) results))
+          (is (some #(= "100" (get % "count")) results))))
+
+      (testing "long field"
+        (sc/add-doc writer {:id "3"
+                            :timestamp {:value 1234567890 :type :long :store? true}})
+        (sc/commit! writer)
+
+        (let [results (sc/search writer {:term [:id "3"]})]
+          (is (= 1 (count results)))
+          (is (= "1234567890" (get (first results) "timestamp")))))
+
+      (testing "float field"
+        (sc/add-doc writer {:id "4"
+                            :score {:value 3.14 :type :float :store? true}})
+        (sc/commit! writer)
+
+        (let [results (sc/search writer {:term [:id "4"]})]
+          (is (= 1 (count results)))
+          (is (some? (get (first results) "score")))))
+
+      (testing "double field"
+        (sc/add-doc writer {:id "5"
+                            :precision {:value 2.718281828 :type :double :store? true}})
+        (sc/commit! writer)
+
+        (let [results (sc/search writer {:term [:id "5"]})]
+          (is (= 1 (count results)))
+          (is (some? (get (first results) "precision")))))
+
+      (finally
+        (sc/close! writer)
+        (delete-dir-recursive path)))))
+
+(deftest stored-only-field
+  (let [path (temp-dir)
+        writer (sc/create-index path "main")]
+    (try
+      (testing "stored-only field is not indexed but is retrievable"
+        (sc/add-doc writer {:id {:value "doc-stored" :type :string}
+                            :metadata {:value "{\"key\":\"value\"}" :type :stored-only}})
+        (sc/commit! writer)
+
+        ;; Can retrieve via id
+        (let [results (sc/search writer {:term [:id "doc-stored"]})]
+          (is (= 1 (count results)))
+          (is (= "{\"key\":\"value\"}" (get (first results) "metadata")))))
+
+      (finally
+        (sc/close! writer)
+        (delete-dir-recursive path)))))
+
+(deftest auto-detect-dates
+  (let [path (temp-dir)
+        writer (sc/create-index path "main")]
+    (try
+      (testing "Instant auto-converts to :long"
+        (let [now (Instant/now)]
+          (sc/add-doc writer {:id {:value "instant-doc" :type :string}
+                              :timestamp now})  ; No explicit :type - should auto-detect
+          (sc/commit! writer)
+
+          (let [results (sc/search writer {:term [:id "instant-doc"]})]
+            (is (= 1 (count results)))
+            (is (= (str (.toEpochMilli now))
+                   (get (first results) "timestamp"))))))
+
+      (testing "Date auto-converts to :long"
+        (let [date (java.util.Date.)]
+          (sc/add-doc writer {:id {:value "date-doc" :type :string}
+                              :created date})  ; No explicit :type - should auto-detect
+          (sc/commit! writer)
+
+          (let [results (sc/search writer {:term [:id "date-doc"]})]
+            (is (= 1 (count results)))
+            (is (= (str (.getTime date))
+                   (get (first results) "created"))))))
+
+      (finally
+        (sc/close! writer)
+        (delete-dir-recursive path)))))
+
+(deftest multi-valued-fields
+  (let [path (temp-dir)
+        writer (sc/create-index path "main")]
+    (try
+      (testing "vector of string values creates multi-valued field"
+        (sc/add-doc writer {:id "multi-doc"
+                            :tags {:value ["clojure" "lucene" "search"]
+                                   :type :string}})
+        (sc/commit! writer)
+
+        ;; Search for each tag
+        (let [results-clojure (sc/search writer {:term [:tags "clojure"]})
+              results-lucene (sc/search writer {:term [:tags "lucene"]})
+              results-search (sc/search writer {:term [:tags "search"]})]
+          (is (= 1 (count results-clojure)))
+          (is (= 1 (count results-lucene)))
+          (is (= 1 (count results-search)))))
+
+      (finally
+        (sc/close! writer)
+        (delete-dir-recursive path)))))
+
+(deftest vector-similarity-function
+  (let [path (temp-dir)
+        writer (sc/create-index path "main")]
+    (try
+      (testing "vector field with cosine similarity"
+        (sc/add-doc writer {:id "vec-doc"
+                            :embedding1 {:value (float-array [0.1 0.2 0.3])
+                                         :type :vector
+                                         :similarity :cosine}})
+        (sc/commit! writer)
+
+        (is (= 1 (sc/num-docs writer))))
+
+      (testing "vector field with dot-product similarity"
+        (sc/add-doc writer {:id "vec-doc-2"
+                            :embedding2 {:value (float-array [0.4 0.5 0.6])
+                                         :type :vector
+                                         :similarity :dot-product}})
+        (sc/commit! writer)
+
+        (is (= 2 (sc/num-docs writer))))
+
+      (finally
+        (sc/close! writer)
+        (delete-dir-recursive path)))))
+
 (deftest delete-documents
   (let [path (temp-dir)
         writer (sc/create-index path "main")]
@@ -109,18 +253,24 @@
   (let [path (temp-dir)
         writer (sc/create-index path "main")]
     (try
-      ;; Use :text type for id since update-doc creates TextFields
-      (sc/add-doc writer {:id {:value "doc1" :type :text :stored? true}
+      (sc/add-doc writer {:id {:value "doc1" :type :string :stored? true}
                           :title {:value "Original" :type :text :stored? true}})
       (sc/commit! writer)
 
-      (sc/update-doc writer "id" "doc1" {:id "doc1" :title "Updated"})
-      (sc/commit! writer)
+      (testing "update with matching field types"
+        (sc/update-doc writer "id" "doc1"
+                       {:id {:value "doc1" :type :string :stored? true}
+                        :title {:value "Updated" :type :text :stored? true}})
+        (sc/commit! writer)
 
-      (is (= 1 (sc/num-docs writer)))
-      (let [results (sc/search writer {:term [:id "doc1"]})]
-        (is (= 1 (count results)))
-        (is (= "Updated" (get (first results) "title"))))
+        (is (= 1 (sc/num-docs writer)))
+        ;; :string exact match still works after update
+        (let [results (sc/search writer {:term [:id "doc1"]})]
+          (is (= 1 (count results)))
+          (is (= "Updated" (get (first results) "title"))))
+        ;; :text analyzed match works
+        (let [results (sc/search writer {:term [:title "updated"]})]
+          (is (= 1 (count results)))))
 
       (finally
         (sc/close! writer)

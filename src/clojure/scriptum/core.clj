@@ -14,8 +14,10 @@
            [org.apache.lucene.analysis Analyzer]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
            [org.apache.lucene.document Document Field$Store TextField StringField
+            IntField LongField FloatField DoubleField StoredField
             KnnFloatVectorField]
-           [org.apache.lucene.index DirectoryReader IndexableField Term]
+           [org.apache.lucene.index DirectoryReader IndexableField Term
+            VectorSimilarityFunction]
            [org.apache.lucene.search IndexSearcher TermQuery BooleanQuery
             BooleanClause$Occur TopDocs ScoreDoc
             MatchAllDocsQuery KnnFloatVectorQuery]
@@ -82,28 +84,110 @@
   "Add a document to the branch.
 
   doc-map is a map of field-name -> value.
-  Options per field can be specified as {:value v :stored? bool :type :text|:string|:vector}
+  Options per field: {:value v :type ... :store? bool}
+
+  Types:
+    :text        - Analyzed full-text (TextField) - default
+    :string      - Exact match (StringField)
+    :int         - Integer with range queries + sorting (IntField)
+    :long        - Long with range queries + sorting (LongField)
+    :float       - Float with range queries + sorting (FloatField)
+    :double      - Double with range queries + sorting (DoubleField)
+    :stored-only - Store but don't index (StoredField)
+    :vector      - KNN float vector search (KnnFloatVectorField)
+
+  Auto-detection:
+    - java.time.Instant → :long (epoch millis)
+    - java.util.Date → :long (epoch millis)
+    - Vector of values → multi-valued field
 
   Simple usage:
-    (add-doc writer {:title \"Hello World\" :body \"Some text\"})
+    (add-doc writer {:subject \"Meeting notes\"
+                     :from \"alice@example.com\"
+                     :date (Instant/now)})
 
   Advanced usage:
-    (add-doc writer {:id {:value \"doc1\" :type :string}
-                     :title {:value \"Hello\" :type :text :stored? true}
-                     :embedding {:value (float-array [0.1 0.2 ...]) :type :vector}})"
+    (add-doc writer {:subject {:value \"Meeting\" :type :text :store? true}
+                     :from {:value \"alice@example.com\" :type :string}
+                     :to {:value [\"bob@example.com\" \"charlie@example.com\"] :type :string}
+                     :date {:value (Instant/now) :type :long :store? true}
+                     :size {:value 42000 :type :int :store? false}
+                     :headers {:value \"{...}\" :type :stored-only}
+                     :embedding {:value (float-array [...]) :type :vector
+                                 :similarity :cosine}})
+
+  For fine-grained control, use Lucene classes directly:
+    (let [doc (Document.)]
+      (.add doc (TextField. \"body\" text Field$Store/NO))
+      (.add doc (StoredField. \"body\" text))
+      (.addDocument writer doc))"
   [^BranchIndexWriter writer doc-map]
   (let [doc (Document.)]
     (doseq [[field-name value-or-opts] doc-map]
       (let [fname (name field-name)
-            {:keys [value stored? type]
-             :or {stored? true type :text}} (if (map? value-or-opts)
-                                              value-or-opts
-                                              {:value (str value-or-opts)})
-            store (if stored? Field$Store/YES Field$Store/NO)]
-        (case type
-          :text (.add doc (TextField. fname (str value) store))
-          :string (.add doc (StringField. fname (str value) store))
-          :vector (.add doc (KnnFloatVectorField. fname ^floats value)))))
+            opts (if (map? value-or-opts) value-or-opts {:value value-or-opts})
+            {:keys [value stored? store? type similarity]} opts
+            store? (cond
+                     (contains? opts :stored?) stored?
+                     (contains? opts :store?) store?
+                     :else true)
+            store (if store? Field$Store/YES Field$Store/NO)
+
+            ;; Auto-detect type from value (only if type not explicitly provided)
+            [detected-type value']
+            (if (contains? opts :type)
+              [type value]
+              (cond
+                (instance? java.time.Instant value) [:long (.toEpochMilli ^Instant value)]
+                (instance? java.util.Date value) [:long (.getTime ^java.util.Date value)]
+                (and (class value) (= (.getName (class value)) "[F")) [:vector value]
+                :else [:text value]))
+
+            final-type detected-type
+
+            ;; Handle multi-valued fields (vector of values)
+            values (if (and (vector? value') (not= final-type :vector))
+                     value'
+                     [value'])]
+
+        (doseq [v values]
+          (case final-type
+            :text
+            (.add doc (TextField. fname (str v) store))
+
+            :string
+            (.add doc (StringField. fname (str v) store))
+
+            :int
+            (.add doc (IntField. fname (int v) store))
+
+            :long
+            (.add doc (LongField. fname (long v) store))
+
+            :float
+            (.add doc (FloatField. fname (float v) store))
+
+            :double
+            (.add doc (DoubleField. fname (double v) store))
+
+            :stored-only
+            (.add doc (StoredField. fname
+                        (cond
+                          (string? v) v
+                          (int? v) (int v)
+                          (instance? Long v) (long v)
+                          (instance? Float v) (float v)
+                          (instance? Double v) (double v)
+                          (bytes? v) v
+                          :else (str v))))
+
+            :vector
+            (let [sim (case (or similarity :euclidean)
+                        :euclidean VectorSimilarityFunction/EUCLIDEAN
+                        :cosine VectorSimilarityFunction/COSINE
+                        :dot-product VectorSimilarityFunction/DOT_PRODUCT
+                        :max-inner-product VectorSimilarityFunction/MAXIMUM_INNER_PRODUCT)]
+              (.add doc (KnnFloatVectorField. fname ^floats v sim)))))))
     (.addDocument writer doc)))
 
 (defn delete-docs
@@ -114,11 +198,75 @@
 (defn update-doc
   "Update a document identified by the given term.
 
-  Replaces the document matching (field, value) with the new doc-map."
+  Replaces the document matching (field, value) with the new doc-map.
+  doc-map uses the same format as add-doc (supports all field types, multi-valued fields, auto-detection)."
   [^BranchIndexWriter writer ^String field ^String value doc-map]
   (let [doc (Document.)]
-    (doseq [[fname fval] doc-map]
-      (.add doc (TextField. (name fname) (str fval) Field$Store/YES)))
+    (doseq [[field-name value-or-opts] doc-map]
+      (let [fname (name field-name)
+            opts (if (map? value-or-opts) value-or-opts {:value value-or-opts})
+            {:keys [value stored? store? type similarity]} opts
+            store? (cond
+                     (contains? opts :stored?) stored?
+                     (contains? opts :store?) store?
+                     :else true)
+            store (if store? Field$Store/YES Field$Store/NO)
+
+            ;; Auto-detect type from value (only if type not explicitly provided)
+            [detected-type value']
+            (if (contains? opts :type)
+              [type value]
+              (cond
+                (instance? java.time.Instant value) [:long (.toEpochMilli ^Instant value)]
+                (instance? java.util.Date value) [:long (.getTime ^java.util.Date value)]
+                (and (class value) (= (.getName (class value)) "[F")) [:vector value]
+                :else [:text value]))
+
+            final-type detected-type
+
+            ;; Handle multi-valued fields (vector of values)
+            values (if (and (vector? value') (not= final-type :vector))
+                     value'
+                     [value'])]
+
+        (doseq [v values]
+          (case final-type
+            :text
+            (.add doc (TextField. fname (str v) store))
+
+            :string
+            (.add doc (StringField. fname (str v) store))
+
+            :int
+            (.add doc (IntField. fname (int v) store))
+
+            :long
+            (.add doc (LongField. fname (long v) store))
+
+            :float
+            (.add doc (FloatField. fname (float v) store))
+
+            :double
+            (.add doc (DoubleField. fname (double v) store))
+
+            :stored-only
+            (.add doc (StoredField. fname
+                        (cond
+                          (string? v) v
+                          (int? v) (int v)
+                          (instance? Long v) (long v)
+                          (instance? Float v) (float v)
+                          (instance? Double v) (double v)
+                          (bytes? v) v
+                          :else (str v))))
+
+            :vector
+            (let [sim (case (or similarity :euclidean)
+                        :euclidean VectorSimilarityFunction/EUCLIDEAN
+                        :cosine VectorSimilarityFunction/COSINE
+                        :dot-product VectorSimilarityFunction/DOT_PRODUCT
+                        :max-inner-product VectorSimilarityFunction/MAXIMUM_INNER_PRODUCT)]
+              (.add doc (KnnFloatVectorField. fname ^floats v sim)))))))
     (.updateDocument writer (Term. field value) doc)))
 
 ;; --- Commit & Sync ---

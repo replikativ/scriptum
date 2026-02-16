@@ -68,9 +68,10 @@ clj -T:build compile-java
 ;; Create an index (with optional crypto-hash for content-addressable commits)
 (def writer (sc/create-index "/tmp/my-index" "main" {:crypto-hash? true}))
 
-;; Add documents
-(sc/add-doc writer {:title {:type :text :value "Hello World"}
-                    :id    {:type :string :value "doc-1"}})
+;; Add documents (with auto-detection)
+(sc/add-doc writer {:title "Hello World"
+                    :id "doc-1"
+                    :created (java.time.Instant/now)})
 
 ;; Commit returns detailed info when crypto-hash enabled
 (sc/commit! writer "Initial commit")
@@ -83,15 +84,16 @@ clj -T:build compile-java
 ;; => {:valid? true, :commit-id "...", :errors []}
 
 ;; Search
-(sc/search writer {:match-all {}} 10)
-;; => [{:title "Hello World", :id "doc-1", :score 1.0}]
+(sc/search writer :all {:limit 10})
+;; => [{:title "Hello World", :id "doc-1", :created "1771269569697", :score 1.0, :doc-id 0}]
 
 ;; Fork a branch
 (def feature (sc/fork writer "experiment"))
 
 ;; Add to branch (doesn't affect main)
-(sc/add-doc feature {:title {:type :text :value "Branch only"}
-                     :id    {:type :string :value "doc-2"}})
+(sc/add-doc feature {:title "Branch only"
+                     :id "doc-2"
+                     :created (java.time.Instant/now)})
 (sc/commit! feature "Added experimental doc")
 
 ;; Main still has 1 doc, branch has 2
@@ -104,6 +106,48 @@ clj -T:build compile-java
 
 ;; Cleanup
 (sc/close! feature)
+(sc/close! writer)
+```
+
+## Use Case: Email Indexing
+
+Scriptum's field types are designed for real-world use cases like email indexing:
+
+```clojure
+(require '[scriptum.core :as sc])
+(import '[java.time Instant]
+        '[org.apache.lucene.document LongField])
+
+(def writer (sc/create-index "/tmp/mail-index" "main"))
+
+;; Index an email with all metadata
+(sc/add-doc writer
+  {:subject "Q1 Planning Meeting"                       ; :text (analyzed, searchable)
+   :body {:value "Email content..." :store? false}      ; searchable but not stored
+   :from {:value "alice@example.com" :type :string}     ; exact match
+   :to {:value ["bob@example.com" "charlie@example.com"]
+        :type :string}                                   ; multi-valued
+   :sent-date (Instant/parse "2026-02-16T10:00:00Z")    ; auto-converts to :long
+   :size {:value 42000 :type :int}                      ; numeric with range queries
+   :attachment-count {:value 2 :type :int}
+   :message-id {:value "<abc123@example.com>" :type :stored-only}  ; retrieve only
+   :headers {:value "{...raw headers...}" :type :stored-only}})
+
+(sc/commit! writer "Indexed email batch")
+
+;; Range query: emails from last week
+(def last-week (.toEpochMilli (.minus (Instant/now) (Duration/ofDays 7))))
+(def recent-emails
+  (sc/search writer
+    (LongField/newRangeQuery "sent-date" last-week Long/MAX_VALUE)
+    {:limit 100}))
+
+;; Full-text search in subject/body
+(def results (sc/search writer {:term [:subject "planning"]} {:limit 10}))
+
+;; Exact match by sender
+(def from-alice (sc/search writer {:term [:from "alice@example.com"]} {:limit 50}))
+
 (sc/close! writer)
 ```
 
@@ -129,16 +173,42 @@ clj -T:build compile-java
 
 ### Document Operations
 
-Field types: `:text` (analyzed, searchable), `:string` (exact match), `:vector` (float array for KNN).
+Field types:
+- `:text` - Analyzed, searchable full-text (default)
+- `:string` - Exact match, non-analyzed
+- `:int`, `:long`, `:float`, `:double` - Numeric fields with range queries and sorting
+- `:stored-only` - Store but don't index (for retrieval-only fields)
+- `:vector` - KNN float vector search with configurable similarity
+
+Auto-detection:
+- `java.time.Instant` → `:long` (epoch millis)
+- `java.util.Date` → `:long` (epoch millis)
+- `float-array` → `:vector`
 
 ```clojure
-(sc/add-doc writer {:title {:type :text :value "Searchable text"}
-                    :tag   {:type :string :value "exact-match"}
-                    :embed {:type :vector :value (float-array [0.1 0.2 0.3])
-                            :dims 3}})
+;; Simple usage (auto-detection)
+(sc/add-doc writer {:title "Searchable text"
+                    :from "alice@example.com"
+                    :date (java.time.Instant/now)})
 
-(sc/delete-docs writer :id "doc-1")           ; delete by field+value
-(sc/update-doc writer :id "doc-1" new-fields) ; atomic delete+add
+;; Advanced usage (explicit types)
+(sc/add-doc writer {:subject {:type :text :value "Meeting notes"}
+                    :from    {:type :string :value "alice@example.com"}
+                    :to      {:type :string :value ["bob@" "charlie@"]}  ; multi-valued
+                    :date    {:type :long :value 1234567890 :store? true}
+                    :size    {:type :int :value 42000 :store? false}
+                    :headers {:type :stored-only :value "{...json...}"}
+                    :embed   {:type :vector :value (float-array [0.1 0.2 0.3])
+                              :similarity :cosine}})
+
+;; For fine-grained control, use Lucene classes directly
+(let [doc (org.apache.lucene.document.Document.)]
+  (.add doc (org.apache.lucene.document.TextField. "body" text Field$Store/NO))
+  (.add doc (org.apache.lucene.document.StoredField. "body" text))
+  (.addDocument writer doc))
+
+(sc/delete-docs writer "id" "doc-1")           ; delete by field+value
+(sc/update-doc writer "id" "doc-1" new-fields) ; atomic delete+add
 ```
 
 ### Commit & History
@@ -189,15 +259,17 @@ When `:crypto-hash?` is enabled, you can verify commit integrity:
 
 ```clojure
 ;; Term query
-(sc/search writer {:term {:field "tag" :value "exact-match"}} 10)
+(sc/search writer {:term [:tag "exact-match"]} {:limit 10})
 
 ;; Match-all
-(sc/search writer {:match-all {}} 100)
+(sc/search writer :all {:limit 100})
 
-;; Custom Lucene query object
-(sc/search writer my-lucene-query 10)
+;; Custom Lucene query object (e.g., range queries for dates)
+(require '[org.apache.lucene.document :as doc])
+(def last-week (.toEpochMilli (.minus (java.time.Instant/now) (java.time.Duration/ofDays 7))))
+(sc/search writer (doc/LongField/newRangeQuery "date" last-week Long/MAX_VALUE) {:limit 10})
 
-;; Returns: [{:field1 "val" :field2 "val" :score 1.0} ...]
+;; Returns: [{:field1 "val" :field2 "val" :score 1.0 :doc-id 0} ...]
 ```
 
 ### Time Travel
@@ -213,8 +285,11 @@ When `:crypto-hash?` is enabled, you can verify commit integrity:
 (def snap (sc/snapshot writer))
 
 ;; Execute with auto-closing snapshot
-(sc/with-snapshot [reader writer]
-  (sc/search reader {:match-all {}} 10))
+(sc/with-snapshot writer
+  (fn [reader]
+    ;; Search on immutable snapshot
+    (let [searcher (org.apache.lucene.search.IndexSearcher. reader)]
+      (.search searcher (org.apache.lucene.search.MatchAllDocsQuery.) 10))))
 
 (.close reader)
 ```
