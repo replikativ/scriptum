@@ -84,7 +84,7 @@
   (system-id [_] (or system-name (str "scriptum:" base-path)))
   (system-type [_] :scriptum)
   (capabilities [_]
-    (t/->Capabilities true true true true false false true))
+    (t/->Capabilities true true true true false false true true true))
 
   p/Snapshotable
   (snapshot-id [_]
@@ -242,6 +242,17 @@
        :snapshot-b (str b)
        :meta-a (select-keys info-a [:timestamp :message :branch])
        :meta-b (select-keys info-b [:timestamp :message :branch])}))
+
+  p/Addressable
+  (working-path [_] base-path)
+
+  p/Committable
+  (commit! [this] (p/commit! this nil nil))
+  (commit! [this message] (p/commit! this message nil))
+  (commit! [this message _opts]
+    (let [writer (get writers current-branch-name)]
+      (pl/commit! writer (or message ""))
+      this))
 
   p/GarbageCollectable
   (gc-roots [_]
