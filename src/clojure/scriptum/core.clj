@@ -199,14 +199,14 @@
 
             :stored-only
             (.add doc (StoredField. fname
-                        (cond
-                          (string? v) v
-                          (int? v) (int v)
-                          (instance? Long v) (long v)
-                          (instance? Float v) (float v)
-                          (instance? Double v) (double v)
-                          (bytes? v) v
-                          :else (str v))))
+                                    (cond
+                                      (string? v) v
+                                      (int? v) (int v)
+                                      (instance? Long v) (long v)
+                                      (instance? Float v) (float v)
+                                      (instance? Double v) (double v)
+                                      (bytes? v) v
+                                      :else (str v))))
 
             :vector
             (let [sim (case (or similarity :euclidean)
@@ -280,14 +280,14 @@
 
             :stored-only
             (.add doc (StoredField. fname
-                        (cond
-                          (string? v) v
-                          (int? v) (int v)
-                          (instance? Long v) (long v)
-                          (instance? Float v) (float v)
-                          (instance? Double v) (double v)
-                          (bytes? v) v
-                          :else (str v))))
+                                    (cond
+                                      (string? v) v
+                                      (int? v) (int v)
+                                      (instance? Long v) (long v)
+                                      (instance? Float v) (float v)
+                                      (instance? Double v) (double v)
+                                      (bytes? v) v
+                                      :else (str v))))
 
             :vector
             (let [sim (case (or similarity :euclidean)
