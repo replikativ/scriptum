@@ -20,8 +20,9 @@
            [org.apache.lucene.index DirectoryReader IndexableField Term
             VectorSimilarityFunction]
            [org.apache.lucene.search IndexSearcher TermQuery BooleanQuery
-            BooleanClause$Occur TopDocs ScoreDoc
+            BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
             MatchAllDocsQuery KnnFloatVectorQuery]
+           [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
            [org.apache.lucene.store FSDirectory]
            [org.replikativ.scriptum BranchIndexWriter BranchedDirectory]))
 
@@ -368,6 +369,71 @@
   [sw]
   (let [^BranchIndexWriter writer (->writer sw)]
     (.flush writer)))
+
+;; --- Query Builders ---
+
+(defn text-query
+  "Parse a text query string against a single field using the given analyzer.
+
+  Uses Lucene's QueryParser to handle operators (+, -, AND, OR, NOT),
+  phrases (\"quoted text\"), wildcards (*), and fuzzy matching (~).
+
+  Args:
+    field    - field name to search (string or keyword)
+    text     - query string
+    analyzer - Lucene Analyzer (optional, defaults to StandardAnalyzer)"
+  ([field text]
+   (text-query field text (StandardAnalyzer.)))
+  ([field text ^Analyzer analyzer]
+   (.parse (QueryParser. (name field) analyzer) text)))
+
+(defn multi-field-query
+  "Parse a text query string across multiple fields.
+
+  Each token is searched across all given fields with SHOULD semantics
+  (match in any field counts).
+
+  Args:
+    fields   - seq of field names (strings or keywords)
+    text     - query string
+    analyzer - Lucene Analyzer (optional, defaults to StandardAnalyzer)
+
+  Example:
+    (multi-field-query [\"title\" \"content\"] \"clojure reactive\")
+    ;; Matches docs where title OR content contains 'clojure reactive'"
+  ([fields text]
+   (multi-field-query fields text (StandardAnalyzer.)))
+  ([fields text ^Analyzer analyzer]
+   (let [field-arr  (into-array String (map name fields))
+         occurs-arr (into-array BooleanClause$Occur
+                      (repeat (count fields) BooleanClause$Occur/SHOULD))]
+     (MultiFieldQueryParser/parse text field-arr occurs-arr analyzer))))
+
+(defn bool-query
+  "Build a BooleanQuery from clause specs.
+
+  Each clause is a vector of [query occur] where occur is one of:
+    :must, :should, :must-not, :filter
+
+  Example:
+    (bool-query [[(text-query \"title\" \"clojure\") :should]
+                 [(text-query \"content\" \"clojure\") :should]
+                 [{:term [:source \"youtube\"]} :filter]])"
+  [clauses]
+  (let [builder (BooleanQuery$Builder.)]
+    (doseq [[q occur] clauses]
+      (let [lucene-q (cond
+                       (instance? org.apache.lucene.search.Query q) q
+                       (map? q) (let [[field value] (:term q)]
+                                  (TermQuery. (Term. (name field) (str value))))
+                       :else (throw (ex-info "Unknown query type" {:query q})))
+            lucene-occur (case occur
+                           :must     BooleanClause$Occur/MUST
+                           :should   BooleanClause$Occur/SHOULD
+                           :must-not BooleanClause$Occur/MUST_NOT
+                           :filter   BooleanClause$Occur/FILTER)]
+        (.add builder lucene-q lucene-occur)))
+    (.build builder)))
 
 ;; --- Search ---
 

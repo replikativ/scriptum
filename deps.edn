@@ -5,6 +5,7 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.apache.lucene/lucene-core {:mvn/version "10.3.2"}
         org.apache.lucene/lucene-analysis-common {:mvn/version "10.3.2"}
+        org.apache.lucene/lucene-queryparser {:mvn/version "10.3.2"}
         com.fasterxml.jackson.core/jackson-core {:mvn/version "2.17.2"}
         com.fasterxml.jackson.core/jackson-databind {:mvn/version "2.17.2"}
         org.replikativ/yggdrasil {:mvn/version "0.2.14"}}
