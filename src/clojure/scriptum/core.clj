@@ -406,7 +406,7 @@
   ([fields text ^Analyzer analyzer]
    (let [field-arr  (into-array String (map name fields))
          occurs-arr (into-array BooleanClause$Occur
-                      (repeat (count fields) BooleanClause$Occur/SHOULD))]
+                                (repeat (count fields) BooleanClause$Occur/SHOULD))]
      (MultiFieldQueryParser/parse text field-arr occurs-arr analyzer))))
 
 (defn bool-query
