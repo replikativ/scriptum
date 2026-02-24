@@ -4,7 +4,7 @@
 
 Copy-on-write branching for Apache Lucene. Git-like snapshot and branch semantics on full-text search indices with structural sharing.
 
-Built on Lucene 10.3.2. Forking a branch takes 3-5ms regardless of index size by sharing immutable segment files.
+Built on Lucene 10.3.2. Forking a branch takes a few ms regardless of index size by sharing immutable segment files.
 
 ## Core Concepts
 
@@ -344,7 +344,7 @@ if (!valid) {
     System.err.println("Integrity check failed: " + errors);
 }
 
-// Fork a branch (3-5ms regardless of index size)
+// Fork a branch (few ms regardless of index size)
 BranchIndexWriter feature = main.fork("experiment");
 feature.addDocument(anotherDoc);
 feature.commit("Feature work");
@@ -422,7 +422,7 @@ Passes the full yggdrasil compliance test suite (22 tests, 203 assertions).
 ## Performance
 
 Typical results:
-- Fork latency: 3-5ms (independent of index size)
+- Fork latency: few ms (independent of index size)
 - Indexing: ~50k docs/sec (text fields, SSD)
 - Search: sub-millisecond for simple queries
 
