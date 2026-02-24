@@ -256,19 +256,48 @@ When `:crypto-hash?` is enabled, you can verify commit integrity:
 
 **Note**: Verification recomputes hashes of all segment files and compares with stored metadata. Returns `:valid? true` only if all hashes match.
 
+### Query Builders
+
+Scriptum provides composable query builders so you don't need to import Lucene classes directly:
+
+```clojure
+;; Full-text query on a single field (supports +, -, AND, OR, NOT, phrases, wildcards, fuzzy)
+(sc/text-query :title "clojure AND functional")
+(sc/text-query :body "\"copy on write\"")        ; phrase
+(sc/text-query :body "lucen~")                   ; fuzzy
+
+;; Search across multiple fields (SHOULD semantics — match in any field counts)
+(sc/multi-field-query [:title :body] "clojure reactive")
+
+;; Compose queries with boolean logic
+(sc/bool-query [[(sc/text-query :title "clojure") :should]
+                [(sc/text-query :body  "clojure") :should]
+                [{:term [:category "programming"]}  :filter]])
+
+;; Pass any query to search
+(sc/search writer (sc/text-query :body "lucene") {:limit 10})
+(sc/search writer (sc/multi-field-query [:title :body] "scriptum branching") {:limit 5})
+```
+
+`bool-query` accepts clauses as `[query occur]` pairs where `occur` is `:must`, `:should`, `:must-not`, or `:filter`. The query in each clause can be a Lucene Query object, the result of `text-query`/`multi-field-query`, or a `{:term [field value]}` map.
+
 ### Search
 
 ```clojure
-;; Term query
+;; Term query (exact match)
 (sc/search writer {:term [:tag "exact-match"]} {:limit 10})
 
 ;; Match-all
 (sc/search writer :all {:limit 100})
 
-;; Custom Lucene query object (e.g., range queries for dates)
-(require '[org.apache.lucene.document :as doc])
+;; Full-text with query builders (no Lucene imports needed)
+(sc/search writer (sc/text-query :body "clojure functional") {:limit 10})
+(sc/search writer (sc/multi-field-query [:title :body] "lucene segments") {:limit 10})
+
+;; Raw Lucene query object (e.g., range queries for numeric fields)
+(import '[org.apache.lucene.document LongField])
 (def last-week (.toEpochMilli (.minus (java.time.Instant/now) (java.time.Duration/ofDays 7))))
-(sc/search writer (doc/LongField/newRangeQuery "date" last-week Long/MAX_VALUE) {:limit 10})
+(sc/search writer (LongField/newRangeQuery "date" last-week Long/MAX_VALUE) {:limit 10})
 
 ;; Returns: [{:field1 "val" :field2 "val" :score 1.0 :doc-id 0} ...]
 ```
