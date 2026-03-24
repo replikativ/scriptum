@@ -70,6 +70,15 @@ import org.apache.lucene.store.MMapDirectory;
  */
 public class BranchIndexWriter implements Closeable {
 
+  /** Check if a Lucene index exists at the given path. */
+  private static boolean indexExistsAt(Path path) {
+    try (Directory dir = MMapDirectory.open(path)) {
+      return DirectoryReader.indexExists(dir);
+    } catch (IOException e) {
+      return false;
+    }
+  }
+
   private static final ObjectMapper JSON = new ObjectMapper();
 
   private static final String COMMIT_TIMESTAMP_KEY = "scriptum.timestamp";
@@ -223,6 +232,21 @@ public class BranchIndexWriter implements Closeable {
       throws IOException {
     Path branchPath = basePath.resolve("branches").resolve(branchName);
     if (!Files.isDirectory(branchPath)) {
+      // The main branch writes directly to basePath (not branches/main/).
+      // Fall back to create() which handles the root directory layout and
+      // detects crypto-hash from existing commits.
+      if (Files.isDirectory(basePath) && indexExistsAt(basePath)) {
+        // Detect crypto-hash from existing index metadata
+        boolean cryptoHash = false;
+        try (Directory dir = MMapDirectory.open(basePath)) {
+          SegmentInfos infos = SegmentInfos.readLatestCommit(dir);
+          Map<String, String> userData = infos.getUserData();
+          cryptoHash = "true".equals(userData.get(COMMIT_CRYPTO_HASH_KEY));
+        } catch (IOException e) {
+          // Default to false if we can't read
+        }
+        return create(basePath, branchName, analyzer, cryptoHash);
+      }
       throw new IOException("Branch directory not found: " + branchPath);
     }
 
