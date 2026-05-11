@@ -191,7 +191,36 @@ public class BranchIndexWriter implements Closeable {
       Path basePath, String branchName, Analyzer analyzer, boolean cryptoHash) throws IOException {
     Files.createDirectories(basePath);
 
-    Directory dir = MMapDirectory.open(basePath);
+    boolean isMain = "main".equals(branchName);
+
+    // All branches — including main — go through BranchedDirectory so the
+    // write lock is per-branch (branchName + "_write.lock") instead of the
+    // shared "write.lock" at basePath. Main "self-overlays" basePath: its
+    // overlay and base both physically point at basePath, but they're
+    // independent MMapDirectory instances so the lock-file name becomes
+    // "main_write.lock" via BranchedDirectory.obtainLock's prefix. Non-main
+    // branches keep their existing layout at basePath/branches/<name>/.
+    Path overlayPath = isMain ? basePath : basePath.resolve("branches").resolve(branchName);
+    if (!isMain) {
+      Files.createDirectories(overlayPath);
+    }
+
+    Directory baseDir = MMapDirectory.open(basePath);
+    Directory overlayDir;
+    BranchedDirectory branchDir;
+    try {
+      overlayDir = isMain ? MMapDirectory.open(basePath) : MMapDirectory.open(overlayPath);
+      try {
+        branchDir = new BranchedDirectory(baseDir, overlayDir, branchName);
+        // branchDir now owns baseDir and overlayDir.
+      } catch (RuntimeException e) {
+        overlayDir.close();
+        throw e;
+      }
+    } catch (IOException e) {
+      baseDir.close();
+      throw e;
+    }
 
     BranchDeletionPolicy deletionPolicy = new BranchDeletionPolicy();
     BranchAwareMergePolicy mergePolicy =
@@ -202,11 +231,17 @@ public class BranchIndexWriter implements Closeable {
     config.setMergePolicy(mergePolicy);
     config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
 
-    IndexWriter writer = new IndexWriter(dir, config);
+    IndexWriter writer;
+    try {
+      writer = new IndexWriter(branchDir, config);
+    } catch (IOException e) {
+      branchDir.close();
+      throw e;
+    }
 
     BranchIndexWriter biw =
         new BranchIndexWriter(
-            writer, dir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, true,
+            writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer, isMain,
             cryptoHash);
 
     // Initialize parent tracking from existing commits
