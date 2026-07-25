@@ -8,10 +8,21 @@
         org.apache.lucene/lucene-queryparser {:mvn/version "10.3.2"}
         com.fasterxml.jackson.core/jackson-core {:mvn/version "2.17.2"}
         com.fasterxml.jackson.core/jackson-databind {:mvn/version "2.17.2"}
-        org.replikativ/yggdrasil {:mvn/version "0.2.14"}}
+        org.replikativ/yggdrasil {:mvn/version "0.2.14"}
+        ;; Direct now rather than transitive: konserve is the source of truth for
+        ;; an index (scriptum.konserve), and hasch supplies the content addresses
+        ;; that make branches share blobs.
+        org.replikativ/konserve {:mvn/version "0.9.350"}
+        org.replikativ/hasch {:mvn/version "0.3.96"}}
 
  :aliases
- {:build
+ {;; Sibling checkouts, for co-development across the replikativ stack.
+  ;; scriptum.konserve needs konserve.gc-guard, which is unreleased — use this
+  ;; alias until a konserve carrying it is on Maven.
+  :local
+  {:override-deps {org.replikativ/konserve {:local/root "../konserve"}}}
+
+  :build
   {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
           slipset/deps-deploy {:mvn/version "0.2.0"}}
    :ns-default build}
