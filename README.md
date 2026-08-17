@@ -98,8 +98,8 @@ clj -T:build compile-java
 (sc/commit! feature "Added experimental doc")
 
 ;; Main still has 1 doc, branch has 2
-(count (sc/search writer {:match-all {}} 100))    ;; => 1
-(count (sc/search feature {:match-all {}} 100))   ;; => 2
+(count (sc/search writer :all))    ;; => 1
+(count (sc/search feature :all))   ;; => 2
 
 ;; Merge branch back
 (sc/merge-from! writer feature)
@@ -162,7 +162,7 @@ Scriptum's field types are designed for real-world use cases like email indexing
 (sc/open-branch path branch-name)                     ; open existing branch
 (sc/fork writer "branch-name")                        ; fast fork from writer
 (sc/close! writer)                                    ; close writer and release resources
-(sc/discover-branches path)                           ; => ["main" "feature" ...]
+(sc/discover-branches path)                           ; => #{"feature"} — forks only, not main
 
 ;; Accessors
 (sc/num-docs writer)                ; document count (excluding deletions)
@@ -327,11 +327,12 @@ Scriptum provides composable query builders so you don't need to import Lucene c
 ### Garbage Collection
 
 ```clojure
-;; Remove commits older than 1 hour, respecting branch references
-(sc/gc! writer)
+;; Remove commits older than an hour, respecting branch references
+(sc/gc! writer (.minus (java.time.Instant/now) (java.time.Duration/ofHours 1)))
 ```
 
-GC only runs on the main branch and protects all segment files referenced by any branch.
+GC only runs on the main branch and protects all segment files referenced by any
+branch. A **store-backed** index collects differently — see below.
 
 ## Java API
 
@@ -425,6 +426,95 @@ main.close();
 | `numDocs()` / `maxDoc()` | Document counts |
 | `getBranchName()` | Current branch name |
 | `isMainBranch()` | Check if main branch |
+
+## Konserve-Backed Storage
+
+An index can live in a [konserve](https://github.com/replikativ/konserve) store
+instead of a directory tree, which is what makes it usable on an object store.
+Konserve is the source of truth; the local directory is a derived cache that may
+be deleted at any time and rebuilt from the store.
+
+A branch is a manifest rather than a directory:
+
+```
+[:scriptum :manifest <branch>]  ->  <commit address>          ; the one mutable cell
+[:scriptum :snapshot <address>] ->  {:files   {name -> address}
+                                     :parents [<address> ...]}
+[:scriptum :blob <address>]     ->  segment bytes             ; content-addressed
+```
+
+Segments shared between branches are one blob, and one inode locally, so a fork
+copies a pointer and no bytes move.
+
+```clojure
+(require '[konserve.store :as kstore]
+         '[scriptum.core :as sc]
+         '[scriptum.konserve :as sk])
+
+;; The store must carry a konserve :id — connect-store attaches one,
+;; konserve.filestore/connect-fs-store does not, and scriptum refuses a store
+;; without one because the GC guard is keyed on it.
+(def store (kstore/create-store {:backend :file
+                                 :path "/data/index-store"
+                                 :id #uuid "..."}
+                                {:sync? true}))
+
+(def writer (sc/open-store-index store "/tmp/index-cache" "main"))
+(sc/add-doc writer {:title "Hello" :body "world"})
+(sc/commit! writer "first")
+
+(sc/fork writer "feature")        ; copies a pointer; no bytes move
+(sc/branches writer)              ; => #{"main" "feature"}
+```
+
+### Snapshots are values
+
+Every commit has an immutable, content-addressed address covering its files and
+its ancestry. Hold one and you can come back to exactly that state:
+
+```clojure
+(def held (sc/snapshot-address writer))     ; a UUID naming this index state
+
+;; read-only, on any machine with the store
+(with-open [d (sk/snapshot-directory store "/tmp/cache" held)]
+  ...)
+
+;; or restore a branch to it, writable
+(sc/open-store-index-at store "/tmp/cache" "main" held)
+(sk/fork-from-snapshot! store "from-held" held)
+```
+
+### Collection
+
+`scriptum.core/gc!` is for directory-backed indices and throws here. A
+store-backed index collects by reachability:
+
+```clojure
+(sk/gc! store (sk/store-id-for store))       ; collect the store
+(sk/gc-cache! store "/tmp/index-cache")      ; and the local cache, separately
+```
+
+Both take the snapshot addresses an external holder still references, so a state
+no branch names is not collected out from under them.
+
+**On a store you do not own** — one shared with datahike, say — do not call
+`sk/gc!` at all. konserve's sweep is allow-list, so it would delete every key
+scriptum does not name. Use `sk/mark` to contribute scriptum's keys to that
+store's own collector, unioned with `scriptum.metadata/mark` if a metadata index
+shares the store.
+
+### Limits worth knowing
+
+- **One writer per branch**, in one JVM. The write lock lives in the local
+  cache, so it does not span machines, and the manifest write is not yet a
+  compare-and-set. Writers on *different* branches are safe by construction.
+- **History accumulates.** Every commit point is retained, so the store and
+  cache grow with commit count regardless of live document count. Pruning is
+  planned; the `:parents` chain is recorded for it.
+- **`scriptum.audit` needs `:crypto-hash?`**, which store-backed indices do not
+  yet enable, so audit degrades to `{:status :advisory}` there.
+- Against a remote store, start from `scriptum.konserve/remote-tuning` — Lucene's
+  default 5 GB merged-segment cap is not appropriate for an object store.
 
 ## Yggdrasil Integration
 
