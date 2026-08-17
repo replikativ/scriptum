@@ -625,6 +625,23 @@
      (locking (store-lock id#)
        ~@body)))
 
+(def blob-upload-parallelism
+  "How many segment blobs a single `sync` uploads at once.
+
+  BOUNDED FOR MEMORY, not for the connection pool — konserve-s3 uses the AWS
+  SDK's `UrlConnectionHttpClient`, which has no pool to exhaust, so unbounded
+  concurrency would not fail there. What it would cost is heap: each in-flight
+  upload holds a konserve streaming buffer, 1 MB by default, so the 32
+  simultaneous PUTs a 35-blob commit was measured issuing are 32 MB of transient
+  buffers. On the 512 MB Lambda this namespace is written for, that matters.
+  Past the JVM keep-alive cache (`http.maxConnections`, 5 by default) the extra
+  sockets are also handshake churn rather than reuse.
+
+  `pmap` alone is not a bound: it realizes a chunk ahead, which is where 32 came
+  from. Enough to hide latency — the win is round trips overlapped, and beyond a
+  dozen or so there is nothing left to hide."
+  (max 4 (min 16 (+ 2 (.availableProcessors (Runtime/getRuntime))))))
+
 (def reserved-branch-names
   "Branch names that would collide with the cache's own layout.
 
@@ -992,33 +1009,54 @@
              (link-into-view! store cache branch n a)))
          (.sync live names)
          (open-guard!)
-         (let [write! (fn []
-                        (locking lock
-                          (let [m (reduce (fn [m ^String n]
-                                            (if (contains? m n)
-                                              m
-                                              (let [vf (view-file cache branch n)
-                                                    address (address-of vf)]
-                                              ;; An InputStream, not the bytes: konserve streams a
-                                              ;; blob in through a fixed buffer, so a segment costs
-                                              ;; that buffer and not its own size. (A java.io.File
-                                              ;; would be the obvious argument and `bassoc` claims
-                                              ;; to take one, but konserve's `blob->channel` File
-                                              ;; branch mis-hints it as a String and throws.)
-                                                (with-open [in (io/input-stream vf)]
-                                                  (k/bassoc store (blob-key address) in {:sync? true}))
-                                                (pool! cache branch n address)
-                                                (assoc m n address))))
-                                          (files-now) names)]
-                            (when (not= m (files-now))
-                              (swap! state assoc :files m)
-                              (reset! dirty true)
-                              (reset! synced-since-flip true))
-                          ;; Synced names are the manifest's now. Handing them
-                          ;; over keeps a name from living in both sets, so
-                          ;; `rename` and `deleteFile` have one place to edit.
-                            (swap! session #(reduce disj % names)))))]
-           (write!)))
+         ;; BLOBS IN PARALLEL, THEN THE POINTER — the shape datahike uses, and the
+         ;; one an object store needs. These writes are independent of each other:
+         ;; a blob is content-addressed, so nothing orders one against another,
+         ;; and the only real barrier is that all of them precede the snapshot and
+         ;; pointer `syncMetaData` writes. Sequentially this cost one round trip
+         ;; per segment — measured at 502 ms for a commit against 60 ms-per-PUT
+         ;; latency, where the blobs alone were 4 of the 6 writes.
+         ;;
+         ;; Outside `lock`, deliberately. Holding it across the uploads made a
+         ;; merge thread blocked here hold the IndexWriter monitor for the length
+         ;; of a remote round trip, stalling the whole writer. The lock exists for
+         ;; the manifest atom, which is touched below and not here.
+         ;;
+         ;; Concurrent `k/bassoc` is safe: konserve locks per key, and two names
+         ;; with identical content resolve to one key holding the same bytes.
+         (let [have (files-now)
+               fresh (remove #(contains? have %) names)
+               upload
+               (fn [^String n]
+                 (let [vf (view-file cache branch n)
+                       address (address-of vf)]
+                                ;; An InputStream, not the bytes: konserve streams a
+                                ;; blob in through a fixed buffer, so a segment costs
+                                ;; that buffer and not its own size. (A java.io.File
+                                ;; would be the obvious argument and `bassoc` claims
+                                ;; to take one, but konserve's `blob->channel` File
+                                ;; branch mis-hints it as a String and throws.)
+                   (with-open [in (io/input-stream vf)]
+                     (k/bassoc store (blob-key address) in {:sync? true}))
+                   (pool! cache branch n address)
+                   [n address]))
+               ;; Partitioned rather than handed to `pmap` whole: that bounds the
+               ;; number in flight, which `pmap` does not.
+               pairs (doall (mapcat #(doall (pmap upload %))
+                                    (partition-all blob-upload-parallelism fresh)))]
+           (locking lock
+             ;; Re-read under the lock rather than reusing `have`: only the
+             ;; manifest edit needs ordering, and merging the pairs in is
+             ;; idempotent if anything landed meanwhile.
+             (let [m (into (files-now) pairs)]
+               (when (not= m (files-now))
+                 (swap! state assoc :files m)
+                 (reset! dirty true)
+                 (reset! synced-since-flip true)))
+             ;; Synced names are the manifest's now. Handing them over keeps a
+             ;; name from living in both sets, so `rename` and `deleteFile` have
+             ;; one place to edit.
+             (swap! session #(reduce disj % names)))))
 
        (syncMetaData []
          (ensure-open!)
