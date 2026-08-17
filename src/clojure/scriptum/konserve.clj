@@ -1062,6 +1062,72 @@
                                          (inc attempt) " times")
                                     {:from from :to to :address address})))))))))))
 
+(defn point-branch-at!
+  "Make `branch` name the index state at `address`.
+
+  THE OPERATION THAT MAKES A SNAPSHOT ADDRESS WORTH HOLDING. `snapshot-directory`
+  can already read one, but nothing could turn one back into a writable branch —
+  so a caller holding an address (datahike's secondary-index key-map) could not
+  restore to it, and opening the branch silently gave whatever the branch had
+  moved on to instead. Primary and secondary then disagree with nothing
+  detecting it, which is the failure the immutable key-map was supposed to make
+  unrepresentable.
+
+  VERIFIED AFTER THE WRITE, for the same reason `fork!` is: the snapshot is old,
+  so the gc-guard cannot protect it — the guard spares what is written inside its
+  window, and this was written by some earlier commit. A collection that marked
+  before this pointer landed sweeps it regardless. Re-checking afterwards catches
+  that, and the pointer is removed rather than left dangling, since `mark`
+  resolves every branch pointer and one dangling branch stops collection for the
+  whole store.
+
+  A caller that needs the state to survive a concurrent collection must pass the
+  address as `extra-snapshots` to `gc!`; that is what it is for.
+
+  THIS DROPS WHATEVER `branch` NAMED BEFORE. The superseded snapshot becomes
+  unreachable and collectable — correct COW semantics, and the caller's business
+  to hold if they still want it. It also does not disturb a live writer on the
+  branch, because it cannot see one: reset a branch someone is writing and their
+  next commit derives from the state they held, not this one.
+
+  Returns the file map now at `branch`."
+  [store branch address]
+  (ensure-format! store)
+  (check-branch-name branch)
+  (when-not (k/exists? store (snapshot-key address) {:sync? true})
+    (throw (ex-info (str "scriptum: snapshot " address " is not in the store, so "
+                         branch " cannot be pointed at it")
+                    {:branch branch :address address})))
+  (let [previous (k/get store (manifest-key branch) nil {:sync? true})
+        registered-here? (register-branch! store branch)]
+    (k/assoc store (manifest-key branch) address {:sync? true})
+    (if (k/exists? store (snapshot-key address) {:sync? true})
+      (read-snapshot store address)
+      (do
+        ;; Undo, leaving the branch as it was rather than dangling.
+        (if previous
+          (k/assoc store (manifest-key branch) previous {:sync? true})
+          (k/dissoc store (manifest-key branch) {:sync? true}))
+        (when registered-here?
+          (k/update store branches-key #(disj (or % #{}) branch) {:sync? true}))
+        (throw (ex-info (str "scriptum: snapshot " address " was collected while "
+                             branch " was being pointed at it — pass it as "
+                             "extra-snapshots to gc! to hold it")
+                        {:branch branch :address address}))))))
+
+(defn fork-from-snapshot!
+  "Branch `to` at the index state `address`, which must not already exist.
+
+  `fork!` copies whatever the source branch names NOW; this names a specific
+  state, which is what a caller holding a snapshot address wants — datahike's
+  `branch-from-key-map` hands the key-map of an OLD commit, and forking the head
+  there would branch from the wrong place entirely."
+  [store to address]
+  (ensure-format! store)
+  (when (k/exists? store (manifest-key to) {:sync? true})
+    (throw (ex-info "scriptum: branch already exists" {:branch to})))
+  (point-branch-at! store to address))
+
 (defn delete-branch!
   "Forget `branch`. Blobs it referenced survive until `gc!` finds them
   unreachable from every remaining manifest."

@@ -20,7 +20,9 @@
             [konserve.utils :as ku]
             [scriptum.konserve :as sk]
             [scriptum.metadata :as m]
-            [scriptum.core :as sc])
+            [scriptum.core :as sc]
+            [scriptum.yggdrasil :as y]
+            [yggdrasil.protocols :as p])
   (:import [org.replikativ.scriptum ContentHash]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
            [org.apache.lucene.document Document TextField StringField Field$Store]
@@ -1369,3 +1371,139 @@
                   "the fork must inherit the merged-segment cap")
               (finally (sc/close! f))))
           (finally (sc/close! w)))))))
+
+;; =============================================================================
+;; Round-tripping a snapshot address
+;; =============================================================================
+
+(deftest a-held-address-restores-a-writable-branch
+  (testing "the operation that makes a snapshot address worth holding.
+            `snapshot-directory` could already READ one, but nothing turned one
+            back into a writable branch — so a holder could not restore to it,
+            and opening the branch silently gave whatever it had moved on to.
+            Primary and secondary then disagree with nothing detecting it, which
+            is the failure the immutable key-map was meant to make
+            unrepresentable."
+    (let [s (store)
+          sid (sk/store-id-for s)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try (sc/add-doc w {:body {:type :text :value "first"}})
+             (sc/commit! w "one")
+             (finally (sc/close! w))))
+      (let [held (let [w (sc/open-store-index s (cache) "main")]
+                   (try (sc/snapshot-address w) (finally (sc/close! w))))]
+        (is (uuid? held) "a branch reports its address")
+        ;; the branch moves on
+        (let [w (sc/open-store-index s (cache) "main")]
+          (try (sc/add-doc w {:body {:type :text :value "second"}})
+               (sc/commit! w "two")
+               (finally (sc/close! w))))
+        (let [w (sc/open-store-index s (cache) "main")]
+          (try (is (= 2 (count (sc/search w :all)))
+                   "precondition: the branch has moved past the held state")
+               (finally (sc/close! w))))
+        ;; and restores
+        (let [w (sc/open-store-index-at s (cache) "main" held)]
+          (try
+            (is (= 1 (count (sc/search w :all)))
+                "restoring must give the held state, not the branch's latest")
+            (is (= held (sc/snapshot-address w)))
+            ;; and it is writable from there
+            (sc/add-doc w {:body {:type :text :value "third"}})
+            (sc/commit! w "three")
+            (is (= 2 (count (sc/search w :all))))
+            (is (not= held (sc/snapshot-address w)) "committing moves it on")
+            (finally (sc/close! w))))
+        (is (some? sid))))))
+
+(deftest forking-from-an-address-branches-the-named-state
+  (testing "`fork!` copies whatever the source names NOW; this names a specific
+            state. datahike's `branch-from-key-map` hands the key-map of an OLD
+            commit, and forking the head there would branch from the wrong place."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try (sc/add-doc w {:body {:type :text :value "first"}})
+             (sc/commit! w "one")
+             (finally (sc/close! w))))
+      (let [old (let [w (sc/open-store-index s (cache) "main")]
+                  (try (sc/snapshot-address w) (finally (sc/close! w))))]
+        (let [w (sc/open-store-index s (cache) "main")]
+          (try (sc/add-doc w {:body {:type :text :value "second"}})
+               (sc/commit! w "two")
+               (finally (sc/close! w))))
+        (sk/fork-from-snapshot! s "from-old" old)
+        (let [w (sc/open-store-index s (cache) "from-old")]
+          (try (is (= 1 (count (sc/search w :all)))
+                   "the fork must hold the named state, not the head")
+               (finally (sc/close! w))))
+        (let [w (sc/open-store-index s (cache) "main")]
+          (try (is (= 2 (count (sc/search w :all))) "and main is untouched")
+               (finally (sc/close! w))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"already exists"
+                              (sk/fork-from-snapshot! s "from-old" old)))))))
+
+(deftest pointing-at-a-collected-snapshot-is-refused
+  (testing "the address is old, so the gc-guard cannot protect it — a collection
+            that marked before the pointer landed sweeps it regardless. The
+            branch must be left as it was rather than dangling, since `mark`
+            resolves every branch pointer and one dangling branch stops
+            collection for the whole store."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try (sc/add-doc w {:body {:type :text :value "x"}})
+             (sc/commit! w "one")
+             (finally (sc/close! w))))
+      (let [before (sk/branch-snapshot s "main")]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not in the store"
+                              (sk/point-branch-at! s "main" (random-uuid))))
+        (is (= before (sk/branch-snapshot s "main"))
+            "a refused move must leave the branch where it was")
+        (is (set? (sk/mark s)) "and collection still works")))))
+
+;; =============================================================================
+;; The yggdrasil protocols over a store
+;; =============================================================================
+
+(deftest yggdrasil-gc-sweep-does-not-delete-its-own-roots
+  (testing "REGRESSION: `gc-sweep!` discarded `snapshot-ids` and collected from
+            the current branch unconditionally, so asking it to delete NOTHING
+            took history from four commits to one — including the id `gc-roots`
+            had just named as live. It also threw outright on a non-main current
+            branch, and returned the system where the protocol asks for a
+            reclamation report."
+    (let [s (store)
+          sys (y/create-over-store s (cache))]
+      (try
+        (let [sys (reduce (fn [sys i]
+                            (sc/add-doc (get (:writers sys) "main")
+                                        {:body {:type :text :value (str "doc " i)}})
+                            (sc/commit! (get (:writers sys) "main") (str "c" i))
+                            sys)
+                          sys (range 4))
+              before (count (p/history sys))
+              report (p/gc-sweep! sys #{})]
+          (is (map? report) "a report, not the system")
+          (is (contains? report :reclaimed))
+          (is (= before (count (p/history sys)))
+              "sweeping with no candidates must not destroy history")
+          (is (= 4 (count (sc/search (get (:writers sys) "main") :all)))
+              "and the documents are all still there"))
+        (finally (y/close! sys))))))
+
+(deftest yggdrasil-delete-branch-removes-it-from-the-store
+  (testing "REGRESSION: `delete-branch!` closed the writer and dropped the handle,
+            so `branches` stopped listing it while the store still did — its
+            manifest stayed a permanent GC root and its blobs were never
+            collectable."
+    (let [s (store)
+          sys (y/create-over-store s (cache))]
+      (try
+        (sc/add-doc (get (:writers sys) "main") {:body {:type :text :value "x"}})
+        (sc/commit! (get (:writers sys) "main") "seed")
+        (let [sys (p/branch! sys :feature)]
+          (is (contains? (sk/branches s) "feature") "the store knows the branch")
+          (let [sys (p/delete-branch! sys :feature)]
+            (is (not (contains? (p/branches sys) :feature)))
+            (is (not (contains? (sk/branches s) "feature"))
+                "and deleting it must remove it from the store too")))
+        (finally (y/close! sys))))))

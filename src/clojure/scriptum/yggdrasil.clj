@@ -7,7 +7,8 @@
   (which writers exist, which is current) is immutable.
 
   Snapshot IDs are UUIDs stored in commit user-data."
-  (:require [scriptum.core :as pl]
+  (:require [konserve.utils :as ku]
+            [scriptum.core :as pl]
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [clojure.string :as str])
@@ -142,9 +143,18 @@
 
   (delete-branch! [this name] (p/delete-branch! this name nil))
   (delete-branch! [this name _opts]
-    (let [branch-str (clojure.core/name name)]
-      (when-let [writer (get writers branch-str)]
-        (pl/close! writer))
+    (let [branch-str (clojure.core/name name)
+          writer (get writers branch-str)]
+      (when writer (pl/close! writer))
+      ;; DELETE THE BRANCH, not just the handle. Dropping it from `writers` made
+      ;; `branches` stop listing it while the store still did, so its manifest
+      ;; stayed a permanent GC root and its blobs were never collectable — the
+      ;; branch outlived every reference to it. Only the store-backed model can
+      ;; do this; the path model leaves its overlay directory, which a later
+      ;; `branch!` of the same name would silently reuse.
+      (when (and writer (pl/store-backed? writer))
+        ((requiring-resolve 'scriptum.konserve/delete-branch!)
+         (:store (:backing writer)) branch-str))
       (assoc this :writers (dissoc writers branch-str))))
 
   (checkout [this name] (p/checkout this name nil))
@@ -263,10 +273,38 @@
          set))
 
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [this _snapshot-ids _opts]
-    (when-let [writer (get writers current-branch-name)]
-      (pl/gc! writer (Instant/now)))
-    this))
+  (gc-sweep! [_ snapshot-ids opts]
+    ;; RETURNS A REPORT, NOT THE SYSTEM, and no longer ignores its argument.
+    ;;
+    ;; It used to discard `snapshot-ids` and collect from the current branch's
+    ;; head unconditionally, so `(gc-sweep! sys #{})` — asking to delete NOTHING
+    ;; — took history from four commits to one, including the id `gc-roots` had
+    ;; just named as live. It also threw outright on a non-main current branch,
+    ;; because the path-model collector refuses those.
+    ;;
+    ;; Scriptum computes its own reachability, which the protocol explicitly
+    ;; allows ("adapters that compute their own reachability IGNORE it"), so the
+    ;; candidate list is not a delete list — but the ROOTS matter, and those are
+    ;; the branch heads plus whatever a caller still holds.
+    (let [writer (get writers current-branch-name)]
+      (if-not (and writer (pl/store-backed? writer))
+        ;; Path model: age out commit points on main, which is all it can do.
+        {:system-id (str "scriptum:" current-branch-name)
+         :reclaimed (if (and writer (pl/main-branch? writer))
+                      (pl/gc! writer (or (:remove-before opts) (Instant/now)))
+                      0)
+         :skipped (when-not (and writer (pl/main-branch? writer)) :not-main-branch)}
+        (let [store (:store (:backing writer))
+              store-id (:store-id (:backing writer))
+              held (into #{} (filter uuid?) snapshot-ids)]
+          (if (:dry-run? opts)
+            {:system-id (str "scriptum:" current-branch-name)
+             :reclaimed 0
+             :would-keep (count ((requiring-resolve 'scriptum.konserve/mark) store held))}
+            (let [collected ((requiring-resolve 'scriptum.konserve/gc!)
+                             store store-id (ku/now) held)]
+              {:system-id (str "scriptum:" current-branch-name)
+               :reclaimed (count collected)})))))))
 
 (defn create
   "Create a ScriptumSystem at the given path.
@@ -283,6 +321,30 @@
       {"main" writer}
       "main"
       (:system-name opts)))))
+
+(defn create-over-store
+  "Create a ScriptumSystem backed by a konserve store rather than a directory.
+
+  The store model is what makes several of these protocols honest: an index
+  state has an immutable, content-addressed address
+  (`scriptum.core/snapshot-address`), so a holder can come back to it, and
+  `gc-sweep!` can collect from reachability instead of ageing out commit points
+  on one branch.
+
+  `store` must carry a konserve id — connect it with
+  `konserve.store/connect-store`, not `connect-fs-store`; see
+  `scriptum.konserve/store-id-for` for why a store without one is refused.
+  `cache` is a local directory it materializes through, derived and disposable.
+
+  Options: as `create`, plus `:store-id`, `:max-merged-segment-mb`,
+  `:ram-buffer-mb`."
+  ([store ^String cache] (create-over-store store cache {}))
+  ([store ^String cache opts]
+   (let [writer (pl/open-store-index store cache "main"
+                                     (select-keys opts [:analyzer :store-id
+                                                        :max-merged-segment-mb
+                                                        :ram-buffer-mb]))]
+     (->ScriptumSystem cache {"main" writer} "main" (:system-name opts)))))
 
 (defn close!
   "Close the system and all its branch writers."

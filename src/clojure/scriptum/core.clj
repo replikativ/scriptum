@@ -243,6 +243,46 @@
                         :max-merged-segment-mb max-merged-segment-mb
                         :ram-buffer-mb ram-buffer-mb}))))
 
+(defn snapshot-address
+  "The immutable address of this branch's current index state, or nil.
+
+  THE VALUE A CALLER HOLDS TO COME BACK TO THIS EXACT STATE. A branch name is a
+  mutable cell and says nothing about which commit it is on; this is content-
+  addressed and cannot change under the holder. It is what a secondary-index
+  key-map should carry — datahike's already carries `:commit-id` for proximum
+  and `:dataset-commit-id` for stratum, and scriptum was the outlier naming a
+  branch.
+
+  It is also a merkle root over the segments it names (`ContentHash/hashMap`
+  over the file map, the same hash family as the blob addresses), so it doubles
+  as a content hash without `:crypto-hash?` being on.
+
+  Reflects the last COMMIT, since the branch pointer moves at commit time —
+  buffered writes are not in it. Store-backed indices only; nil otherwise."
+  [sw]
+  (when (store-backed? sw)
+    ((sk 'branch-snapshot) (:store (:backing sw)) (.getBranchName (->writer sw)))))
+
+(defn open-store-index-at
+  "Open `branch` as a WRITABLE index at the state named by `address`.
+
+  Points the branch at `address` and opens it — the restore half of
+  `snapshot-address`. Without it a holder could read a snapshot
+  (`scriptum.konserve/snapshot-directory`) but never write from one, so
+  restoring a secondary index to a specific state was impossible and opening the
+  branch silently gave whatever it had moved on to instead.
+
+  THIS MOVES THE BRANCH. Whatever it named before becomes unreachable and
+  collectable; hold that address yourself if you still want it. Do not call it
+  on a branch another writer has open — see
+  `scriptum.konserve/point-branch-at!`.
+
+  Takes the same options as `open-store-index`."
+  ([store cache branch address] (open-store-index-at store cache branch address {}))
+  ([store ^String cache ^String branch address opts]
+   ((sk 'point-branch-at!) store branch address)
+   (open-store-index store cache branch opts)))
+
 (defn branches
   "Every branch of a store-backed index, from its manifests."
   [sw]
