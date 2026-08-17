@@ -588,6 +588,43 @@
   [store]
   ((requiring-resolve 'konserve.protocols/store-id) store))
 
+(defonce ^{:private true
+           :doc
+           "One lock per store id, for operations that cannot be made safe by ordering.
+
+  THE VERIFY-AFTER-WRITE DOES NOT WORK, and this replaces it. Pointing a branch
+  at an OLD snapshot cannot be protected by `konserve.gc-guard`, which spares
+  what is written inside its window — this names something written long ago. The
+  check that followed the write looked sufficient and is not: `gc!` computes its
+  whitelist BEFORE the new pointer exists and sweeps AFTER the check has passed,
+  so the check sees a snapshot that is still there and about to be deleted. The
+  window is mark→sweep, and `sweep!` walks the whole keyspace — measured at 65 ms
+  on a 1034-key store, growing with the store rather than with the operation.
+
+  The observed result was as bad as it gets: `open-store-index-at` returned a
+  working writer and reported success, after which the branch could not be
+  opened by any reader or writer, and BOTH collectors threw store-wide,
+  permanently, for every branch. The only documented repair discarded the
+  branch's data.
+
+  In-process, like the guard itself, and that is the same support boundary
+  scriptum already documents — one writer per branch, in one JVM. Two processes
+  moving branches while a third collects is not covered here any more than it is
+  by the guard."}
+  store-locks
+  (atom {}))
+
+(defn- store-lock ^Object [store-id]
+  (or (get @store-locks store-id)
+      (get (swap! store-locks update store-id #(or % (Object.))) store-id)))
+
+(defmacro ^:private with-store-lock
+  "Serialize `body` against collection on the same store."
+  [store & body]
+  `(let [id# (or (store-id-for ~store) ::no-id)]
+     (locking (store-lock id#)
+       ~@body)))
+
 (def reserved-branch-names
   "Branch names that would collide with the cache's own layout.
 
@@ -1143,31 +1180,32 @@
   ;; then hands the next `gc!` a branch nothing roots, and it sweeps the manifest
   ;; and every blob: the precise failure `register-branch!`'s docstring exists to
   ;; warn about, reintroduced by a rollback meant to prevent a smaller one.
-  (let [registered-here? (register-branch! store to)] ; registry first — see there
-    (loop [attempt 0]
-      (let [address (branch-snapshot store from)]
-        (if-not address
-          {}
-          (do
-            (k/assoc store (manifest-key to) address {:sync? true})
-            (if (and (= address (branch-snapshot store from))
-                     (k/exists? store (snapshot-key address) {:sync? true}))
-              (snapshot-files store address)
-              (if (< attempt 3)
-                (recur (inc attempt))
+  (with-store-lock store
+    (let [registered-here? (register-branch! store to)] ; registry first — see there
+      (loop [attempt 0]
+        (let [address (branch-snapshot store from)]
+          (if-not address
+            {}
+            (do
+              (k/assoc store (manifest-key to) address {:sync? true})
+              (if (and (= address (branch-snapshot store from))
+                       (k/exists? store (snapshot-key address) {:sync? true}))
+                (snapshot-files store address)
+                (if (< attempt 3)
+                  (recur (inc attempt))
                 ;; LEAVE NO DANGLING POINTER BEHIND. `mark` resolves every branch
                 ;; pointer, and a branch naming a snapshot that is gone makes it
                 ;; throw — so one abandoned fork would disable collection for the
                 ;; whole store until someone found and deleted the branch. Undo
                 ;; before failing: pointer first, then the registry, the same
                 ;; order `delete-branch!` uses and for the same reason.
-                (do (k/dissoc store (manifest-key to) {:sync? true})
-                    (when registered-here?
-                      (k/update store branches-key #(disj (or % #{}) to) {:sync? true}))
-                    (throw (ex-info (str "scriptum: could not fork " from " to " to
-                                         " — its snapshot was collected mid-fork "
-                                         (inc attempt) " times")
-                                    {:from from :to to :address address})))))))))))
+                  (do (k/dissoc store (manifest-key to) {:sync? true})
+                      (when registered-here?
+                        (k/update store branches-key #(disj (or % #{}) to) {:sync? true}))
+                      (throw (ex-info (str "scriptum: could not fork " from " to " to
+                                           " — its snapshot was collected mid-fork "
+                                           (inc attempt) " times")
+                                      {:from from :to to :address address}))))))))))))
 
 (defn point-branch-at!
   "Make `branch` name the index state at `address`.
@@ -1205,22 +1243,23 @@
     (throw (ex-info (str "scriptum: snapshot " address " is not in the store, so "
                          branch " cannot be pointed at it")
                     {:branch branch :address address})))
-  (let [previous (k/get store (manifest-key branch) nil {:sync? true})
-        registered-here? (register-branch! store branch)]
-    (k/assoc store (manifest-key branch) address {:sync? true})
-    (if (k/exists? store (snapshot-key address) {:sync? true})
-      (snapshot-files store address)
-      (do
+  (with-store-lock store
+    (let [previous (k/get store (manifest-key branch) nil {:sync? true})
+          registered-here? (register-branch! store branch)]
+      (k/assoc store (manifest-key branch) address {:sync? true})
+      (if (k/exists? store (snapshot-key address) {:sync? true})
+        (snapshot-files store address)
+        (do
         ;; Undo, leaving the branch as it was rather than dangling.
-        (if previous
-          (k/assoc store (manifest-key branch) previous {:sync? true})
-          (k/dissoc store (manifest-key branch) {:sync? true}))
-        (when registered-here?
-          (k/update store branches-key #(disj (or % #{}) branch) {:sync? true}))
-        (throw (ex-info (str "scriptum: snapshot " address " was collected while "
-                             branch " was being pointed at it — pass it as "
-                             "extra-snapshots to gc! to hold it")
-                        {:branch branch :address address}))))))
+          (if previous
+            (k/assoc store (manifest-key branch) previous {:sync? true})
+            (k/dissoc store (manifest-key branch) {:sync? true}))
+          (when registered-here?
+            (k/update store branches-key #(disj (or % #{}) branch) {:sync? true}))
+          (throw (ex-info (str "scriptum: snapshot " address " was collected while "
+                               branch " was being pointed at it — pass it as "
+                               "extra-snapshots to gc! to hold it")
+                          {:branch branch :address address})))))))
 
 (defn fork-from-snapshot!
   "Branch `to` at the index state `address`, which must not already exist.
@@ -1265,20 +1304,25 @@
   them, leaving a snapshot whitelisted whose blobs had already been swept."
   ([store] (reachable store nil))
   ([store extra-snapshots]
-   (let [known (branches store)
-         ;; AN EMPTY REGISTRY OVER A NON-EMPTY KEYSPACE IS DRIFT, NOT AN EMPTY
-         ;; INDEX. It lives here rather than in `mark` so that every collector
-         ;; derived from this walk gets it: `mark` refused while `gc-cache!`
-         ;; happily wiped the whole pool and every view, which is a full
-         ;; re-download rather than the no-op the caller was owed.
-         _ (when (empty? known)
-             (when-let [orphans (seq (manifest-branches store))]
-               (throw (ex-info (str "scriptum: the branch registry is empty but "
-                                    (count orphans) " manifest(s) exist — refusing, "
-                                    "because collecting from this would treat the "
-                                    "whole index as garbage. Run `repair-branches!` "
-                                    "first.")
-                               {:orphans (set orphans)}))))
+   (let [;; THE KEYSPACE, NOT JUST THE REGISTRY. A manifest the registry does not
+         ;; name is drift, and drift means the branch is real while the root that
+         ;; protects it is missing — so marking from the registry alone treats a
+         ;; live branch as garbage and the sweep deletes it.
+         ;;
+         ;; This used to refuse only when the registry was ENTIRELY empty, which
+         ;; missed the case that actually happens: `register-branch!` runs once at
+         ;; Directory open while `flip!` writes the manifest on EVERY commit, so
+         ;; `delete-branch!` under a live writer removes the registry entry and
+         ;; the next commit puts the manifest back. The branch then reads back
+         ;; fine — through a cold cache, even — and the next routine `gc!`
+         ;; deletes it with no error anywhere. Reproduced.
+         ;;
+         ;; PROTECTING beats refusing: an orphan manifest is always drift (the
+         ;; registry is written before any manifest can be), so keeping it is
+         ;; never wrong, and refusing would leave collection wedged until someone
+         ;; ran `repair-branches!`. It costs one keyspace scan per collection,
+         ;; against a `sweep!` that already walks the same keys.
+         known (into (branches store) (manifest-branches store))
          pointers (into {} (keep (fn [b] (when-let [a (branch-snapshot store b)] [b a])))
                         known)
          ;; Branch pointers are scriptum's own: a dangling one is corruption,
@@ -1575,5 +1619,11 @@
      ;; there was nowhere to put the answer — `gc!` swept from scriptum's own
      ;; whitelist alone, which on a store carrying a metadata index deleted it
      ;; outright: roots, freed map and every PSS node.
-     (kgc/sweep! store (into (mark store extra-snapshots) extra-keys)
-                 cutoff 1000 {:sync? true}))))
+     ;; MARK AND SWEEP UNDER ONE LOCK. They are not atomic together: the
+     ;; whitelist is computed first and the deletion happens after, and anything
+     ;; that points a branch at an OLD snapshot in between produces a pointer the
+     ;; mark never saw to a snapshot the sweep is about to delete. See
+     ;; `store-locks` — verifying after the write cannot catch it.
+     (with-store-lock store
+       (kgc/sweep! store (into (mark store extra-snapshots) extra-keys)
+                   cutoff 1000 {:sync? true})))))

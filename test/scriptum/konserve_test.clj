@@ -997,23 +997,59 @@
       (is (nil? (k/get s sk/format-key nil {:sync? true}))
           "and refusing must not stamp it, or the evidence is destroyed"))))
 
-(deftest marking-refuses-an-empty-registry-over-a-live-keyspace
-  (testing "`sweep!` is allow-list, so marking from a registry that has lost its
-            entries whitelists nothing and deletes every branch — which is how
-            the registry became a GC root in the first place. An empty registry
-            over a non-empty keyspace is drift, not an empty index."
+(deftest marking-protects-a-branch-the-registry-has-forgotten
+  (testing "`sweep!` is allow-list, so a branch the registry does not name is
+            treated as garbage and deleted. It used to REFUSE only when the
+            registry was entirely empty, which missed the case that actually
+            happens: `register-branch!` runs once at Directory open while
+            `flip!` writes the manifest on EVERY commit, so `delete-branch!`
+            under a live writer removes the registry entry and the next commit
+            puts the manifest back. The branch then read back fine — through a
+            cold cache, even — and the next routine `gc!` destroyed it with no
+            error anywhere.
+
+            Protecting beats refusing: an orphan manifest is always drift, since
+            the registry is written before any manifest can be, so keeping it is
+            never wrong — and refusing would wedge collection until someone ran
+            `repair-branches!`."
     (let [s (store)
-          sid (random-uuid)]
+          sid (sk/store-id-for s)]
       (with-open [d (sk/konserve-directory s (cache) "main" sid)]
         (add-doc! d "precious"))
+      ;; the registry forgets a branch whose manifest is still there
       (k/assoc s sk/branches-key #{} {:sync? true})
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"registry is empty"
-                            (sk/gc! s sid))
-          "collection refuses rather than wiping")
-      (sk/repair-branches! s)
+      (is (contains? (sk/mark s) (sk/manifest-key "main"))
+          "the orphan manifest is still a root")
+      (let-the-millisecond-turn-over!)
       (sk/gc! s sid)
       (with-open [d (sk/konserve-directory s (cache) "main" sid)]
-        (is (= #{"precious"} (bodies d)) "and repair restores it")))))
+        (is (= #{"precious"} (bodies d))
+            "and collection leaves it intact rather than wiping it")))))
+
+(deftest a-delete-under-a-live-writer-does-not-lose-its-commits
+  (testing "REPRODUCED data loss. `delete-branch!` drops the registry entry and
+            the manifest, but a live writer's next `flip!` writes the manifest
+            back — so the branch is resurrected as a manifest nothing roots. Its
+            commit succeeded and read back through a cold directory, and a
+            routine `gc!` then deleted it silently and bricked the writer."
+    (let [s (store)
+          sid (sk/store-id-for s)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "m1"))
+      (sk/fork! s "main" "feature")
+      (with-open [d (sk/konserve-directory s (cache) "feature" sid)]
+        (add-doc! d "f1")
+        ;; the branch is deleted out from under the open Directory
+        (sk/delete-branch! s "feature")
+        (add-doc! d "f2")
+        (is (= #{"m1" "f1" "f2"} (bodies d)) "the commit succeeds"))
+      (let-the-millisecond-turn-over!)
+      (sk/gc! s sid)
+      (with-open [d (sk/konserve-directory s (cache) "feature" sid)]
+        (is (= #{"m1" "f1" "f2"} (bodies d))
+            "and a routine collection must not destroy what it committed"))
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (is (= #{"m1"} (bodies d)) "main is unaffected")))))
 
 (deftest a-stale-external-snapshot-is-ignored-not-fatal
   (testing "`extra-snapshots` are HINTS from a holder that is not scriptum, and
@@ -1669,3 +1705,55 @@
           "a key named in extra-keys survives the sweep")
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (is (= #{"x"} (bodies d)) "and the index is untouched")))))
+
+(deftest restoring-a-branch-cannot-land-inside-a-collection
+  (testing "REPRODUCED, and the worst failure found in this branch.
+            `point-branch-at!` verified AFTER writing the pointer that the
+            snapshot was still there, and claimed that caught a racing
+            collection. It cannot: `gc!` computes its whitelist BEFORE the new
+            pointer exists and sweeps AFTER the check has passed, so the check
+            sees a snapshot that is still present and about to be deleted. The
+            window is mark->sweep, and `sweep!` walks the whole keyspace.
+
+            `open-store-index-at` returned a working writer and reported
+            success; afterwards the branch could not be opened by any reader or
+            writer, and BOTH collectors threw store-wide, permanently, for every
+            branch. The only documented repair discarded the branch's data.
+
+            Serializing the two is the fix — the same in-process boundary the
+            guard already works within."
+    (let [s (store)
+          sid (sk/store-id-for s)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "x"))
+      (let [a1 (sk/branch-snapshot s "main")]
+        (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+          (add-doc! d "y"))
+        (let-the-millisecond-turn-over!)
+        ;; Run the restore in the window between mark and sweep — the
+        ;; interleaving a slow sweep gives for free.
+        (let [real-mark sk/mark
+              restored (promise)]
+          (with-redefs [sk/mark (fn [& args]
+                                  (let [m (apply real-mark args)]
+                                    (when-not (realized? restored)
+                                      (deliver restored
+                                               (future (sk/point-branch-at! s "main" a1))))
+                                    m))]
+            (sk/gc! s sid))
+          ;; EITHER ORDER IS CORRECT once they are serialized: the restore wins
+          ;; and the snapshot survives, or the collection wins and the restore
+          ;; refuses with its precondition. What must not happen is the third
+          ;; outcome — a restore that reports success over a snapshot the sweep
+          ;; then deletes.
+          (let [outcome (try {:ok @@restored}
+                             (catch java.util.concurrent.ExecutionException e
+                               {:refused (ex-message (.getCause e))}))]
+            (when-let [msg (:refused outcome)]
+              (is (re-find #"not in the store" msg)
+                  "a refused restore must say why, not corrupt"))))
+        ;; whatever order they took, the branch must be readable and collection alive
+        (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+          (is (seq (bodies d)) "the branch must still open"))
+        (is (set? (sk/mark s)) "and collection must not be wedged store-wide")
+        (is (map? (sk/gc-cache! s (cache))))))))
