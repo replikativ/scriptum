@@ -849,24 +849,46 @@
 
 (deftest cache-collection-spares-a-live-writers-lock
   (testing "REGRESSION: view deletion unlinked the whole directory including
-            Lucene's `write.lock`, so a writer whose branch had drifted out of
+            Lucene's `write.lock`, so a writer on a branch that is no longer in
             the registry failed its next commit with NoSuchFileException on the
-            lock itself. The lock is Lucene's, not ours — the open-time reconcile
-            already exempts it and this must too."
+            lock itself. The lock is the liveness test — held means skip the
+            directory untouched — and every deletion happens under it, because
+            doing the last pass after release let a writer acquire it in the gap
+            and lose its whole view.
+
+            Drift is not the way to reach this any more (the shared walk refuses
+            an empty registry outright), so this uses the honest route: a branch
+            deleted while a writer still holds it open."
     (let [s (store)
           sid (random-uuid)]
       (with-open [d (sk/konserve-directory s (cache) "main" sid)]
-        (add-doc! d "one")
+        (add-doc! d "main doc"))
+      (with-open [d (sk/konserve-directory s (cache) "doomed" sid)]
+        (add-doc! d "doomed doc")
         (with-open [iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
-          ;; drift: the registry forgets a branch that is open and being written
-          (k/assoc s sk/branches-key #{} {:sync? true})
+          ;; the branch goes away underneath a live writer
+          (sk/delete-branch! s "doomed")
           (sk/gc-cache! s (cache))
-          (is (.exists (io/file (cache) "main" "write.lock"))
-              "the lock survives collection")
+          (is (.exists (io/file (cache) "doomed" "write.lock"))
+              "a held lock means the view is left alone")
           (let [doc (Document.)]
-            (.add doc (TextField. "body" "two" Field$Store/YES))
+            (.add doc (TextField. "body" "still writable" Field$Store/YES))
             (.addDocument iw doc))
           (.commit iw))))))
+
+(deftest cache-collection-reclaims-a-released-view
+  (testing "the other side of the liveness test: once nothing holds the lock,
+            the view goes entirely, lock file included."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "main doc"))
+      (with-open [d (sk/konserve-directory s (cache) "doomed" sid)]
+        (add-doc! d "doomed doc"))
+      (sk/delete-branch! s "doomed")
+      (is (pos? (:views (sk/gc-cache! s (cache)))))
+      (is (not (.exists (io/file (cache) "doomed")))
+          "including the lock file, which is only ours to remove while we hold it"))))
 
 (deftest reserved-branch-names-are-refused
   (testing "a branch view is `cache/<branch>`, and `pool`/`snapshots` are
@@ -1200,3 +1222,33 @@
                             (sk/gc! s nil)))
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (is (= #{"precious"} (bodies d)) "and nothing was collected")))))
+
+(deftest the-guard-id-is-a-function-of-the-bytes-not-the-spelling
+  (testing "REGRESSION: konserve keeps the store path verbatim, so `/x/store`,
+            `/x/store/` and `/x/./store` derived THREE ids for one store — the
+            `same bytes, two ids` case the guard calls out as deleting live
+            data, measured at ~1400 lost blobs and a branch that would not open."
+    (let [base (str *root* "/store")
+          s1 (connect-fs-store base :opts {:sync? true})
+          s2 (connect-fs-store (str base "/") :opts {:sync? true})
+          s3 (connect-fs-store (str *root* "/./store") :opts {:sync? true})]
+      (is (= (sk/store-id-for s1) (sk/store-id-for s2) (sk/store-id-for s3))
+          "one store, one id, however it was spelled"))))
+
+(deftest a-fork-inherits-the-parents-guard-id
+  (testing "REGRESSION: `fork` dropped an explicit `:store-id`, so a caller using
+            the documented option got a parent guarded under their id and a fork
+            guarded under the derived one — two ids on one store, which is the
+            direction that deletes live data."
+    (let [s (store)
+          sid (str "explicit-" (random-uuid))]
+      (let [w (sc/open-store-index s (cache) "main" {:store-id sid})]
+        (try
+          (sc/add-doc w {:body {:type :text :value "parent"}})
+          (sc/commit! w "seed")
+          (let [f (sc/fork w "child")]
+            (try
+              (is (= sid (:store-id (:backing f)))
+                  "the fork must carry the parent's id, not re-derive one")
+              (finally (sc/close! f))))
+          (finally (sc/close! w)))))))

@@ -167,11 +167,17 @@
     ;; Forking a store-backed index copies a manifest — no bytes move and no
     ;; directory is created. The parent must land its buffered writes first, or
     ;; the copy names a manifest that does not yet describe them.
-    (let [{:keys [store cache]} (:backing sw)]
+    (let [{:keys [store cache store-id]} (:backing sw)]
       (.commit (->writer sw))
       ((sk 'fork!) store (.getBranchName (->writer sw)) new-branch-name)
+      ;; CARRY THE PARENT'S GUARD ID. Dropping it left a caller who passed
+      ;; `:store-id` explicitly with a parent guarded under their id and a fork
+      ;; guarded under the derived one — two ids for one store, which is the
+      ;; case `konserve.gc-guard` names as deleting live data, and which
+      ;; measured as thousands of lost blobs and a branch that would not open.
       (open-store-index store cache new-branch-name
-                        {:metadata-index (->metadata-index sw)}))
+                        {:metadata-index (->metadata-index sw)
+                         :store-id store-id}))
     (let [w (->writer sw)
           mi (->metadata-index sw)
           new-writer (.fork w new-branch-name)]
@@ -220,7 +226,7 @@
          writer (BranchIndexWriter/createOver dir branch analyzer)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer metadata-index
-                       {:store store :cache cache :directory dir}))))
+                       {:store store :cache cache :directory dir :store-id store-id}))))
 
 (defn branches
   "Every branch of a store-backed index, from its manifests."

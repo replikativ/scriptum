@@ -514,7 +514,13 @@
   is the case `konserve.gc-guard` calls out as deleting live data)."
   [store]
   (or ((requiring-resolve 'konserve.protocols/store-id) store)
-      (some-> store :backing :base str not-empty)))
+      ;; CANONICALIZED, because the id must be a function of the BYTES and the
+      ;; raw string is a function of how the caller spelled them. konserve keeps
+      ;; the path verbatim, so `/x/store`, `/x/store/`, `/x/./store` and a
+      ;; symlink to it are four ids for one store — the "same bytes, two ids"
+      ;; case the guard calls out as deleting live data, and measured as ~1400
+      ;; lost blobs and a branch that would not open.
+      (some-> store :backing :base str not-empty io/file .getCanonicalPath)))
 
 (def reserved-branch-names
   "Branch names that would collide with the cache's own layout.
@@ -561,7 +567,23 @@
   ;; RESOLVES THE GUARD ID rather than defaulting it to nil. Passing an explicit
   ;; nil to the 4-arity still opts out, which is only safe on a store that is
   ;; never collected — see `store-id-for` for what defaulting to nil cost.
-  (^Directory [store cache branch] (konserve-directory store cache branch (store-id-for store)))
+  (^Directory [store cache branch]
+   ;; REFUSE RATHER THAN SILENTLY DISABLE. Only konserve's own store-config and
+   ;; the filestore's path yield an id; a memory, tiered, S3 or JDBC store gives
+   ;; nil, and nil means the guard is a no-op and a concurrent collection sweeps
+   ;; an in-flight commit's blobs. This namespace is written for remote object
+   ;; stores, so failing closed there is the only defensible side. Pass an id
+   ;; explicitly — the same one every writer and collector on these bytes uses —
+   ;; or pass an explicit nil to the 4-arity to opt out on a store that is never
+   ;; collected.
+   (if-let [id (store-id-for store)]
+     (konserve-directory store cache branch id)
+     (throw (ex-info (str "scriptum: cannot derive a gc-guard id for this store, and "
+                          "running without one lets a collection delete an in-flight "
+                          "commit's blobs. Pass :store-id explicitly (the same value "
+                          "for every writer and collector on these bytes), or pass an "
+                          "explicit nil to opt out on a store that is never collected.")
+                     {:store-type (type store)}))))
   (^Directory [store ^String cache ^String branch store-id]
    (check-branch-name branch)
    (.mkdirs (io/file cache branch))
@@ -716,13 +738,23 @@
      ;; reader opening alongside a writer simply skips the cleanup, which is the
      ;; right answer: the debris is not going anywhere, and whoever owns the view
      ;; will clear it on its next open.
-     (try
-       (with-open [_ (.obtainLock live IndexWriter/WRITE_LOCK_NAME)]
-         (doseq [^String n (.list (io/file cache branch))]
-           (when-not (or (contains? (files-now) n) (= n IndexWriter/WRITE_LOCK_NAME))
-             (.delete (view-file cache branch n)))))
-       (catch org.apache.lucene.store.LockObtainFailedException _
-         (some-> store :backing :base str not-empty)))
+     ;; DEBRIS IS COMPUTED FIRST, AND THE LOCK IS TAKEN ONLY IF THERE IS ANY.
+     ;; Taking it unconditionally made every open — reader or writer — contend
+     ;; for `write.lock`, and a reader landing between a writer's release here
+     ;; and its `IndexWriter` construction killed the writer open with
+     ;; LockObtainFailedException about 1% of the time. That contradicts this
+     ;; namespace's own contract, which says readers are unconstrained. The
+     ;; overwhelmingly common case is a view with no debris at all, and that
+     ;; case must not touch the lock.
+     (let [debris (remove #(or (contains? (files-now) %)
+                               (= % IndexWriter/WRITE_LOCK_NAME))
+                          (.list (io/file cache branch)))]
+       (when (seq debris)
+         (try
+           (with-open [_ (.obtainLock live IndexWriter/WRITE_LOCK_NAME)]
+             (doseq [^String n debris]
+               (.delete (view-file cache branch n))))
+           (catch org.apache.lucene.store.LockObtainFailedException _ nil))))
      ;; FilterDirectory over the live MMapDirectory, not a bare Directory: this
      ;; IS an mmap'd directory with a store-backed materialization layer in
      ;; front, and `FilterDirectory.unwrap` is how Lucene detects that. A bare
@@ -1062,6 +1094,19 @@
   ([store] (reachable store nil))
   ([store extra-snapshots]
    (let [known (branches store)
+         ;; AN EMPTY REGISTRY OVER A NON-EMPTY KEYSPACE IS DRIFT, NOT AN EMPTY
+         ;; INDEX. It lives here rather than in `mark` so that every collector
+         ;; derived from this walk gets it: `mark` refused while `gc-cache!`
+         ;; happily wiped the whole pool and every view, which is a full
+         ;; re-download rather than the no-op the caller was owed.
+         _ (when (empty? known)
+             (when-let [orphans (seq (manifest-branches store))]
+               (throw (ex-info (str "scriptum: the branch registry is empty but "
+                                    (count orphans) " manifest(s) exist — refusing, "
+                                    "because collecting from this would treat the "
+                                    "whole index as garbage. Run `repair-branches!` "
+                                    "first.")
+                               {:orphans (set orphans)}))))
          pointers (into {} (keep (fn [b] (when-let [a (branch-snapshot store b)] [b a])))
                         known)
          ;; Branch pointers are scriptum's own: a dangling one is corruption,
@@ -1141,18 +1186,6 @@
   ([store] (mark store nil))
   ([store extra-snapshots]
    (let [{:keys [known snapshots addresses]} (reachable store extra-snapshots)]
-     ;; AN EMPTY REGISTRY OVER A NON-EMPTY KEYSPACE IS DRIFT, NOT AN EMPTY INDEX,
-     ;; and the difference is the whole store. `sweep!` is allow-list, so marking
-     ;; from a registry that has lost its entries whitelists nothing and deletes
-     ;; every branch — which is how the registry came to be a GC root in the
-     ;; first place. Cheap because it only scans when the registry is empty.
-     (when (empty? known)
-       (when-let [orphans (seq (manifest-branches store))]
-         (throw (ex-info (str "scriptum: the branch registry is empty but " (count orphans)
-                              " manifest(s) exist — refusing to mark, because sweeping "
-                              "from this would delete the whole index. Run "
-                              "`repair-branches!` first.")
-                         {:orphans (set orphans)}))))
      (-> #{branches-key format-key}
          (into (map manifest-key) known)
          (into (map snapshot-key) snapshots)
@@ -1219,17 +1252,31 @@
          ;; whole pool, which is the number a caller reads to decide whether it
          ;; reclaimed space.
          rm-dir! (fn [^java.io.File d]
+                   ;; EVERYTHING UNDER THE LOCK, including the lock file. Doing
+                   ;; the second pass after release reintroduced exactly what
+                   ;; taking the lock was meant to prevent: a writer acquiring it
+                   ;; in the gap had its whole view unlinked — its held
+                   ;; `write.lock` with it — and failed with NoSuchFileException
+                   ;; on the lock, the verbatim symptom this was fixed for.
+                   ;; Deleting a lock file we currently hold is safe; deleting
+                   ;; one someone else has just taken is the bug.
+                   ;;
+                   ;; Catches IOException, not only LockObtainFailedException:
+                   ;; `MMapDirectory/open` and `obtainLock` throw the whole
+                   ;; family, and a single unreadable directory aborting the call
+                   ;; left the pool unreclaimed — the unbounded-cache failure
+                   ;; this function exists to prevent, from one bad directory.
                    (try
                      (with-open [dir (MMapDirectory/open (->path (.getPath d)))
                                  _ (.obtainLock dir IndexWriter/WRITE_LOCK_NAME)]
-                       (run! #(.delete ^java.io.File %) (.listFiles d)))
-                     ;; the lock file itself is only ours to remove once released
-                     (let [left (.listFiles d)]
-                       (run! #(.delete ^java.io.File %) left)
+                       (run! #(.delete ^java.io.File %)
+                             (remove #(= IndexWriter/WRITE_LOCK_NAME
+                                         (.getName ^java.io.File %))
+                                     (.listFiles d)))
+                       (.delete (io/file d IndexWriter/WRITE_LOCK_NAME))
                        (.delete d)
                        true)
-                     (catch org.apache.lucene.store.LockObtainFailedException _
-                       false)))
+                     (catch java.io.IOException _ false)))
          pool-dir (io/file cache "pool")
          blobs (if (.isDirectory pool-dir)
                  (count (filterv (fn [^java.io.File f]
