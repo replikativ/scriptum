@@ -226,7 +226,12 @@ public class BranchIndexWriter implements Closeable {
    * ref-counting — but they are harmless, and leaving them in keeps one writer implementation
    * instead of two.
    *
-   * @param directory the Directory to write through; the caller owns closing it
+   * <p>OWNERSHIP: this writer closes the supplied Directory in {@link #close()}, like every other
+   * constructor here. The parameter was documented as caller-owned, and {@code
+   * scriptum.core/close!} closed it a second time on that basis — the second close threw
+   * AlreadyClosedException on a Directory that reports it.
+   *
+   * @param directory the Directory to write through; this writer closes it
    * @param branchName the branch this writer is on
    * @param analyzer the analyzer to use for text processing
    * @return a new BranchIndexWriter with no base path
@@ -525,6 +530,25 @@ public class BranchIndexWriter implements Closeable {
 
     // 3. Create new overlay directory
     Path newOverlayPath = basePath.resolve("branches").resolve(newBranchName);
+
+    // REFUSE AN EXISTING TARGET BEFORE WRITING ANYTHING. This wrote the cloned
+    // SegmentInfos into the target overlay first and only discovered a live
+    // writer afterwards, when constructing IndexWriter threw
+    // LockObtainFailedException — by which time this branch's commit was already
+    // the newest durable one in the target. The target's own writer kept serving
+    // its old NRT view, and everything it had committed vanished on the next
+    // reopen. Reproduced: a feature-only document, gone after a fork that threw.
+    if (Files.isDirectory(newOverlayPath)) {
+      try (java.util.stream.Stream<Path> existing = Files.list(newOverlayPath)) {
+        if (existing.anyMatch(p -> p.getFileName().toString().startsWith("segments"))) {
+          throw new IOException(
+              "scriptum: branch "
+                  + newBranchName
+                  + " already exists; forking onto it would replace its history with this"
+                  + " branch's");
+        }
+      }
+    }
     Files.createDirectories(newOverlayPath);
 
     Directory baseDir = MMapDirectory.open(basePath);
@@ -986,8 +1010,12 @@ public class BranchIndexWriter implements Closeable {
    * at this layer.
    *
    * <p>Requires a commit to take effect, because {@link IndexDeletionPolicy#onCommit} is where
-   * Lucene lets a policy delete — so one is issued here. The shrunken file map reaches the store
-   * at the flip that commit performs.
+   * Lucene lets a policy delete — so one is issued here, but only when something will actually be
+   * dropped, since the commit itself becomes a commit point.
+   *
+   * <p>The shrunken file map reaches the store at the NEXT commit, not this one: Lucene runs the
+   * deletion policy during the checkpoint that follows {@code finishCommit}, by which time the
+   * manifest for this commit has already been written.
    *
    * <p>The newest commit point always survives. Reading a dropped one is no longer possible by
    * generation; its state is reachable by snapshot address instead, which is what {@code

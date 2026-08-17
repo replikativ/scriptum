@@ -137,7 +137,11 @@
   (branch! [this name from] (p/branch! this name from nil))
   (branch! [this name from _opts]
     (let [branch-str (clojure.core/name name)
-          from-str (str from)
+          ;; `name`, not `str`: `writers` is keyed by plain strings, and
+          ;; `(str :feature)` is ":feature", which never matches. The lookup
+          ;; failed and fell back to the CURRENT branch, so an explicit `from`
+          ;; silently forked the wrong one.
+          from-str (when from (clojure.core/name from))
           source-writer (or (get writers from-str) (get writers current-branch-name))
           new-writer (pl/fork source-writer branch-str)]
       (assoc this :writers (assoc writers branch-str new-writer))))
@@ -299,14 +303,29 @@
               ;; the whole contract: the coordinator has already computed the
               ;; reachable set from every system's `gc-roots` and the commit
               ;; graph, and hands each adapter its own unreachable, past-grace
-              ;; entries. Dropping them shrinks the branch's manifest; the store
+              ;; entries. Dropping them shrinks a branch's manifest; the store
               ;; collector then reclaims the blobs nothing else names.
-              (when (seq snapshot-ids)
-                (pl/retain! writer {:commit-ids snapshot-ids}))
-              (when-let [before (:remove-before opts)]
-                (pl/retain! writer {:before (if (instance? Instant before)
-                                              before
-                                              (.toInstant ^java.util.Date before))}))
+              ;;
+              ;; ACROSS EVERY BRANCH, not just the current one. The candidates
+              ;; belong to the SYSTEM, and after a fork the same old commit
+              ;; exists on several branches — retaining only the current one left
+              ;; the copies behind while the coordinator, taking a successful
+              ;; return as deletion, deregistered every candidate. They could
+              ;; then never be nominated again, so that history became permanent.
+              ;;
+              ;; ONE call per writer, not one per criterion: two passes meant the
+              ;; first created a bookkeeping head and the second protected THAT
+              ;; instead of the head `gc-roots` had reported, and dropped the
+              ;; real one.
+              (let [before (when-let [b (:remove-before opts)]
+                             (if (instance? Instant b) b (.toInstant ^java.util.Date b)))
+                    ids (seq snapshot-ids)]
+                (when (or before ids)
+                  (doseq [[_ w] writers]
+                    (when (pl/store-backed? w)
+                      (pl/retain! w (cond-> {}
+                                      before (assoc :before before)
+                                      ids (assoc :commit-ids ids)))))))
               (sk/gc! (:store (:backing writer)) (:store-id (:backing writer))
                       (ku/now) nil))
             this)

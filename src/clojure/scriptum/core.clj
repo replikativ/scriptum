@@ -963,10 +963,16 @@
     ;; as a parent. Without this the merged branch's history is not an ancestor
     ;; of the result: it survives as segments, but nothing walking parents can
     ;; reach it, and the head address stops covering it.
+    (.mergeFrom tw sw)
+    ;; AFTER the merge, not before. `mergeFrom` commits the source so it can read
+    ;; a consistent view of it, and that commit produces a NEW source snapshot —
+    ;; which is the state actually merged. Capturing the address first recorded
+    ;; the source's PREVIOUS head as the parent, so the lineage the target really
+    ;; took in was not an ancestor of the result, and the head address did not
+    ;; cover it. Both are claims this layout is built on.
     (when (and (store-backed? target) (store-backed? source))
       (when-let [a (snapshot-address source)]
-        (swap! (:pending-parents (:backing target)) conj a)))
-    (.mergeFrom tw sw)))
+        (swap! (:pending-parents (:backing target)) conj a)))))
 
 (defn close!
   "Close a branch writer and its resources."
@@ -975,9 +981,8 @@
         mi (->metadata-index sw)]
     (when mi
       (metadata/close-index! mi))
-    (.close writer)
-    ;; A store-backed writer holds a Directory the caller did not construct, so
-    ;; closing the writer is not enough — `createOver` takes the Directory as
-    ;; given and leaves its lifetime to whoever supplied it, which here is us.
-    (when-let [^java.io.Closeable dir (:directory (:backing sw))]
-      (.close dir))))
+    ;; ONE close. `BranchIndexWriter.close` closes the Directory it was given —
+    ;; `createOver`'s javadoc used to claim the caller owned it, and closing it
+    ;; again here on that basis threw AlreadyClosedException on any Directory
+    ;; that reports being closed.
+    (.close writer)))

@@ -1,7 +1,8 @@
 (ns scriptum.core-test
   "Unit tests for scriptum.core Lucene functionality."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [scriptum.core :as sc])
+            [scriptum.core :as sc]
+            [konserve.store :as kstore])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
            [java.time Instant Duration]))
@@ -837,3 +838,51 @@
                 "and main's own survives, as before")
             (finally (sc/close! feature))))
         (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest forking-onto-an-existing-branch-is-refused
+  (testing "REGRESSION, data loss: `fork` wrote the cloned SegmentInfos into the
+            target overlay BEFORE constructing the IndexWriter that discovers the
+            target's lock. So a fork onto a live branch threw
+            LockObtainFailedException having already installed this branch's
+            commit as the newest durable one there — the target's own writer kept
+            serving its old NRT view, and everything it had committed vanished on
+            the next reopen."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "on main"})
+        (sc/commit! main "m")
+        (let [feature (sc/fork main "feature")]
+          (try
+            (sc/add-doc feature {:body "feature only"})
+            (sc/commit! feature "f")
+            (is (thrown? java.io.IOException (sc/fork main "feature"))
+                "forking onto an existing branch must be refused")
+            (finally (sc/close! feature))))
+        ;; and the branch still has what it committed
+        (let [reopened (sc/open-branch path "feature")]
+          (try
+            (is (= 2 (sc/num-docs reopened))
+                "the target branch must keep its own history")
+            (finally (sc/close! reopened))))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest closing-a-store-backed-writer-closes-its-directory-once
+  (testing "REGRESSION: `createOver`'s javadoc said the caller owned the supplied
+            Directory while `close()` closed it itself, and `close!` closed it
+            again on the javadoc's word — the second close threw
+            AlreadyClosedException on any Directory that reports being closed."
+    (let [path (temp-dir)]
+      (try
+        (let [s (kstore/create-store {:backend :file :path (str path "/store")
+                                      :id (random-uuid)}
+                                     {:sync? true})
+              w (sc/open-store-index s (str path "/cache") "main")]
+          (sc/add-doc w {:body {:type :text :value "x"}})
+          (sc/commit! w "one")
+          (is (nil? (sc/close! w)) "closing must not throw")
+          ;; and reopening works, i.e. nothing was left half-closed
+          (let [w2 (sc/open-store-index s (str path "/cache") "main")]
+            (try (is (= 1 (sc/num-docs w2)))
+                 (finally (sc/close! w2)))))
+        (finally (delete-dir-recursive path))))))

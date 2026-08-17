@@ -528,8 +528,16 @@
   (let [pf (pool-file cache address)]
     (when-not (.exists pf)
       (io/make-parents pf)
-      (Files/createLink (->path (.getPath pf))
-                        (->path (.getPath (view-file cache branch name)))))))
+      (try
+        (Files/createLink (->path (.getPath pf))
+                          (->path (.getPath (view-file cache branch name))))
+        ;; A CONCURRENT IDENTICAL LINK IS SUCCESS, not failure. `sync` now
+        ;; uploads in parallel, so two workers handling different NAMES with the
+        ;; same content — the address is a content hash — race between the
+        ;; `.exists` check and the link. The loser was throwing out of the whole
+        ;; commit; measured at 2 failures in 300. Whoever won linked the same
+        ;; bytes under the same address, which is exactly what this wanted.
+        (catch FileAlreadyExistsException _ nil)))))
 
 ;; =============================================================================
 ;; The Directory
@@ -1190,10 +1198,6 @@
   [store from to]
   (ensure-format! store)
   (check-branch-name to)
-  ;; `k/exists?` on the one key, not a scan: existence of a branch IS existence
-  ;; of its manifest, so this needs a lookup rather than an enumeration.
-  (when (k/exists? store (manifest-key to) {:sync? true})
-    (throw (ex-info "scriptum: branch already exists" {:branch to})))
   ;; Copy the POINTER, not the map: both branches now name the same immutable
   ;; snapshot, so a fork writes one small value and the two histories share a
   ;; tree until either commits. Under the previous layout this rewrote the whole
@@ -1219,6 +1223,14 @@
   ;; and every blob: the precise failure `register-branch!`'s docstring exists to
   ;; warn about, reintroduced by a rollback meant to prevent a smaller one.
   (with-store-lock store
+    ;; INSIDE the lock, and `k/exists?` on the one key rather than a scan:
+    ;; existence of a branch IS existence of its manifest. Checked outside the
+    ;; lock, two concurrent forks to one name both saw the target absent, both
+    ;; serialized afterwards, and BOTH reported success — leaving whichever ran
+    ;; last, so one caller's branch silently was not the one it believed it had
+    ;; created. Reproduced 57 times in 100.
+    (when (k/exists? store (manifest-key to) {:sync? true})
+      (throw (ex-info "scriptum: branch already exists" {:branch to})))
     (let [registered-here? (register-branch! store to)] ; registry first — see there
       (loop [attempt 0]
         (let [address (branch-snapshot store from)]
@@ -1312,9 +1324,13 @@
   there would branch from the wrong place entirely."
   [store to address]
   (ensure-format! store)
-  (when (k/exists? store (manifest-key to) {:sync? true})
-    (throw (ex-info "scriptum: branch already exists" {:branch to})))
-  (point-branch-at! store to address))
+  ;; The existence check belongs under the same lock as the write, so it is done
+  ;; by `point-branch-at!` rather than here — see `fork!` for what checking
+  ;; outside it cost.
+  (with-store-lock store
+    (when (k/exists? store (manifest-key to) {:sync? true})
+      (throw (ex-info "scriptum: branch already exists" {:branch to})))
+    (point-branch-at! store to address)))
 
 (defn delete-branch!
   "Forget `branch`. Blobs it referenced survive until `gc!` finds them

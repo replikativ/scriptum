@@ -1648,8 +1648,13 @@
           (try
             (sc/add-doc feature {:body {:type :text :value "on feature"}})
             (sc/commit! feature "f1")
-            (let [feature-head (sc/snapshot-address feature)]
-              (sc/merge-from! main feature)
+            (let [_ (sc/merge-from! main feature)
+                  ;; AFTER the merge: `mergeFrom` commits the source so it can
+                  ;; read a consistent view, and that commit produces the source
+                  ;; snapshot actually merged. Capturing before it recorded the
+                  ;; source's PREVIOUS head, so the lineage really taken in was
+                  ;; not an ancestor of the result.
+                  feature-head (sc/snapshot-address feature)]
               (sc/commit! main "merged")
               (let [head (sc/snapshot-address main)
                     reachable (ancestors-of s head)]
