@@ -5,9 +5,14 @@
   with lazy loading from disk (O(1) startup) and incremental updates.
 
   Each entry is {:branch b :key k :value v :generation g}.
-  Sorted by [:branch :key :value] enabling efficient exact and floor queries."
-  (:require [clojure.core.async :refer [<!!]]
-            [konserve.core :as k]
+  Sorted by [:branch :key :value] enabling efficient exact and floor queries.
+
+  Every store call is `{:sync? true}`. It used to block on konserve's async
+  channel with `<!!`, which measured 8.6x slower per write on the same
+  filestore — a flush issues eight of them, so it dominated commit cost for any
+  index carrying metadata. `scriptum.konserve` was already synchronous
+  throughout; this namespace was the outlier."
+  (:require [konserve.core :as k]
             [konserve.filestore :refer [connect-fs-store]]
             [org.replikativ.persistent-sorted-set :as pss])
   (:import [org.replikativ.persistent_sorted_set ANode Branch IStorage Leaf Settings]))
@@ -55,13 +60,13 @@
                      :keys      (mapv entry->map (.keys node))
                      :addresses (when (instance? Branch node)
                                   (vec (.addresses ^Branch node)))}]
-      (<!! (k/assoc kv-store address node-data))
+      (k/assoc kv-store address node-data {:sync? true})
       (swap! cache assoc address node)
       address))
 
   (restore [_ address]
     (or (get @cache address)
-        (let [node-data (<!! (k/get kv-store address))
+        (let [node-data (k/get kv-store address nil {:sync? true})
               raw-keys (:keys node-data)
               keys (mapv map->entry raw-keys)
               addresses (:addresses node-data)
@@ -77,6 +82,17 @@
   (accessed [_ _address] nil)
 
   (markFreed [_ address]
+    ;; KNOWN LEAK, not yet fixed. This map grows with every node the tree ever
+    ;; frees and nothing prunes it — measured ~1 entry per commit — and
+    ;; `flush-index!` rewrites the whole map on every flush, so the cost is
+    ;; O(commits) per commit and O(n^2) overall: ~0.13 ms at 1 entry against
+    ;; ~3.6 ms at 5000.
+    ;;
+    ;; The fix is to delete the freed node from the store and drop it from the
+    ;; map, which would bound both this and the orphaned nodes it tracks. Left
+    ;; alone deliberately: persistent-sorted-set is the only consumer of
+    ;; `isFreed`/`freedInfo`, and pruning changes the answers it gets, so it
+    ;; needs PSS's contract confirmed rather than a guess about it.
     (when address
       (swap! freed-atom assoc address (System/currentTimeMillis))))
 
@@ -94,7 +110,7 @@
   (let [dir (java.io.File. (str path))]
     (when-not (.exists dir)
       (.mkdirs dir)))
-  (<!! (connect-fs-store (str path))))
+  (connect-fs-store (str path) :opts {:sync? true}))
 
 (defn- create-storage
   ([kv-store]
@@ -103,16 +119,16 @@
    (->ScriptumMetadataStorage kv-store settings (atom {}) (atom {}))))
 
 (defn- save-roots! [kv-store roots]
-  (<!! (k/assoc kv-store :metadata/roots roots)))
+  (k/assoc kv-store :metadata/roots roots {:sync? true}))
 
 (defn- load-roots [kv-store]
-  (<!! (k/get kv-store :metadata/roots)))
+  (k/get kv-store :metadata/roots nil {:sync? true}))
 
 (defn- save-freed! [kv-store freed]
-  (<!! (k/assoc kv-store :metadata/freed freed)))
+  (k/assoc kv-store :metadata/freed freed {:sync? true}))
 
 (defn- load-freed [kv-store]
-  (or (<!! (k/get kv-store :metadata/freed)) {}))
+  (or (k/get kv-store :metadata/freed nil {:sync? true}) {}))
 
 ;; ============================================================================
 ;; MetadataIndex record
