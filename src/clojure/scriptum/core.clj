@@ -185,12 +185,17 @@
   local files, so a cache is required even when the store is remote; what the
   store buys is that it is the only thing that must be durable.
 
+  Takes a CONNECTED store. A secondary index that must reconnect from a
+  serialized key-map (datahike's `-sec-restore`) connects it itself and passes
+  the store in — that belongs in the adapter, which owns the config, not here.
+
   Options:
     :analyzer - the Lucene Analyzer (default: StandardAnalyzer)
     :metadata-index - shared metadata index (default: none)
     :store-id - id for konserve.gc-guard, so a collection cannot sweep this
-                index's in-flight segment writes. Should come off the store
-                itself; see `scriptum.konserve/konserve-directory`.
+                index's in-flight segment writes. Defaults to the store's own
+                id, which is what keeps two components on one store from
+                disagreeing about its name.
     :max-merged-segment-mb / :ram-buffer-mb - see `create-index`. Against a
                 remote store start from `scriptum.konserve/remote-tuning`.
 
@@ -201,6 +206,10 @@
   ([store ^String cache ^String branch
     {:keys [analyzer metadata-index store-id max-merged-segment-mb ram-buffer-mb]}]
    (let [analyzer (or analyzer (StandardAnalyzer.))
+         ;; Default the guard id off the store rather than making the caller
+         ;; track it, so two components on one store cannot disagree about its
+         ;; name — see konserve.gc-guard on why only that direction is unsafe.
+         store-id (or store-id ((requiring-resolve 'konserve.protocols/store-id) store))
          dir ((sk 'konserve-directory) store cache branch store-id)
          writer (BranchIndexWriter/createOver dir branch analyzer)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
