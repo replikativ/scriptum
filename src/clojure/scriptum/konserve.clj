@@ -721,6 +721,15 @@
   is safe to run there."
   ([store store-id] (gc! store store-id (ku/now)))
   ([store store-id ts]
+   ;; REFUSE A LAYOUT WE CANNOT READ BEFORE DELETING ANYTHING. `gc!` is reachable
+   ;; without ever opening a Directory, so it cannot rely on the check there, and
+   ;; it is the one operation where misreading a manifest destroys data rather
+   ;; than merely failing: `reachable-addresses` takes `vals` of every manifest
+   ;; and assumes each is a whole-blob address. Under a layout whose entries are
+   ;; not addresses — the batched `[address offset length]` form this version
+   ;; marker exists to make possible — every val misses every blob key, and
+   ;; `sweep!` being allow-list then deletes THE ENTIRE STORE.
+   (ensure-format! store)
    ;; THE GUARD IS READ BEFORE THE MANIFESTS ARE WALKED, and that order is the
    ;; whole point — `sweep!` cannot do it for us, because by the time it has a
    ;; whitelist the walk has already happened.

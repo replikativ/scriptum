@@ -571,6 +571,26 @@
       (is (= {:version sk/format-version} (k/get s sk/format-key nil {:sync? true}))
           "the format stamp is a GC root"))))
 
+(deftest collection-is-refused-on-a-newer-layout
+  (testing "`gc!` reaches a store without opening a Directory, so it cannot rely
+            on the check there — and it is the one operation where misreading a
+            manifest DESTROYS data instead of failing. `reachable-addresses`
+            takes `vals` of every manifest and assumes each is a whole-blob
+            address; under a layout whose entries are not addresses, every val
+            misses every blob key and allow-list `sweep!` takes the whole store."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "keep me"))
+      (let [blob-key? (fn [e] (= [:scriptum :blob] (subvec (:key e) 0 2)))
+            blobs #(count (filter blob-key? (k/keys s {:sync? true})))
+            before (blobs)]
+        (is (pos? before) "precondition: there are blobs to lose")
+        (k/assoc s sk/format-key {:version (inc sk/format-version)} {:sync? true})
+        (let-the-millisecond-turn-over!)
+        (is (thrown? clojure.lang.ExceptionInfo (sk/gc! s sid)))
+        (is (= before (blobs)) "and refusing must delete nothing")))))
+
 (deftest concurrent-readers-may-materialize-the-same-file
   (testing "REGRESSION: `link-into-view!` checked `.exists` then linked, so two
             readers materializing one file both saw it absent and both linked —
