@@ -295,8 +295,20 @@
 
         (pl/store-backed? writer)
         (do (when-not (:dry-run? opts)
+              ;; THE CANDIDATES ARE COMMIT POINTS TO DROP, and honouring them is
+              ;; the whole contract: the coordinator has already computed the
+              ;; reachable set from every system's `gc-roots` and the commit
+              ;; graph, and hands each adapter its own unreachable, past-grace
+              ;; entries. Dropping them shrinks the branch's manifest; the store
+              ;; collector then reclaims the blobs nothing else names.
+              (when (seq snapshot-ids)
+                (pl/retain! writer {:commit-ids snapshot-ids}))
+              (when-let [before (:remove-before opts)]
+                (pl/retain! writer {:before (if (instance? Instant before)
+                                              before
+                                              (.toInstant ^java.util.Date before))}))
               (sk/gc! (:store (:backing writer)) (:store-id (:backing writer))
-                      (ku/now) (into #{} (filter uuid?) snapshot-ids)))
+                      (ku/now) nil))
             this)
 
         ;; Path model: age out commit points, which is all it can do, and only on

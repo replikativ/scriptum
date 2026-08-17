@@ -29,7 +29,8 @@
            [org.apache.lucene.index IndexWriter IndexWriterConfig DirectoryReader Term]
            [org.apache.lucene.search IndexSearcher]
            [org.apache.lucene.store AlreadyClosedException IOContext LockObtainFailedException]
-           [java.nio.file Files LinkOption Paths FileAlreadyExistsException]))
+           [java.nio.file Files LinkOption Paths FileAlreadyExistsException]
+           [java.time Instant]))
 
 (def ^:dynamic *root* nil)
 
@@ -1792,3 +1793,77 @@
         (let [segs (sk/warm! s (cache) "main"
                              {:only #(clojure.string/starts-with? % "segments_")})]
           (is (< 0 segs n-files) ":only warms a subset"))))))
+
+;; =============================================================================
+;; Retention
+;; =============================================================================
+
+(deftest retention-bounds-a-store-backed-index
+  (testing "THE THING THAT MAKES A STORE-BACKED INDEX FINITE. Every commit point
+            is kept, so the branch's file map is cumulative and all of it is
+            legitimately reachable — which is why `gc!` correctly reclaimed
+            nothing however long the index ran. Dropping commit points removes
+            their files from the manifest, and the collector can then take the
+            blobs no other branch names.
+
+            No protected-file scan is needed here, unlike the directory model:
+            a drop removes a NAME from this branch's manifest, and whether the
+            blob dies is decided afterwards by reachability across every branch,
+            which `mark` already computes."
+    (let [s (store)
+          sid (sk/store-id-for s)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (dotimes [i 20]
+          (sc/add-doc w {:body {:type :text :value (str "doc " i)}})
+          (sc/commit! w (str "c" i)))
+        (let [before-files (count (sk/read-manifest s "main"))
+              before-points (count (filter #(clojure.string/starts-with? % "segments_")
+                                           (keys (sk/read-manifest s "main"))))]
+          (is (<= 20 before-points) "precondition: every commit point is retained")
+          (let [dropped (sc/retain! w {:before (Instant/now)})]
+            (is (pos? dropped) "commit points are dropped")
+            (let [after-files (count (sk/read-manifest s "main"))]
+              (is (< after-files before-files)
+                  "and the manifest shrinks, which is what makes the blobs collectable")))
+          (is (= 20 (sc/num-docs w)) "without losing a single live document"))
+        (finally (sc/close! w)))
+      ;; the blobs the manifest no longer names are now reclaimable
+      (let-the-millisecond-turn-over!)
+      (let [collected (count (sk/gc! s sid))]
+        (is (pos? collected) "the collector finally has something to take"))
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (is (= 20 (count (bodies-at s (cache) (sk/branch-snapshot s "main"))))
+            "and the index still reads every live document")))))
+
+(deftest retention-can-drop-named-commits
+  (testing "yggdrasil's coordinator computes reachability itself and hands each
+            adapter its own candidates, so a time cutoff cannot express what it
+            wants — an unreachable commit may be newer than a reachable one on
+            another branch."
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (dotimes [i 5]
+          (sc/add-doc w {:body {:type :text :value (str "doc " i)}})
+          (sc/commit! w (str "c" i)))
+        (let [snaps (sort-by :generation (sc/list-snapshots w))
+              victims (map :snapshot-id (take 2 snaps))
+              dropped (sc/retain! w {:commit-ids victims})]
+          (is (= 2 dropped) "exactly the named commit points go")
+          (let [left (set (map :snapshot-id (sc/list-snapshots w)))]
+            (is (empty? (filter left victims)) "and they are gone from the history")
+            (is (= 5 (sc/num-docs w)) "with every live document intact")))
+        (finally (sc/close! w))))))
+
+(deftest retention-is-refused-on-a-directory-backed-index
+  (testing "there a commit point holds real files another branch may share, so
+            dropping one needs the protected-file scan `gc!` does."
+    (let [path (str *root* "/dir-index")
+          w (sc/create-index path "main")]
+      (try
+        (sc/add-doc w {:title "x"})
+        (sc/commit! w "one")
+        (is (nil? (sc/retain! w {:before (Instant/now)}))
+            "retain! is a no-op there, and gc! is the way")
+        (finally (sc/close! w))))))

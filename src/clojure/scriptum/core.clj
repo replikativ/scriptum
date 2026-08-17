@@ -280,6 +280,43 @@
    (sk/point-branch-at! store branch address)
    (open-store-index store cache branch opts)))
 
+(defn retain!
+  "Drop old commit points from a store-backed index, bounding its growth.
+
+  THE THING THAT MAKES A STORE-BACKED INDEX FINITE. Nothing else prunes it:
+  every commit point is kept, so the branch's file map is cumulative — 30
+  commits of 30 documents were measured naming 130 files, 30 of them commit
+  points — and all of it is legitimately reachable, so `scriptum.konserve/gc!`
+  correctly reclaims nothing. Dropping a commit point removes its files from the
+  manifest, and the collector can then take the blobs no other branch names.
+
+  Two ways to say what goes, because two callers ask different questions:
+
+    :before     — an Instant; drop commit points committed before it. This is
+                  yggdrasil's `:remove-before`, and the timestamp compared is
+                  the real commit time from user-data.
+    :commit-ids — drop exactly these `snapshot-id`s. yggdrasil's coordinator
+                  computes reachability itself, from every system's `gc-roots`
+                  and the commit graph, and hands each adapter its own
+                  candidates; a cutoff cannot express that, since an unreachable
+                  commit may be newer than a reachable one elsewhere.
+
+  Issues a commit, because `onCommit` is the only place Lucene lets a deletion
+  policy act. The newest commit point always survives.
+
+  READING A DROPPED COMMIT BY GENERATION STOPS WORKING — that is the trade. Its
+  state is still reachable by snapshot address, which is what
+  `scriptum.konserve/snapshot-directory` opens and what yggdrasil's `as-of`
+  maps onto. Pin an address with `snapshot-address` before dropping if you need
+  it.
+
+  Returns the number of commit points dropped, or nil for a directory-backed
+  index, which must use `gc!` — there a commit point holds real files another
+  branch may share."
+  [sw {:keys [before commit-ids]}]
+  (when (store-backed? sw)
+    (.retain (->writer sw) before (when commit-ids (set (map str commit-ids))))))
+
 (defn warm!
   "Materialize this branch's segments into the local cache, in parallel.
 

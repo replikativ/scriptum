@@ -521,14 +521,35 @@ scriptum does not name. Use `sk/mark` to contribute scriptum's keys to that
 store's own collector, unioned with `scriptum.metadata/mark` if a metadata index
 shares the store.
 
+### Retention
+
+Every commit point is kept by default, so a branch's file map is cumulative —
+30 commits of 30 documents were measured naming 130 files, 30 of them commit
+points. All of that is legitimately reachable, which is why collection reclaims
+nothing however long the index runs. `retain!` is what bounds it:
+
+```clojure
+(sc/retain! writer {:before (.minus (Instant/now) (Duration/ofDays 30))})
+(sk/gc! store (sk/store-id-for store))     ; now there is something to collect
+```
+
+Dropping a commit point removes its files from the manifest; the collector then
+takes the blobs no other branch names. Reading a dropped commit **by generation**
+stops working — its state is still reachable by snapshot address, so pin one with
+`snapshot-address` first if you need it.
+
+Under yggdrasil this is automatic: the coordinator computes reachability from
+every system's `gc-roots` and the commit graph, and `gc-sweep!` drops the
+candidates it is handed.
+
 ### Limits worth knowing
 
 - **One writer per branch**, in one JVM. The write lock lives in the local
   cache, so it does not span machines, and the manifest write is not yet a
   compare-and-set. Writers on *different* branches are safe by construction.
-- **History accumulates.** Every commit point is retained, so the store and
-  cache grow with commit count regardless of live document count. Pruning is
-  planned; the `:parents` chain is recorded for it.
+- **History accumulates until you prune it.** Every commit point is retained by
+  default, so the store grows with commit count regardless of live document
+  count. See Retention above.
 - **`scriptum.audit` needs `:crypto-hash?`**, which store-backed indices do not
   yet enable, so audit degrades to `{:status :advisory}` there.
 - Against a remote store, start from `scriptum.konserve/remote-tuning` — Lucene's

@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -967,6 +968,71 @@ public class BranchIndexWriter implements Closeable {
               + " where branches are manifests rather than directories. Use the scriptum.konserve"
               + " equivalent.");
     }
+  }
+
+  /**
+   * Drop old commit points from a STORE-BACKED index, so its manifest stops naming them.
+   *
+   * <p>This is what bounds a store-backed index. Nothing else prunes it: {@link
+   * BranchDeletionPolicy} keeps every commit point, so the branch's file map is cumulative — 30
+   * commits of 30 documents were measured naming 130 files, of which 30 were commit points — and
+   * everything in it is legitimately reachable, so the store collector correctly reclaims nothing.
+   *
+   * <p>NO PROTECTED-FILE SCAN, and that is the whole reason this is simpler than {@link
+   * #gc(Instant)}. There, deleting a commit point deletes real files another branch may share, so
+   * it must first walk every branch directory. Here a deletion only removes a NAME from this
+   * branch's manifest; whether the blob dies is decided afterwards by reachability across every
+   * branch, which {@code scriptum.konserve/mark} already computes. So there is nothing to protect
+   * at this layer.
+   *
+   * <p>Requires a commit to take effect, because {@link IndexDeletionPolicy#onCommit} is where
+   * Lucene lets a policy delete — so one is issued here. The shrunken file map reaches the store
+   * at the flip that commit performs.
+   *
+   * <p>The newest commit point always survives. Reading a dropped one is no longer possible by
+   * generation; its state is reachable by snapshot address instead, which is what {@code
+   * scriptum.konserve/snapshot-directory} opens.
+   *
+   * @param before drop commit points older than this, or null to use {@code commitIds}
+   * @param commitIds drop exactly these {@code scriptum.uuid}s, or null to use {@code before}
+   * @return the number of commit points dropped
+   */
+  public int retain(Instant before, Set<String> commitIds) throws IOException {
+    if (hasBasePath()) {
+      throw new IOException(
+          "retain() is for store-backed indices; a directory-backed one shares files between"
+              + " branches and must use gc(), which protects them.");
+    }
+    if (before == null && commitIds == null) {
+      throw new IOException("retain() needs either a cutoff or a set of commit ids");
+    }
+    if (commitIds != null) {
+      deletionPolicy.setGcCommits(commitIds, Collections.emptySet());
+    } else {
+      deletionPolicy.setGcCutoff(before, Collections.emptySet());
+    }
+    // onCommit is the only place Lucene lets a policy delete, so ask for one —
+    // and it has to be a REAL one. IndexWriter.commit() returns early when
+    // nothing changed, so a retain with no indexing in front of it silently did
+    // nothing: the policy was armed and never consulted. Writing commit data
+    // marks the SegmentInfos changed, which is what makes the commit happen.
+    String uuid = setCommitData("scriptum-retain");
+    writer.commit();
+    int dropped = deletionPolicy.getLastGcDeleted();
+
+    // TWICE, because the deletions land after the flip that publishes. Lucene's
+    // IndexFileDeleter removes a dropped commit point's files during the
+    // checkpoint that follows finishCommit — by which time the manifest for THIS
+    // commit has already been written. Without a second commit `retain` reports
+    // what it dropped while the manifest still names every one of them, and the
+    // shrink only appears whenever the caller happens to commit next.
+    if (dropped > 0) {
+      lastCommitId = setCommitData("scriptum-retain-publish");
+      writer.commit();
+    } else {
+      lastCommitId = uuid;
+    }
+    return dropped;
   }
 
   public int gc(Instant before) throws IOException {
