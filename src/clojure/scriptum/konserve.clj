@@ -494,33 +494,29 @@
    :ram-buffer-mb 32})
 
 (defn store-id-for
-  "A guard id for `store`, or nil when none can be derived.
+  "The guard id for `store`, or nil.
 
   THE GUARD DEFAULTED TO OFF, AND THAT BRICKED BRANCHES ON THE ORDINARY PATH.
-  `konserve.protocols/store-id` reads `(:id (-store-config store))`, which only
-  `konserve.store/connect-store` populates — a store from `connect-fs-store`,
-  which is what every caller here actually uses, answers nil. A nil id makes
-  `open-guard!`/`close-guard!` no-ops and makes `gc!` take `ts` instead of
-  `guard/cutoff`, so a collection landing between the blob writes and the
-  pointer flip sweeps blobs the branch is about to name. The writer sees no
-  error; the branch head then names a blob that is gone and the branch cannot
-  be opened at all. Reproduced without instrumentation, bricking at commit 2.
+  A nil id makes `open-guard!`/`close-guard!` no-ops and makes `gc!` take `ts`
+  instead of `guard/cutoff`, so a collection landing between the blob writes and
+  the pointer flip sweeps blobs the branch is about to name. The writer sees no
+  error; the branch head then names a blob that is gone and the branch cannot be
+  opened at all. Reproduced without instrumentation, bricking at commit 2.
 
-  The requirement is that every writer and collector on the SAME BYTES pass the
-  SAME id — so falling back to the filestore's base path is exactly right: it
-  is stable across opens and across processes, and two stores on one path get
-  one id. Deriving it beats defaulting to nil, and beats a per-open
-  `random-uuid`, which is the other half of the same bug (two ids on one store
-  is the case `konserve.gc-guard` calls out as deleting live data)."
+  IT IS KONSERVE'S ID OR NOTHING, DELIBERATELY. `konserve.store/connect-store`
+  requires a UUID `:id` and attaches the config to the store, so any store
+  connected that way answers here. `konserve.filestore/connect-fs-store`
+  bypasses that and carries no config, so it answers nil — do not use it.
+
+  Deriving a substitute from the store's path was tried and is worse than
+  refusing. The requirement is that every writer and collector on the SAME BYTES
+  agree, and a derived id is a different KIND of name from konserve's: one
+  component reaching a store through `connect-store` and another through
+  `connect-fs-store` would then hold a UUID and a path for one store — two ids,
+  which is the direction `konserve.gc-guard` calls out as deleting live data.
+  A single source of identity is the only way that cannot happen."
   [store]
-  (or ((requiring-resolve 'konserve.protocols/store-id) store)
-      ;; CANONICALIZED, because the id must be a function of the BYTES and the
-      ;; raw string is a function of how the caller spelled them. konserve keeps
-      ;; the path verbatim, so `/x/store`, `/x/store/`, `/x/./store` and a
-      ;; symlink to it are four ids for one store — the "same bytes, two ids"
-      ;; case the guard calls out as deleting live data, and measured as ~1400
-      ;; lost blobs and a branch that would not open.
-      (some-> store :backing :base str not-empty io/file .getCanonicalPath)))
+  ((requiring-resolve 'konserve.protocols/store-id) store))
 
 (def reserved-branch-names
   "Branch names that would collide with the cache's own layout.
@@ -578,11 +574,14 @@
    ;; collected.
    (if-let [id (store-id-for store)]
      (konserve-directory store cache branch id)
-     (throw (ex-info (str "scriptum: cannot derive a gc-guard id for this store, and "
-                          "running without one lets a collection delete an in-flight "
-                          "commit's blobs. Pass :store-id explicitly (the same value "
-                          "for every writer and collector on these bytes), or pass an "
-                          "explicit nil to opt out on a store that is never collected.")
+     (throw (ex-info (str "scriptum: this store carries no konserve id, and running "
+                          "without one lets a collection delete an in-flight commit's "
+                          "blobs. Connect it with `konserve.store/connect-store` (or "
+                          "`create-store`), which requires a UUID :id and attaches it — "
+                          "`konserve.filestore/connect-fs-store` does not. Failing that, "
+                          "pass :store-id explicitly, using the same value as every other "
+                          "writer and collector on these bytes; an explicit nil to the "
+                          "4-arity opts out for a store that is never collected.")
                      {:store-type (type store)}))))
   (^Directory [store ^String cache ^String branch store-id]
    (check-branch-name branch)

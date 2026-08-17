@@ -13,7 +13,7 @@
   that suite cannot know about: the storage model, and the cost of using it."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.java.io :as io]
-            [konserve.filestore :refer [connect-fs-store]]
+            [konserve.store :as kstore]
             [clojure.set :as set]
             [konserve.core :as k]
             [konserve.gc-guard :as guard]
@@ -41,7 +41,24 @@
       (try (binding [*root* root] (t))
            (finally (rm-rf (io/file root)))))))
 
-(defn- store [] (connect-fs-store (str *root* "/store") :opts {:sync? true}))
+(defn- store-at
+  "A konserve store with an identity.
+
+  `connect-store`, never `connect-fs-store`: only the former requires a UUID
+  `:id` and attaches it, and a store answering nil to
+  `konserve.protocols/store-id` is what silently disabled scriptum's GC guard.
+  The id is derived from the path so that two connections to one store agree —
+  which is the whole requirement the guard rests on."
+  [path]
+  (let [cfg {:backend :file :path path
+             :id (java.util.UUID/nameUUIDFromBytes
+                  (.getBytes ^String (.getCanonicalPath (io/file path)) "UTF-8"))}]
+    (io/make-parents (io/file path "x"))
+    (if (konserve.filestore/store-exists? nil path)
+      (kstore/connect-store cfg {:sync? true})
+      (kstore/create-store cfg {:sync? true}))))
+
+(defn- store [] (store-at (str *root* "/store")))
 (defn- cache [] (str *root* "/cache"))
 
 (defn- add-doc! [dir text]
@@ -1201,9 +1218,7 @@
             so the fallback is the store's own base path: stable across opens and
             processes, one id per store."
     (let [s (store)]
-      (is (nil? ((requiring-resolve 'konserve.protocols/store-id) s))
-          "precondition: konserve has no id for this store")
-      (is (some? (sk/store-id-for s)) "but one is derivable")
+      (is (some? (sk/store-id-for s)) "the store carries konserve's id")
       (is (= (sk/store-id-for s) (sk/store-id-for (store)))
           "and it is the same for a second connection to the same bytes")
       ;; the default Directory must be guarded
@@ -1223,17 +1238,29 @@
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (is (= #{"precious"} (bodies d)) "and nothing was collected")))))
 
-(deftest the-guard-id-is-a-function-of-the-bytes-not-the-spelling
-  (testing "REGRESSION: konserve keeps the store path verbatim, so `/x/store`,
-            `/x/store/` and `/x/./store` derived THREE ids for one store — the
-            `same bytes, two ids` case the guard calls out as deleting live
-            data, measured at ~1400 lost blobs and a branch that would not open."
+(deftest the-guard-id-comes-from-konserve-not-the-path
+  (testing "identity is konserve's, deliberately. Deriving a substitute from the
+            store path was tried and is worse than refusing: a derived id is a
+            different KIND of name, so one component reaching a store through
+            `connect-store` and another through `connect-fs-store` would hold a
+            UUID and a path for one store — two ids, the direction gc-guard calls
+            out as deleting live data. One source of identity cannot do that.
+
+            It also means the id is stable however the path is spelled, which the
+            raw-path version was not."
     (let [base (str *root* "/store")
-          s1 (connect-fs-store base :opts {:sync? true})
-          s2 (connect-fs-store (str base "/") :opts {:sync? true})
-          s3 (connect-fs-store (str *root* "/./store") :opts {:sync? true})]
-      (is (= (sk/store-id-for s1) (sk/store-id-for s2) (sk/store-id-for s3))
-          "one store, one id, however it was spelled"))))
+          s1 (store-at base)
+          s2 (store-at (str base "/"))
+          s3 (store-at (str *root* "/./store"))]
+      (is (every? uuid? (map sk/store-id-for [s1 s2 s3])))
+      (is (apply = (map sk/store-id-for [s1 s2 s3]))
+          "one store, one id, however it was reached")
+      ;; and a store with no config is refused rather than silently unguarded
+      (let [bare (konserve.filestore/connect-fs-store
+                  (str *root* "/bare") :opts {:sync? true})]
+        (is (nil? (sk/store-id-for bare)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"carries no konserve id"
+                              (sk/konserve-directory bare (cache) "main")))))))
 
 (deftest a-fork-inherits-the-parents-guard-id
   (testing "REGRESSION: `fork` dropped an explicit `:store-id`, so a caller using

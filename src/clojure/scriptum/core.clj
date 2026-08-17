@@ -216,11 +216,11 @@
          ;; track it, so two components on one store cannot disagree about its
          ;; name — see konserve.gc-guard on why only that direction is unsafe.
          ;;
-         ;; `konserve.protocols/store-id` alone was NOT enough: it answers nil
-         ;; for a `connect-fs-store` store, which is what callers actually use,
-         ;; and a nil id silently disables the guard — a collection then sweeps
-         ;; an in-flight commit's blobs and bricks the branch. `store-id-for`
-         ;; falls back to something stable for the same bytes.
+         ;; A nil id silently disables the guard — a collection then sweeps an
+         ;; in-flight commit's blobs and bricks the branch — so connect the store
+         ;; with `konserve.store/connect-store`, which requires a UUID `:id` and
+         ;; attaches it. `konserve.filestore/connect-fs-store` carries no config
+         ;; and answers nil; see `scriptum.konserve/store-id-for`.
          store-id (or store-id ((sk 'store-id-for) store))
          dir ((sk 'konserve-directory) store cache branch store-id)
          writer (BranchIndexWriter/createOver dir branch analyzer)]

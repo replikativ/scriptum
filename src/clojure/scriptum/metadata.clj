@@ -13,7 +13,7 @@
   index carrying metadata. `scriptum.konserve` was already synchronous
   throughout; this namespace was the outlier."
   (:require [konserve.core :as k]
-            [konserve.filestore :refer [connect-fs-store]]
+            [konserve.store :as kstore]
             [org.replikativ.persistent-sorted-set :as pss])
   (:import [org.replikativ.persistent_sorted_set ANode Branch IStorage Leaf Settings]))
 
@@ -110,7 +110,18 @@
   (let [dir (java.io.File. (str path))]
     (when-not (.exists dir)
       (.mkdirs dir)))
-  (connect-fs-store (str path) :opts {:sync? true}))
+  ;; `connect-store`, not `connect-fs-store`: only the former attaches the
+  ;; config, and a store with no `:id` answers nil to `konserve.protocols/store-id`
+  ;; — which is what silently disabled the GC guard in `scriptum.konserve`. The
+  ;; id is derived from the path so that reconnecting the same index yields the
+  ;; same identity, which is what every component sharing it must agree on.
+  (let [cfg {:backend :file
+             :path (str path)
+             :id (java.util.UUID/nameUUIDFromBytes
+                  (.getBytes (.getCanonicalPath (java.io.File. (str path))) "UTF-8"))}]
+    (if (konserve.filestore/store-exists? nil (str path))
+      (kstore/connect-store cfg {:sync? true})
+      (kstore/create-store cfg {:sync? true}))))
 
 (defn- create-storage
   ([kv-store]

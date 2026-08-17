@@ -12,7 +12,7 @@
   a store-backed Directory really is a Directory. The suite is a JUnit class, so
   the Java side (`ScriptumDirectoryTCK`) drives it and calls back in here for the
   one thing it cannot construct itself."
-  (:require [konserve.filestore :refer [connect-fs-store]]
+  (:require [konserve.store :as kstore]
             [scriptum.konserve :as sk]))
 
 (defn directory-for
@@ -21,5 +21,9 @@
   The suite hands out a fresh temp path per test and expects an independent
   Directory over it, so store and cache both live under that path."
   ^org.apache.lucene.store.Directory [^String path]
-  (let [store (connect-fs-store (str path "/store") :opts {:sync? true})]
+  (let [sp (str path "/store")
+        store (kstore/create-store
+               {:backend :file :path sp
+                :id (java.util.UUID/nameUUIDFromBytes (.getBytes ^String sp "UTF-8"))}
+               {:sync? true})]
     (sk/konserve-directory store (str path "/cache") "main")))
