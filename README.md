@@ -484,6 +484,24 @@ its ancestry. Hold one and you can come back to exactly that state:
 (sk/fork-from-snapshot! store "from-held" held)
 ```
 
+### Warming a cold machine
+
+Materialization is lazy — a selective query does not pay for segments it never
+reads. On a machine with an empty cache that is about to serve, that is the
+wrong trade: Lucene opens segment readers serially, so a cold query costs one
+round trip per file, in sequence. Measured on a 35-segment index at 60 ms
+latency: **2.2 s lazily against 275 ms warmed**.
+
+```clojure
+(sc/warm! writer)                                     ; fetch this branch, in parallel
+(sc/warm! writer {:only #(str/ends-with? % ".cfs")})  ; or part of it
+```
+
+Lucene's own warming hooks do not help here, because they all assume the file is
+already on the machine: `IndexInput.prefetch` fires after this Directory has
+materialized the whole blob, `MMapDirectory.setPreload` pages in what is on
+disk, and `setMergedSegmentWarmer` warms this writer's own merges.
+
 ### Collection
 
 `scriptum.core/gc!` is for directory-backed indices and throws here. A

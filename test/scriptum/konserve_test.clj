@@ -1759,3 +1759,36 @@
           (is (seq (bodies d)) "the branch must still open"))
         (is (set? (sk/mark s)) "and collection must not be wedged store-wide")
         (is (map? (sk/gc-cache! s (cache))))))))
+
+(deftest warming-fetches-a-cold-index-in-parallel
+  (testing "Lucene's demand is SERIAL — `StandardDirectoryReader` opens segment
+            readers one at a time — so a cold query pays one round trip per file
+            in sequence. None of Lucene's own warming hooks help: `prefetch` is
+            called after this Directory has already materialized the whole blob
+            inside `openInput`, `setPreload` pages in files that are on disk, and
+            `setMergedSegmentWarmer` warms this writer's own merges. The fetch is
+            ours, and fetching ahead of Lucene is the only lever."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main" {:ram-buffer-mb 0.05})]
+        (try
+          (dotimes [i 60]
+            (sc/add-doc w {:body {:type :text :value (str "doc " i)}}))
+          (sc/commit! w "bulk")
+          (finally (sc/close! w))))
+      (let [n-files (count (sk/read-manifest s "main"))]
+        (is (< 1 n-files) "precondition: several segments")
+        ;; wipe the derived cache — this is the cold machine
+        (rm-rf (io/file (cache)))
+        (is (= n-files (sk/warm! s (cache) "main"))
+            "warming materializes every file the snapshot names")
+        ;; and the index reads without touching the store again
+        (let [w (sc/open-store-index s (cache) "main")]
+          (try (is (= 60 (sc/num-docs w))
+                   "the whole index reads without touching the store again")
+               (finally (sc/close! w))))
+        ;; idempotent, and selective
+        (is (= n-files (sk/warm! s (cache) "main")) "warming again is a no-op cost")
+        (rm-rf (io/file (cache)))
+        (let [segs (sk/warm! s (cache) "main"
+                             {:only #(clojure.string/starts-with? % "segments_")})]
+          (is (< 0 segs n-files) ":only warms a subset"))))))

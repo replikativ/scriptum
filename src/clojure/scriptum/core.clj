@@ -280,6 +280,27 @@
    (sk/point-branch-at! store branch address)
    (open-store-index store cache branch opts)))
 
+(defn warm!
+  "Materialize this branch's segments into the local cache, in parallel.
+
+  FOR A COLD MACHINE — a fresh container, a thawed Lambda, a cache that was
+  wiped. The store has everything and this machine has nothing, and Lucene will
+  otherwise fetch one file per round trip in sequence, because
+  `StandardDirectoryReader` opens segment readers serially. Measured on a
+  35-segment index at 60 ms latency: 2.2 s lazily against 275 ms warmed.
+
+  Explicit rather than automatic: materialization is lazy by design, since a
+  selective query should not pay for segments it never reads. Warming is worth
+  it when you know the machine is cold and about to serve.
+
+  Options: `:only`, a predicate on the Lucene filename. Returns the number of
+  files materialized. Store-backed indices only; nil otherwise."
+  ([sw] (warm! sw {}))
+  ([sw opts]
+   (when (store-backed? sw)
+     (let [{:keys [store cache]} (:backing sw)]
+       (sk/warm! store cache (.getBranchName (->writer sw)) opts)))))
+
 (defn branches
   "Every branch of a store-backed index, from its manifests."
   [sw]
