@@ -974,6 +974,17 @@ public class BranchIndexWriter implements Closeable {
               BranchedDirectory branchDir = new BranchedDirectory(baseDir, overlayDir, bName)) {
 
             String[] overlayFiles = overlayDir.listAll();
+            // The branch's HEAD, which is protected regardless of age. `before`
+            // is a retention policy for HISTORY — on main, an old commit point
+            // is a snapshot you may drop, and dropping it is the point of a
+            // collection. On another branch the latest commit is not history,
+            // it is that branch's current state, and ageing it out deletes the
+            // base segments the branch is built from. A branch idle longer than
+            // the grace window was contributing nothing to protectedFiles, so a
+            // collection on main destroyed it: reproduced as CorruptIndexException
+            // opening the fork, once main had merged away the shared segment and
+            // stopped referencing it too.
+            long headGen = SegmentInfos.getLastCommitGeneration(overlayFiles);
             for (String fileName : overlayFiles) {
               if (!fileName.startsWith("segments_")) {
                 continue;
@@ -982,8 +993,10 @@ public class BranchIndexWriter implements Closeable {
                 SegmentInfos infos = SegmentInfos.readCommit(branchDir, fileName);
 
                 boolean protect = true;
+                boolean isHead =
+                    SegmentInfos.generationFromSegmentsFileName(fileName) == headGen;
                 String tsStr = infos.getUserData().get(COMMIT_TIMESTAMP_KEY);
-                if (tsStr != null) {
+                if (tsStr != null && !isHead) {
                   try {
                     Instant commitTime = Instant.parse(tsStr);
                     protect = !commitTime.isBefore(before);

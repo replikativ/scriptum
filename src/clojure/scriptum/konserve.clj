@@ -229,45 +229,61 @@
   inode, so the bytes sit on disk once and mmap'd pages are shared between
   branches instead of duplicated.
 
-  A view entry that is NOT that inode is stale — the same Lucene name mapped to
-  a different address in an earlier session, and the file survived into this
-  one. Serving it would hand Lucene content the manifest does not name. Lucene
-  catches some of these itself, because `segments_N` embeds its generation in a
-  header suffix and codecs checksum their files, but it reports them as index
-  corruption, which is both alarming and wrong: the store is intact and only
-  the derived cache is stale. Repair it instead — the cache is disposable by
-  design, so the fix is to drop the entry and re-link from the pool.
+  WRITTEN AS A CONVERGENCE LOOP, not a sequence of steps, because `openInput`
+  is an unconstrained-concurrency path and every step here races something:
+  two readers both finding the name absent and both linking, one repairing a
+  stale entry while another reads it, a pooled blob being renamed into place
+  underneath. Each of those was a different exception escaping `openInput` —
+  and `Directory` permits only NoSuchFile/FileNotFound or a plain IOException
+  there, never FileAlreadyExists.
 
-  Compared by INODE rather than by re-hashing, because a view entry is a hard
-  link into a pool whose filename IS the content address. Two stats, no read."
+  So the postcondition is CHECKED rather than assumed: the loop ends when the
+  view entry is the pooled inode, whoever put it there. Losing a race is
+  success, and any of these failures simply means someone else is mid-repair,
+  so it retries.
+
+  A view entry that is not the pooled inode is stale — the same Lucene name
+  mapped to a different address in an earlier session. Serving it would hand
+  Lucene content the manifest does not name; Lucene notices some of these and
+  calls them index corruption, which is wrong, since the store is intact and
+  only the derived cache is stale. Repaired, not raised.
+
+  Compared by INODE rather than by re-hashing, because the pool's filename IS
+  the content address. Two stats, no read."
   [store cache branch name address]
   (let [pf (ensure-pooled! store cache address)
         vf (view-file cache branch name)]
     (io/make-parents vf)
-    (when (and (.exists vf) (not (same-inode? vf pf)))
-      ;; Replace ATOMICALLY. Unlinking and re-linking leaves a window where the
-      ;; name does not exist, and `openInput` is an unconstrained-concurrency
-      ;; path — a reader landing in that window gets NoSuchFileException for a
-      ;; file the manifest names. A link under a private name, moved into place,
-      ;; is never absent.
-      (let [tmp (io/file (.getParentFile vf) (str "." name "." (random-uuid) ".link"))]
-        (Files/createLink (->path (.getPath tmp)) (->path (.getPath pf)))
-        (Files/move (->path (.getPath tmp)) (->path (.getPath vf))
-                    (into-array java.nio.file.CopyOption
-                                [StandardCopyOption/REPLACE_EXISTING
-                                 StandardCopyOption/ATOMIC_MOVE]))))
-    (when-not (.exists vf)
-      ;; Losing this race is SUCCESS, not failure. Two readers materializing the
-      ;; same file both see it absent and both link; the loser used to get
-      ;; FileAlreadyExistsException thrown straight out of `openInput`, which is
-      ;; the createOutput signal and a contract violation there — Directory
-      ;; permits only NoSuchFile/FileNotFound or a plain IOException. Measured at
-      ;; 38 failures over 24 threads opening a cold forked branch.
-      (try
-        (Files/createLink (->path (.getPath vf)) (->path (.getPath pf)))
-        (catch FileAlreadyExistsException _
-          nil)))
-    vf))
+    (loop [attempt 0]
+      (cond
+        (and (.exists vf) (same-inode? vf pf))
+        vf
+
+        (> attempt 8)
+        (throw (java.io.IOException.
+                (str "scriptum: could not materialize " name " for branch " branch)))
+
+        :else
+        (do
+          (try
+            (if (.exists vf)
+              ;; Stale entry. Link under a private name and move it into place:
+              ;; unlink-then-relink would leave a window where the name does not
+              ;; exist at all, which a concurrent reader sees as NoSuchFile for a
+              ;; file the manifest names.
+              (let [tmp (io/file (.getParentFile vf)
+                                 (str "." name "." (random-uuid) ".link"))]
+                (try
+                  (Files/createLink (->path (.getPath tmp)) (->path (.getPath pf)))
+                  (Files/move (->path (.getPath tmp)) (->path (.getPath vf))
+                              (into-array java.nio.file.CopyOption
+                                          [StandardCopyOption/REPLACE_EXISTING
+                                           StandardCopyOption/ATOMIC_MOVE]))
+                  (finally (.delete tmp))))
+              (Files/createLink (->path (.getPath vf)) (->path (.getPath pf))))
+            (catch FileAlreadyExistsException _ nil)
+            (catch NoSuchFileException _ nil))
+          (recur (inc attempt)))))))
 
 (defn- pool!
   "Fold a freshly written view file into the pool under `address`, so a later

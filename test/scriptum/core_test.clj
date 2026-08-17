@@ -669,3 +669,48 @@
                         (when (.isDirectory x) (run! rm (.listFiles x)))
                         (.delete x))]
                 (rm f)))))))))
+
+(deftest gc-protects-an-idle-forks-head
+  (testing "REGRESSION: `before` is a retention policy for HISTORY. On main an
+            old commit point is a snapshot you may drop, and dropping it is what
+            a collection is for. `collectBranchReferencedFiles` applied the same
+            age test to every commit point of every BRANCH, including each
+            branch's latest — which is not history, it is that branch's current
+            state.
+
+            So a branch idle longer than the grace window contributed nothing to
+            the protected set, and a collection on main deleted the base
+            segments it was built from. It only bites once main has stopped
+            referencing them too, which is why this forceMerges main first —
+            without that, main's own commit keeps the shared segment alive and
+            the bug hides."
+    (let [path (str "/tmp/scriptum-gc-fork-" (random-uuid))]
+      (try
+        (let [m (sc/create-index path "main")]
+          (sc/add-doc m {:body {:type :text :value "base document"}})
+          (sc/commit! m "base")
+          (let [f (sc/fork m "feature")]
+            (sc/add-doc f {:body {:type :text :value "feature document"}})
+            (sc/commit! f "feature work")
+            (is (= 2 (count (sc/search f :all))))
+            (sc/close! f))
+          ;; main moves on and merges away the segment the fork depends on
+          (dotimes [i 3]
+            (sc/add-doc m {:body {:type :text :value (str "main " i)}})
+            (sc/commit! m (str "main " i)))
+          (.forceMerge (sc/->writer m) 1)
+          (sc/commit! m "merged")
+          ;; collect with a cutoff past the fork's last commit
+          (sc/gc! m (java.time.Instant/now))
+          (sc/close! m)
+          (let [f (sc/open-branch path "feature")]
+            (is (= 2 (count (sc/search f :all)))
+                "an idle fork must survive a collection on main")
+            (sc/close! f)))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
