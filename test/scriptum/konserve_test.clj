@@ -41,18 +41,32 @@
       (try (binding [*root* root] (t))
            (finally (rm-rf (io/file root)))))))
 
-(defn- store-at
-  "A konserve store with an identity.
+(def ^:private store-ids
+  "One CONSTANT RANDOM UUID per store path, minted on first use.
 
-  `connect-store`, never `connect-fs-store`: only the former requires a UUID
-  `:id` and attaches it, and a store answering nil to
-  `konserve.protocols/store-id` is what silently disabled scriptum's GC guard.
-  The id is derived from the path so that two connections to one store agree —
-  which is the whole requirement the guard rests on."
+  Modelling konserve's contract rather than working around it: `:id` is a global
+  address, so it is chosen once at random and reused, never derived from the
+  location. Deriving it from the path gets both directions wrong — move the
+  store and its identity changes, while two unrelated stores under the same
+  mount path collide.
+
+  Held in an atom rather than regenerated per call because the guard's whole
+  requirement is that every connection to one store agrees. An earlier version
+  of this suite minted `(random-uuid)` per OPEN, which is the two-ids-on-one-store
+  case `konserve.gc-guard` calls out as deleting live data — the tests were
+  modelling the bug."
+  (atom {}))
+
+(defn- store-at
+  "A konserve store with an identity, via `connect-store`.
+
+  Never `connect-fs-store`: only `connect-store` requires a UUID `:id` and
+  attaches it, and a store answering nil to `konserve.protocols/store-id` is
+  what silently disabled scriptum's GC guard."
   [path]
-  (let [cfg {:backend :file :path path
-             :id (java.util.UUID/nameUUIDFromBytes
-                  (.getBytes ^String (.getCanonicalPath (io/file path)) "UTF-8"))}]
+  (let [canonical (.getCanonicalPath (io/file path))
+        id (get (swap! store-ids update canonical #(or % (random-uuid))) canonical)
+        cfg {:backend :file :path path :id id}]
     (io/make-parents (io/file path "x"))
     (if (konserve.filestore/store-exists? nil path)
       (kstore/connect-store cfg {:sync? true})
@@ -1238,24 +1252,22 @@
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (is (= #{"precious"} (bodies d)) "and nothing was collected")))))
 
-(deftest the-guard-id-comes-from-konserve-not-the-path
-  (testing "identity is konserve's, deliberately. Deriving a substitute from the
-            store path was tried and is worse than refusing: a derived id is a
-            different KIND of name, so one component reaching a store through
-            `connect-store` and another through `connect-fs-store` would hold a
-            UUID and a path for one store — two ids, the direction gc-guard calls
-            out as deleting live data. One source of identity cannot do that.
+(deftest the-guard-id-comes-from-konserve
+  (testing "identity is konserve's, deliberately, and it is a CONSTANT RANDOM
+            UUID rather than anything derived. Deriving one from the store path
+            was tried and is worse than refusing on two counts: it is a different
+            KIND of name, so a component reaching a store through `connect-store`
+            and another through `connect-fs-store` hold a UUID and a path for one
+            store — two ids, the direction gc-guard calls out as deleting live
+            data — and it is not global, since moving the store changes it while
+            two unrelated stores under one mount path share it.
 
-            It also means the id is stable however the path is spelled, which the
-            raw-path version was not."
-    (let [base (str *root* "/store")
-          s1 (store-at base)
-          s2 (store-at (str base "/"))
-          s3 (store-at (str *root* "/./store"))]
-      (is (every? uuid? (map sk/store-id-for [s1 s2 s3])))
-      (is (apply = (map sk/store-id-for [s1 s2 s3]))
-          "one store, one id, however it was reached")
-      ;; and a store with no config is refused rather than silently unguarded
+            A store carrying no id is refused rather than silently unguarded."
+    (let [s1 (store)
+          s2 (store)]
+      (is (uuid? (sk/store-id-for s1)))
+      (is (= (sk/store-id-for s1) (sk/store-id-for s2))
+          "every connection to one store agrees")
       (let [bare (konserve.filestore/connect-fs-store
                   (str *root* "/bare") :opts {:sync? true})]
         (is (nil? (sk/store-id-for bare)))

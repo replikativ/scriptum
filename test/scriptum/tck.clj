@@ -15,6 +15,8 @@
   (:require [konserve.store :as kstore]
             [scriptum.konserve :as sk]))
 
+(def ^:private store-ids (atom {}))
+
 (defn directory-for
   "A konserve-backed `Directory` rooted at `path`, for one TCK run.
 
@@ -22,8 +24,10 @@
   Directory over it, so store and cache both live under that path."
   ^org.apache.lucene.store.Directory [^String path]
   (let [sp (str path "/store")
-        store (kstore/create-store
-               {:backend :file :path sp
-                :id (java.util.UUID/nameUUIDFromBytes (.getBytes ^String sp "UTF-8"))}
-               {:sync? true})]
+        ;; A constant random UUID per store, memoized by path: konserve's `:id`
+        ;; is a global address and must not be derived from the location. The
+        ;; suite hands out a fresh path per test, so this mints one per store
+        ;; and reuses it if the same path is opened again.
+        id (get (swap! store-ids update sp #(or % (random-uuid))) sp)
+        store (kstore/create-store {:backend :file :path sp :id id} {:sync? true})]
     (sk/konserve-directory store (str path "/cache") "main")))

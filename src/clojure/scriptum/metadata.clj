@@ -12,7 +12,9 @@
   filestore — a flush issues eight of them, so it dominated commit cost for any
   index carrying metadata. `scriptum.konserve` was already synchronous
   throughout; this namespace was the outlier."
-  (:require [konserve.core :as k]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [konserve.core :as k]
             [konserve.store :as kstore]
             [org.replikativ.persistent-sorted-set :as pss])
   (:import [org.replikativ.persistent_sorted_set ANode Branch IStorage Leaf Settings]))
@@ -106,19 +108,44 @@
 ;; Store / Storage lifecycle
 ;; ============================================================================
 
+(def ^:private store-id-suffix
+  "Suffix for the file holding a store's identity.
+
+  BESIDE the store directory, never inside it: konserve's filestore treats every
+  file under its path as a blob, and a stray one is picked up by the v1 migration
+  scan and fails there."
+  ".store-id")
+
+(defn- store-id!
+  "This store's konserve id: minted once at random, then persisted.
+
+  A CONSTANT RANDOM UUID, not a function of the path, because konserve's `:id`
+  is a GLOBAL address. Deriving it from the location gets both directions wrong:
+  copy or move the directory and the same logical store answers to a different
+  id, while two unrelated stores that happen to share a mount path answer to the
+  same one. Minting once and writing it beside the store makes the identity
+  travel with the bytes, which is what `konserve.store/validate-store-config`
+  is asking for when it requires a UUID.
+
+  Written before the store is connected, because konserve needs the id at
+  connect time and so it cannot live inside the store it identifies."
+  [path]
+  (let [f (java.io.File. (str path store-id-suffix))]
+    (if (.exists f)
+      (java.util.UUID/fromString (str/trim (slurp f)))
+      (let [id (random-uuid)]
+        (io/make-parents f)
+        (spit f (str id))
+        id))))
+
 (defn- create-store [path]
   (let [dir (java.io.File. (str path))]
     (when-not (.exists dir)
       (.mkdirs dir)))
   ;; `connect-store`, not `connect-fs-store`: only the former attaches the
   ;; config, and a store with no `:id` answers nil to `konserve.protocols/store-id`
-  ;; — which is what silently disabled the GC guard in `scriptum.konserve`. The
-  ;; id is derived from the path so that reconnecting the same index yields the
-  ;; same identity, which is what every component sharing it must agree on.
-  (let [cfg {:backend :file
-             :path (str path)
-             :id (java.util.UUID/nameUUIDFromBytes
-                  (.getBytes (.getCanonicalPath (java.io.File. (str path))) "UTF-8"))}]
+  ;; — which is what silently disabled the GC guard in `scriptum.konserve`.
+  (let [cfg {:backend :file :path (str path) :id (store-id! path)}]
     (if (konserve.filestore/store-exists? nil (str path))
       (kstore/connect-store cfg {:sync? true})
       (kstore/create-store cfg {:sync? true}))))
