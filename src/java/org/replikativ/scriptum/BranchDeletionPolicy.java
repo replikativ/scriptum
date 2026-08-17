@@ -37,18 +37,30 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
   private static final class GcConfig {
     final Instant cutoff;
     final Set<String> commitIds;
+    final Set<String> keepIds;
     final Set<String> protectedFiles;
 
-    GcConfig(Instant cutoff, Set<String> commitIds, Set<String> protectedFiles) {
+    GcConfig(
+        Instant cutoff, Set<String> commitIds, Set<String> keepIds, Set<String> protectedFiles) {
       this.cutoff = cutoff;
       this.commitIds = commitIds;
+      this.keepIds = keepIds;
       this.protectedFiles = protectedFiles;
     }
 
     /** Whether this config selects `commit` for deletion. */
     boolean selects(IndexCommit commit) throws IOException {
+      String uuid = commit.getUserData().get(COMMIT_UUID_KEY);
+      // A branch head is never dropped, however old. The directory-backed
+      // collector protects every branch's head for the same reason and says so
+      // at length; a time cutoff alone dropped the head that `gc-roots` had
+      // just reported as live, because the collector's own new commit became
+      // the newest and the real head no longer was.
+      if (keepIds != null && keepIds.contains(uuid)) {
+        return false;
+      }
       if (commitIds != null) {
-        return commitIds.contains(commit.getUserData().get(COMMIT_UUID_KEY));
+        return commitIds.contains(uuid);
       }
       return true;
     }
@@ -93,7 +105,8 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
 
   public void setGcCutoff(Instant before, Set<String> protectedFiles) {
     this.pendingGc =
-        new GcConfig(before, null, Collections.unmodifiableSet(new HashSet<>(protectedFiles)));
+        new GcConfig(
+            before, null, null, Collections.unmodifiableSet(new HashSet<>(protectedFiles)));
   }
 
   /**
@@ -112,7 +125,24 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
         new GcConfig(
             null,
             Collections.unmodifiableSet(new HashSet<>(commitIds)),
+            null,
             Collections.unmodifiableSet(new HashSet<>(protectedFiles)));
+  }
+
+  /**
+   * Arm a collection that additionally never drops {@code keepIds}, whatever else selects them.
+   *
+   * @param before drop commit points older than this, or null when using {@code commitIds}
+   * @param commitIds drop exactly these {@code scriptum.uuid}s, or null when using {@code before}
+   * @param keepIds {@code scriptum.uuid}s that must survive regardless — branch heads
+   */
+  public void setGc(Instant before, Set<String> commitIds, Set<String> keepIds) {
+    this.pendingGc =
+        new GcConfig(
+            before,
+            commitIds == null ? null : Collections.unmodifiableSet(new HashSet<>(commitIds)),
+            keepIds == null ? null : Collections.unmodifiableSet(new HashSet<>(keepIds)),
+            Collections.emptySet());
   }
 
   public int getLastGcDeleted() {

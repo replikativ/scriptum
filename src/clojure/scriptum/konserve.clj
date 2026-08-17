@@ -1323,12 +1323,20 @@
   ;; Destructive on a layout we may not understand — check before dropping a
   ;; branch we cannot read back.
   (ensure-format! store)
-  ;; Manifest first, then the registry: the reverse order would leave a moment
+  ;; UNDER THE STORE LOCK, like every other branch-pointer move. `reachable`
+  ;; discovers branches by scanning for manifest keys, so a delete running
+  ;; alongside a collection let the mark see a branch by its manifest and then
+  ;; read a half-unlinked one — konserve throws "File is empty or deleted during
+  ;; read" out of `branch-snapshot` rather than answering nil, and both
+  ;; collectors died. Reproduced under a fork/delete loop; no data was lost,
+  ;; since the abort came before any sweep, but collection became flaky.
+  (with-store-lock store
+   ;; Manifest first, then the registry: the reverse order would leave a moment
   ;; where the manifest exists and no root names it, which is exactly when a
   ;; concurrent `gc!` would sweep the blobs it still names.
-  (k/dissoc store (manifest-key branch) {:sync? true})
-  (k/update store branches-key #(disj (or % #{}) branch) {:sync? true})
-  nil)
+    (k/dissoc store (manifest-key branch) {:sync? true})
+    (k/update store branches-key #(disj (or % #{}) branch) {:sync? true})
+    nil))
 
 (defn reachable
   "One walk of the branch pointers: `{:known :snapshots :addresses}`.

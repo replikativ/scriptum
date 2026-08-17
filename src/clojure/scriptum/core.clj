@@ -301,8 +301,24 @@
                   candidates; a cutoff cannot express that, since an unreachable
                   commit may be newer than a reachable one elsewhere.
 
-  Issues a commit, because `onCommit` is the only place Lucene lets a deletion
-  policy act. The newest commit point always survives.
+  Issues a commit WHEN IT WILL ACTUALLY DROP SOMETHING, because `onCommit` is
+  the only place Lucene lets a deletion policy act — and because committing is
+  not free here, since the commit itself becomes a commit point. A sweep that
+  matches nothing returns 0 without touching the index; doing otherwise made
+  the collector grow the index on every cycle under yggdrasil, whose candidates
+  come from a registry that never names scriptum's own bookkeeping commits.
+
+  THE BRANCH HEAD IS NEVER DROPPED, whatever the cutoff says, so a caller who
+  passes `:before (now)` does not lose the commit `gc-roots` just reported.
+
+  THE SHRINK IS PUBLISHED AT THE NEXT COMMIT, not this one: Lucene removes a
+  dropped commit point's files during the checkpoint that follows the flip, so
+  the manifest for the retain commit is already written by then. `retain!`
+  reports what it dropped; the manifest reflects it once you commit again.
+
+  IT ALSO COMMITS WHATEVER IS BUFFERED, because `IndexWriter.commit` cannot do
+  otherwise. Collection should not be what makes a caller's in-flight writes
+  durable — commit first if that distinction matters to you.
 
   READING A DROPPED COMMIT BY GENERATION STOPS WORKING — that is the trade. Its
   state is still reachable by snapshot address, which is what

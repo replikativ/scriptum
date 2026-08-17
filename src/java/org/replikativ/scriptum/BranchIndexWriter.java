@@ -1006,33 +1006,60 @@ public class BranchIndexWriter implements Closeable {
     if (before == null && commitIds == null) {
       throw new IOException("retain() needs either a cutoff or a set of commit ids");
     }
-    if (commitIds != null) {
-      deletionPolicy.setGcCommits(commitIds, Collections.emptySet());
-    } else {
-      deletionPolicy.setGcCutoff(before, Collections.emptySet());
+
+    // DECIDE BEFORE COMMITTING, because committing is not free here: it creates
+    // a commit point of its own. Arming the policy and committing unconditionally
+    // meant a sweep that matched nothing still grew the index — and on the
+    // yggdrasil coordinator path, where candidates come from a registry that
+    // never contains scriptum's own bookkeeping commits, that growth was
+    // monotonic: every cycle added commit points no later cycle could nominate.
+    // The collector was making the index bigger.
+    List<IndexCommit> commits = deletionPolicy.getAllCommits();
+    String head = commits.isEmpty() ? null : lastUuid(commits.get(commits.size() - 1));
+    int wouldDrop = 0;
+    for (int i = 0; i < commits.size() - 1; i++) {
+      IndexCommit c = commits.get(i);
+      String uuid = lastUuid(c);
+      if (uuid != null && uuid.equals(head)) {
+        continue;
+      }
+      if (commitIds != null ? commitIds.contains(uuid) : isOlderThan(c, before)) {
+        wouldDrop++;
+      }
     }
+    if (wouldDrop == 0) {
+      return 0;
+    }
+
+    Set<String> keep = head == null ? Collections.emptySet() : Collections.singleton(head);
+    deletionPolicy.setGc(before, commitIds, keep);
+
     // onCommit is the only place Lucene lets a policy delete, so ask for one —
     // and it has to be a REAL one. IndexWriter.commit() returns early when
-    // nothing changed, so a retain with no indexing in front of it silently did
-    // nothing: the policy was armed and never consulted. Writing commit data
-    // marks the SegmentInfos changed, which is what makes the commit happen.
-    String uuid = setCommitData("scriptum-retain");
+    // nothing changed, so a retain with no indexing in front of it armed the
+    // policy and never consulted it. Writing commit data marks the SegmentInfos
+    // changed, which is what makes the commit happen.
+    //
+    // NOTE FOR CALLERS: this commits whatever the writer has buffered, because
+    // IndexWriter.commit() cannot do otherwise. Collection should not be the
+    // thing that makes a caller's in-flight writes durable, so commit before
+    // retaining if that matters to you.
+    lastCommitId = setCommitData("scriptum-retain");
     writer.commit();
-    int dropped = deletionPolicy.getLastGcDeleted();
+    return deletionPolicy.getLastGcDeleted();
+  }
 
-    // TWICE, because the deletions land after the flip that publishes. Lucene's
-    // IndexFileDeleter removes a dropped commit point's files during the
-    // checkpoint that follows finishCommit — by which time the manifest for THIS
-    // commit has already been written. Without a second commit `retain` reports
-    // what it dropped while the manifest still names every one of them, and the
-    // shrink only appears whenever the caller happens to commit next.
-    if (dropped > 0) {
-      lastCommitId = setCommitData("scriptum-retain-publish");
-      writer.commit();
-    } else {
-      lastCommitId = uuid;
+  /** A commit's `scriptum.uuid`, or null. */
+  private static String lastUuid(IndexCommit commit) throws IOException {
+    return commit.getUserData().get(COMMIT_UUID_KEY);
+  }
+
+  private static boolean isOlderThan(IndexCommit commit, Instant cutoff) throws IOException {
+    if (cutoff == null) {
+      return false;
     }
-    return dropped;
+    String ts = commit.getUserData().get(COMMIT_TIMESTAMP_KEY);
+    return ts != null && Instant.parse(ts).isBefore(cutoff);
   }
 
   public int gc(Instant before) throws IOException {

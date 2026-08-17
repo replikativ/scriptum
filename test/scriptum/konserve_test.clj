@@ -1823,17 +1823,25 @@
           (is (<= 20 before-points) "precondition: every commit point is retained")
           (let [dropped (sc/retain! w {:before (Instant/now)})]
             (is (pos? dropped) "commit points are dropped")
+            ;; PUBLISHED AT THE NEXT FLIP, not this one. Lucene deletes a dropped
+            ;; commit point's files during the checkpoint AFTER finishCommit, by
+            ;; which time the manifest for the retain commit is already written.
+            ;; `retain!` used to force a second commit to publish immediately,
+            ;; which cost a commit point per call and grew the index forever on
+            ;; the coordinator path.
+            (sc/add-doc w {:body {:type :text :value "after"}})
+            (sc/commit! w "publish")
             (let [after-files (count (sk/read-manifest s "main"))]
               (is (< after-files before-files)
                   "and the manifest shrinks, which is what makes the blobs collectable")))
-          (is (= 20 (sc/num-docs w)) "without losing a single live document"))
+          (is (= 21 (sc/num-docs w)) "without losing a single live document"))
         (finally (sc/close! w)))
       ;; the blobs the manifest no longer names are now reclaimable
       (let-the-millisecond-turn-over!)
       (let [collected (count (sk/gc! s sid))]
         (is (pos? collected) "the collector finally has something to take"))
       (with-open [d (sk/konserve-directory s (cache) "main" sid)]
-        (is (= 20 (count (bodies-at s (cache) (sk/branch-snapshot s "main"))))
+        (is (= 21 (count (bodies-at s (cache) (sk/branch-snapshot s "main"))))
             "and the index still reads every live document")))))
 
 (deftest retention-can-drop-named-commits
@@ -1866,4 +1874,76 @@
         (sc/commit! w "one")
         (is (nil? (sc/retain! w {:before (Instant/now)}))
             "retain! is a no-op there, and gc! is the way")
+        (finally (sc/close! w))))))
+
+(deftest retention-never-drops-the-branch-head
+  (testing "REGRESSION: a time cutoff dropped the commit `gc-roots` had just
+            reported as live, because retain's own new commit became the newest
+            and the real head no longer was. The directory-backed collector
+            protects every branch's head regardless of age and says so at
+            length; this had no equivalent. No data was lost — the retain commit
+            carries the same segments — but yggdrasil's promise that a root and
+            its ancestors survive was broken."
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (dotimes [i 3]
+          (sc/add-doc w {:body {:type :text :value (str "d" i)}})
+          (sc/commit! w (str "c" i)))
+        (let [head (.getLastCommitId (sc/->writer w))]
+          (sc/retain! w {:before (Instant/now)})
+          (let [ids (set (map :snapshot-id (sc/list-snapshots w)))]
+            (is (contains? ids head)
+                "the head that gc-roots would report must survive its own collection")))
+        (finally (sc/close! w))))))
+
+(deftest retention-that-drops-nothing-costs-nothing
+  (testing "REGRESSION, and the reason a store-backed index grew without bound
+            under the yggdrasil coordinator: committing is not free here, since
+            the commit itself becomes a commit point. Candidates come from a
+            registry that never contains scriptum's own bookkeeping commits, so
+            every cycle added points no later cycle could nominate — the
+            collector made the index bigger, monotonically."
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (dotimes [i 3]
+          (sc/add-doc w {:body {:type :text :value (str "d" i)}})
+          (sc/commit! w (str "c" i)))
+        (let [points #(count (sc/list-snapshots w))
+              before (points)]
+          (is (= 0 (sc/retain! w {:commit-ids ["no-such-commit"]}))
+              "a sweep that matches nothing drops nothing")
+          (is (= before (points)) "and must not add a commit point either")
+          ;; repeated no-op sweeps, as a coordinator loop would issue
+          (dotimes [_ 5] (sc/retain! w {:commit-ids ["no-such-commit"]}))
+          (is (= before (points)) "however many times it runs"))
+        (finally (sc/close! w))))))
+
+(deftest retention-keeps-the-commit-graph-linear
+  (testing "REGRESSION: `lastCommitId` was assigned before the commit that
+            established it, so retain's commits both claimed the PRE-retain head
+            as parent. That left an orphan tip — never an ancestor of the head,
+            so yggdrasil's reachable set never saw it and its registry never
+            nominated it, which is what made the growth permanent."
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (dotimes [i 4]
+          (sc/add-doc w {:body {:type :text :value (str "d" i)}})
+          (sc/commit! w (str "c" i)))
+        (sc/retain! w {:before (Instant/now)})
+        (sc/add-doc w {:body {:type :text :value "after"}})
+        (sc/commit! w "after")
+        (let [snaps (sort-by :generation (sc/list-snapshots w))
+              ids (set (map :snapshot-id snaps))
+              ;; every commit but the oldest must name a parent that is present
+              orphans (remove (fn [{:keys [parent-ids]}]
+                                (or (nil? parent-ids)
+                                    (some ids (if (string? parent-ids)
+                                                (clojure.string/split parent-ids #",")
+                                                parent-ids))))
+                              (rest snaps))]
+          (is (empty? orphans)
+              (str "no commit may dangle off a parent that is gone: " (pr-str orphans))))
         (finally (sc/close! w))))))
