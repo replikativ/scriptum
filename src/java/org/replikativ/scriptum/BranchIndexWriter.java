@@ -493,9 +493,9 @@ public class BranchIndexWriter implements Closeable {
         BranchedDirectory newBranchDir = new BranchedDirectory(baseDir, overlayDir, newBranchName);
         // newBranchDir now owns baseDir and overlayDir
 
-        // 4. Clone SegmentInfos and bump counter to avoid segment name collisions
+        // 4. Clone SegmentInfos and move the counter past every ordinal in use
         SegmentInfos cloned = currentInfos.clone();
-        cloned.counter = currentInfos.counter + 10000;
+        cloned.counter = Math.max(currentInfos.counter, nextFreeSegmentOrdinal(basePath));
 
         // 5. Write cloned SegmentInfos to new branch
         cloned.commit(newBranchDir);
@@ -1047,6 +1047,76 @@ public class BranchIndexWriter implements Closeable {
    */
   public String getLastContentHash() {
     return lastContentHash;
+  }
+
+
+  /**
+   * One past the highest segment ordinal in use anywhere under {@code basePath} — the base
+   * directory and every branch overlay.
+   *
+   * <p>A forked branch writes into its own overlay, but {@link BranchedDirectory} composes that
+   * overlay OVER the base, so a new segment whose name matches an inherited one shadows it and the
+   * branch reads its own file where it meant to read the parent's. The counter therefore has to
+   * clear every ordinal any branch has used, not merely the parent's.
+   *
+   * <p>This used to be {@code counter + 10000}, which is the same workaround OpenSearch applies on
+   * primary failover ({@code SI_COUNTER_INCREMENT}). Their comment is candid about it — a constant
+   * "decreases the chances of conflict", and the ideal is to "identify the counter from previous
+   * primary" — and they had to raise theirs from 10 to 100000 when collisions kept happening.
+   * Scriptum can do the sound thing instead, because the ordinals in use are all on disk and
+   * enumerable.
+   *
+   * <p>Falls back to 0 for anything unparseable, so a stray file cannot break a fork; the caller
+   * takes the max with the parent's own counter.
+   */
+  private static long nextFreeSegmentOrdinal(Path basePath) throws IOException {
+    long max = -1;
+    List<Path> dirs = new java.util.ArrayList<>();
+    dirs.add(basePath);
+    Path branchesDir = basePath.resolve("branches");
+    if (Files.isDirectory(branchesDir)) {
+      try (java.util.stream.Stream<Path> branches = Files.list(branchesDir)) {
+        branches.filter(Files::isDirectory).forEach(dirs::add);
+      }
+    }
+    for (Path dir : dirs) {
+      if (!Files.isDirectory(dir)) {
+        continue;
+      }
+      try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+        for (Path f : (Iterable<Path>) files::iterator) {
+          long ordinal = segmentOrdinal(f.getFileName().toString());
+          if (ordinal > max) {
+            max = ordinal;
+          }
+        }
+      }
+    }
+    return max + 1;
+  }
+
+  /**
+   * The ordinal in a Lucene segment filename, or -1 if it is not one.
+   *
+   * <p>Segment files are named {@code _<ordinal>} with the ordinal in base 36, optionally followed
+   * by {@code _<generation>} for per-segment generational files such as {@code _0_5.liv}, then an
+   * extension. Only the leading ordinal matters here.
+   */
+  private static long segmentOrdinal(String fileName) {
+    if (fileName.isEmpty() || fileName.charAt(0) != '_') {
+      return -1;
+    }
+    int end = 1;
+    while (end < fileName.length()
+        && fileName.charAt(end) != '.'
+        && fileName.charAt(end) != '_') {
+      end++;
+    }
+    try {
+      return Long.parseLong(fileName.substring(1, end), Character.MAX_RADIX);
+    } catch (NumberFormatException e) {
+      return -1;
+    }
   }
 
   /** Returns the branch name. */

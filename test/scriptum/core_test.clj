@@ -627,3 +627,45 @@
                           (when (.isDirectory x) (run! rm (.listFiles x)))
                           (.delete x))]
                   (rm f))))))))))
+
+(deftest sibling-forks-do-not-reuse-segment-names
+  (testing "a forked branch writes into its own overlay, but BranchedDirectory
+            composes that overlay OVER the base — so a new segment whose name
+            matches an inherited one shadows it, and the branch reads its own
+            file where it meant to read the parent's.
+
+            The counter therefore has to clear every ordinal ANY branch has
+            used, not just the parent's. It used to be `counter + 10000`, the
+            same workaround OpenSearch applies on failover and openly calls a
+            way to 'decrease the chances of conflict' — they raised theirs from
+            10 to 100000 when collisions kept happening. Two forks off one
+            parent both computed the same bumped value and wrote the same
+            names; deriving from the ordinals on disk is exact."
+    (let [path (str "/tmp/scriptum-fork-counter-" (random-uuid))]
+      (try
+        (let [m (sc/create-index path "main")]
+          (sc/add-doc m {:body {:type :text :value "seed"}})
+          (sc/commit! m "seed")
+          (let [a (sc/fork m "sibA")]
+            (sc/add-doc a {:body {:type :text :value "A"}})
+            (sc/commit! a "A")
+            (let [b (sc/fork m "sibB")]
+              (sc/add-doc b {:body {:type :text :value "B"}})
+              (sc/commit! b "B")
+              (let [seg (fn [branch]
+                          (set (filter #(clojure.string/starts-with? % "_")
+                                       (.list (clojure.java.io/file path "branches" branch)))))]
+                (is (seq (seg "sibA")))
+                (is (seq (seg "sibB")))
+                (is (empty? (clojure.set/intersection (seg "sibA") (seg "sibB")))
+                    "two forks off one parent must not write the same segment names"))
+              (sc/close! b))
+            (sc/close! a))
+          (sc/close! m))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
