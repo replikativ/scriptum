@@ -19,6 +19,7 @@
             [konserve.gc-guard :as guard]
             [konserve.utils :as ku]
             [scriptum.konserve :as sk]
+            [scriptum.metadata :as m]
             [scriptum.core :as sc])
   (:import [org.replikativ.scriptum ContentHash]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
@@ -978,6 +979,32 @@
       (sk/delete-branch! s "broken")
       (is (set? (sk/mark s)) "collection works again once it is gone"))))
 
+(deftest a-failed-open-does-not-corrupt-the-live-writer
+  (testing "REGRESSION: the open-time reconcile deletes every cached file the
+            manifest does not name — which is precisely a live writer's unsynced
+            segments — and it ran before the caller could take Lucene's lock. So
+            a second open that went on to FAIL with LockObtainFailedException had
+            already destroyed the first writer's work: its next commit threw
+            NoSuchFileException and its reader threw CorruptIndexException.
+
+            A failed open must not damage a successful one. Taking the lock
+            around the reconcile makes it skip when anything else owns the view."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "committed")
+        (with-open [iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
+          (let [doc (Document.)]
+            (.add doc (TextField. "body" "in flight" Field$Store/YES))
+            (.addDocument iw doc))
+          (.flush iw)                       ; blobs exist, manifest does not name them
+          ;; a second open on the same branch and cache must fail — and be inert
+          (is (thrown? Exception
+                       (with-open [_ (sk/konserve-directory s (cache) "main")]
+                         (IndexWriter. _ (IndexWriterConfig. (StandardAnalyzer.))))))
+          (.commit iw)
+          (is (= #{"committed" "in flight"} (bodies d))
+              "the first writer must be unharmed"))))))
+
 (deftest concurrent-readers-may-materialize-the-same-file
   (testing "REGRESSION: `link-into-view!` checked `.exists` then linked, so two
             readers materializing one file both saw it absent and both linked —
@@ -1092,3 +1119,25 @@
               "a reader with the file mapped must keep working")
           (let [sf (.storedFields (IndexSearcher. r))]
             (is (= "before" (.get (.document sf 0) "body")))))))))
+
+(deftest a-shared-store-needs-both-marks
+  (testing "`sweep!` is allow-list, so silence is deletion. The metadata index
+            keeps its roots under bare keywords and every PSS node under a raw
+            UUID — no `[:scriptum \u2026]` prefix — so `scriptum.konserve/mark`
+            cannot infer them. Sweeping from it alone deleted the roots and every
+            node, leaving the in-memory atom as the only copy until restart.
+
+            No in-tree caller shares a store today, but `open-store-index` takes
+            a `:metadata-index` over any store, so the wiring is one line away."
+    (let [mi (m/create-metadata-index *root*)]
+      (m/index! mi "main" {"tx" "42"} 1)
+      (m/flush-index! mi)
+      (let [kv (:kv-store mi)
+            marked (m/mark kv)
+            all (into #{} (map :key) (k/keys kv {:sync? true}))]
+        (is (contains? marked :metadata/roots))
+        (is (contains? marked :metadata/freed))
+        (is (empty? (set/difference all marked))
+            "every key the metadata index needs is named, PSS nodes included")
+        (is (every? #(not (and (vector? %) (= :scriptum (first %)))) marked)
+            "and none of them carry a prefix scriptum.konserve could match on")))))

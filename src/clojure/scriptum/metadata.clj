@@ -251,6 +251,35 @@
       (save-freed! kv-store @(:freed-atom storage))
       (reset! (:dirty-atom mi) false))))
 
+(defn mark
+  "Every key this index needs kept, for a collector over its store.
+
+  MUST BE UNIONED WITH `scriptum.konserve/mark` WHEN BOTH SHARE A STORE.
+  `konserve.gc/sweep!` is allow-list — it deletes every key not named — and
+  scriptum's own mark cannot infer these: `:metadata/roots` and
+  `:metadata/freed` are bare keywords, and every PSS node is stored under a
+  raw `(random-uuid)`, so there is no `[:scriptum …]` prefix to match on. The
+  result was not a collision but something quieter: a sweep from scriptum's
+  whitelist deleted the roots and every node, leaving the in-memory atom as the
+  only surviving copy until restart.
+
+  No in-tree caller shares a store today — `create-metadata-index` always builds
+  its own filestore under `<path>/scriptum-metadata` — but `open-store-index`
+  accepts a `:metadata-index` over any store, so the wiring is one line away.
+
+  Walks the tree from the roots, so it costs a read per node."
+  [kv-store]
+  (let [roots (load-roots kv-store)]
+    (loop [queue (if-let [r (:index roots)] [r] [])
+           seen #{}]
+      (if-let [address (first queue)]
+        (if (contains? seen address)
+          (recur (rest queue) seen)
+          (let [node (k/get kv-store address nil {:sync? true})]
+            (recur (into (vec (rest queue)) (:addresses node))
+                   (conj seen address))))
+        (into #{:metadata/roots :metadata/freed} seen)))))
+
 (defn close-index!
   "Flush and close the metadata index store."
   [^MetadataIndex mi]

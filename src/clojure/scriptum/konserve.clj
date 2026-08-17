@@ -662,9 +662,28 @@
      ;;
      ;; `write.lock` is exempt — it is Lucene's, not ours, and deleting one held
      ;; by a live writer in this JVM would break the exclusion it provides.
-     (doseq [^String n (.list (io/file cache branch))]
-       (when-not (or (contains? (files-now) n) (= n IndexWriter/WRITE_LOCK_NAME))
-         (.delete (view-file cache branch n))))
+     ;;
+     ;; ONLY WHEN NOTHING ELSE OWNS THE VIEW, and this is the difference between
+     ;; a cleanup and silent corruption. A writer's unsynced files are, by
+     ;; definition, not in the manifest — so reconciling under a live writer
+     ;; deletes exactly its in-progress segments. It ran before the caller could
+     ;; take Lucene's lock, so even an open that went on to FAIL with
+     ;; LockObtainFailedException had already destroyed the first writer's work:
+     ;; its next commit threw NoSuchFileException and its reader threw
+     ;; CorruptIndexException. A failed open must not damage a successful one.
+     ;;
+     ;; The lock is the only reliable witness — the session set is per-Directory
+     ;; and invisible across instances — so take it, reconcile, and release. A
+     ;; reader opening alongside a writer simply skips the cleanup, which is the
+     ;; right answer: the debris is not going anywhere, and whoever owns the view
+     ;; will clear it on its next open.
+     (try
+       (with-open [_ (.obtainLock live IndexWriter/WRITE_LOCK_NAME)]
+         (doseq [^String n (.list (io/file cache branch))]
+           (when-not (or (contains? (files-now) n) (= n IndexWriter/WRITE_LOCK_NAME))
+             (.delete (view-file cache branch n)))))
+       (catch org.apache.lucene.store.LockObtainFailedException _
+         nil))
      ;; FilterDirectory over the live MMapDirectory, not a bare Directory: this
      ;; IS an mmap'd directory with a store-backed materialization layer in
      ;; front, and `FilterDirectory.unwrap` is how Lucene detects that. A bare
@@ -1022,6 +1041,12 @@
   So this is the contract, in one place, and `gc!` is a caller of it like any
   other.
 
+  IT COVERS THIS NAMESPACE ONLY. A `scriptum.metadata` index sharing the store
+  keeps its roots under bare keywords and every tree node under a raw UUID, so
+  nothing here can infer them — union `scriptum.metadata/mark` as well, or a
+  sweep from this whitelist alone deletes the metadata index outright. Same for
+  any other component on the store: allow-list means silence is deletion.
+
   `extra-snapshots` names index states an external holder still references; see
   `reachable-snapshots`. They are treated as HINTS: one that no longer exists is
   ignored rather than fatal, because the holder is not scriptum and its list is
@@ -1128,22 +1153,34 @@
    (let [live (into #{} (map str) (reachable-addresses store extra-snapshots))
          live-snapshots (into #{} (map str) (reachable-snapshots store extra-snapshots))
          known (branches store)
-         ;; Returns whether it DID WORK, not whether the directory vanished.
-         ;; `.delete` on a directory still holding `write.lock` is false, and
-         ;; using that as the predicate reported `:views 0` for a call that had
-         ;; just emptied a view and the entire pool — the number a caller reads
-         ;; to decide whether it reclaimed space.
+         ;; THE LOCK IS THE LIVENESS TEST, not the registry. Registry membership
+         ;; cannot tell a dead branch from a live writer whose branch drifted out
+         ;; of the registry, and the two want opposite treatment: the first
+         ;; should be removed entirely, the second left completely alone. An
+         ;; earlier version guessed by sparing `write.lock` unconditionally,
+         ;; which protected the live writer but then left every dead view
+         ;; undeletable — `.delete` fails on a non-empty directory — so nothing
+         ;; was ever reclaimed.
+         ;;
+         ;; Taking the lock answers it exactly: if it is free, no writer owns
+         ;; this view and everything including the lock file can go; if it is
+         ;; held, skip the directory untouched. Returns whether it did work,
+         ;; rather than whether the directory vanished — reporting `.delete`'s
+         ;; value said `:views 0` for a call that had emptied a view and the
+         ;; whole pool, which is the number a caller reads to decide whether it
+         ;; reclaimed space.
          rm-dir! (fn [^java.io.File d]
-                   (let [removable (remove #(= IndexWriter/WRITE_LOCK_NAME
-                                               (.getName ^java.io.File %))
-                                           (.listFiles d))]
-                     (run! #(.delete ^java.io.File %) removable)
-                     ;; `.delete` fails while write.lock remains, by design — so
-                     ;; "did work" is either: we removed files, or the directory
-                     ;; itself went. An empty view (materialization is lazy, so a
-                     ;; branch never read has one) is deleted and must still count.
-                     (let [gone (.delete d)]
-                       (boolean (or (seq removable) gone)))))
+                   (try
+                     (with-open [dir (MMapDirectory/open (->path (.getPath d)))
+                                 _ (.obtainLock dir IndexWriter/WRITE_LOCK_NAME)]
+                       (run! #(.delete ^java.io.File %) (.listFiles d)))
+                     ;; the lock file itself is only ours to remove once released
+                     (let [left (.listFiles d)]
+                       (run! #(.delete ^java.io.File %) left)
+                       (.delete d)
+                       true)
+                     (catch org.apache.lucene.store.LockObtainFailedException _
+                       false)))
          pool-dir (io/file cache "pool")
          blobs (if (.isDirectory pool-dir)
                  (count (filterv (fn [^java.io.File f]
