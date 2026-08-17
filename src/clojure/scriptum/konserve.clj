@@ -118,28 +118,65 @@
   [:scriptum :snapshot address])
 
 (defn snapshot-address
-  "The content address of a file map: a merkle root over the blobs it names.
+  "The content address of a commit: `files` plus the `parent` it descends from.
 
-  `ContentHash/hashMap` sorts keys before serializing, so this is deterministic
-  and — being the same hash family the leaf addresses use — makes the snapshot a
-  genuine interior node rather than a checksum that happens to sit above one."
-  [files]
-  (ContentHash/hashMap files))
+  A COMMIT HASH, NOT A TREE HASH, and the distinction is git's. Addressing the
+  file map alone gives two commits with identical content the same address — so
+  two branches that happen to produce the same segments would collide, and the
+  second write would silently replace the first's parent. Covering the parent
+  makes an address name a position in history rather than a set of bytes.
+
+  It also makes the merkle claim a real one. The values are blob addresses,
+  themselves content hashes of segments, so a head address covers every segment
+  in the index AND every ancestor: tamper with any byte at any point in the
+  history and the head changes. Addressing the file map alone covered only the
+  current commit.
+
+  The cost is that two lineages holding identical content store the map twice.
+  That map is metadata — measured at ~1KB across 200 commits — while the bytes
+  live in blobs, which stay deduplicated because their addresses are unchanged."
+  ([files] (snapshot-address files nil))
+  ([files parent]
+   ;; String keys, not keywords: `ContentHash/hashMap` sorts and serializes keys
+   ;; as strings, and pinning them here keeps the address independent of how the
+   ;; value happens to be spelled in Clojure.
+   (ContentHash/hashMap {"files" files "parent" (str parent)})))
 
 (defn read-snapshot
-  "The file map at `address`. Throws when the address names nothing.
+  "The commit at `address`: `{:files {filename -> blob-address} :parent address}`.
+  Throws when the address names nothing.
 
   NOT `{}` on a miss. A pointer into a snapshot that does not exist is
   corruption — a swept snapshot, an interrupted fork, an unmigrated store — and
   returning an empty map made every one of those look like an empty branch.
-  That is the worst possible reading: `reachable-addresses` then whitelists
-  nothing for the branch, so the next `gc!` deletes the blobs that would have
-  made the damage recoverable. Loud beats quiet here."
+  That is the worst possible reading: the mark then whitelists nothing for the
+  branch, so the next `gc!` deletes the blobs that would have made the damage
+  recoverable. Loud beats quiet here."
   [store address]
   (or (k/get store (snapshot-key address) nil {:sync? true})
       (throw (ex-info (str "scriptum: snapshot " address " is missing — the branch "
                            "points at a tree that is not in the store")
                       {:address address}))))
+
+(defn snapshot-files
+  "Just the `{filename -> blob-address}` map at `address`."
+  [store address]
+  (:files (read-snapshot store address)))
+
+(defn snapshot-parent
+  "The address this commit descends from, or nil at the start of a lineage.
+
+  RECORDED BUT NOT YET WALKED. Nothing marks through it today, so a superseded
+  commit is still collected exactly as before and chains stay short. It is here
+  because retention needs it and adding it later would have forced a second
+  layout change on published stores — the shape is settled now, and turning it
+  on is a change to the mark rather than to the store.
+
+  When the mark does walk it, a parent that is not in the store must terminate
+  the chain rather than raise: stores written before retention was switched on
+  have their history collected already, and that is not corruption."
+  [store address]
+  (:parent (read-snapshot store address)))
 
 (defn branch-snapshot
   "The snapshot address `branch` points at, or nil for a branch with no commit.
@@ -171,10 +208,14 @@
 
   1 — `[:scriptum :manifest <branch>]` held the file map itself: a mutable cell
       containing the whole tree.
-  2 — that cell holds a SNAPSHOT ADDRESS, and the tree lives at
-      `[:scriptum :snapshot <address>]` as an immutable, content-addressed
-      value. One mutable pointer per branch, everything below it a value."
-  2)
+  2 — that cell holds an address, and the tree lives at
+      `[:scriptum :snapshot <address>]` addressed by the FILE MAP alone.
+  3 — the same, but the address covers the file map AND the parent it
+      descends from, and the value carries that parent: a commit hash
+      rather than a tree hash. Two commits with identical content in
+      different lineages no longer collide, and a head address covers
+      every ancestor as well as every segment."
+  3)
 
 (def branches-key
   "Where the branch registry lives: a set of branch names."
@@ -205,10 +246,11 @@
   both produce valid-looking UUIDs for the same bytes, so the only symptom was
   a manifest naming blobs that were not there.
 
-  NO MIGRATION, DELIBERATELY. Layout 1 was never released — no released scriptum
-  contains this namespace at all, and the version stamp itself postdates every
-  build that exists — so the only v1 stores are development ones, which are
-  cheaper to discard than to convert. Nothing here migrates path-based
+  NO MIGRATION, DELIBERATELY. No earlier layout was ever released — no released
+  scriptum contains this namespace at all, and the version stamp itself postdates
+  every build that exists — so the only older stores are development ones, which
+  are cheaper to discard than to convert. That exemption ends at the first
+  publication, which is why the layout was settled before it rather than after. Nothing here migrates path-based
   (`BranchedDirectory`) indices either; that is a different storage model and a
   separate problem.
 
@@ -234,7 +276,7 @@
       (throw (ex-info (str "scriptum: this store is manifest layout " v
                            ", and this scriptum reads only " format-version
                            (when (< v format-version)
-                             " — layout 1 was never released, so there is no migration"))
+                             " — no earlier layout was ever released, so there is no migration"))
                       {:store-version v :supported format-version}))
 
       ;; Unstamped: fresh, or written before the stamp existed. FRESH MEANS NO
@@ -252,8 +294,8 @@
       :else
       (if-let [existing (seq (manifest-branches store))]
         (throw (ex-info (str "scriptum: this store predates manifest layout " format-version
-                             " and cannot be read — layout 1 was never released, so there is "
-                             "no migration from it")
+                             " and cannot be read — no earlier layout was ever released, so "
+                             "there is no migration from it")
                         {:store-version :pre-stamp
                          :supported format-version
                          :branches (set existing)}))
@@ -269,7 +311,7 @@
   only the pointer and a cache keyed by address never needs invalidating."
   [store branch]
   (if-let [address (branch-snapshot store branch)]
-    (read-snapshot store address)
+    (snapshot-files store address)
     {}))
 
 (defn branches
@@ -598,7 +640,7 @@
    ;; directory — nothing closes it on the way out, and its mapped arena outlives
    ;; the failed call.
    (let [initial (let [a (branch-snapshot store branch)]
-                   {:pointer a :files (if a (read-snapshot store a) {})})
+                   {:pointer a :files (if a (snapshot-files store a) {})})
          live (MMapDirectory/open (->path (str cache "/" branch)))
          ;; ONE atom holding BOTH halves, and that is a correctness requirement
          ;; rather than tidiness. As two atoms, `listAll` claimed the pointer with
@@ -694,12 +736,19 @@
          flip! (fn []
                  (locking lock
                    (when @synced-since-flip
-                     (let [m (files-now)
-                           address (snapshot-address m)]
+                     (let [{:keys [files pointer]} @state
+                           ;; THE PARENT IS WHERE THIS BRANCH WAS, which is what
+                           ;; the pointer still holds until the line below moves
+                           ;; it. Recording it costs nothing — the commit is one
+                           ;; write either way — and it is what lets retention
+                           ;; become a change to the mark rather than a second
+                           ;; layout change on published stores.
+                           address (snapshot-address files pointer)]
                        ;; Values then pointer: the snapshot must exist before
                        ;; anything names it. Being content-addressed, rewriting
                        ;; an identical snapshot is harmless.
-                       (k/assoc store (snapshot-key address) m {:sync? true})
+                       (k/assoc store (snapshot-key address)
+                                {:files files :parent pointer} {:sync? true})
                        (k/assoc store (manifest-key branch) address {:sync? true})
                        (swap! state assoc :pointer address)
                        (reset! dirty false)
@@ -792,7 +841,7 @@
              (when (not= a (:pointer before))
                (compare-and-set! state before
                                  {:pointer a
-                                  :files (if a (read-snapshot store a) {})}))))
+                                  :files (if a (snapshot-files store a) {})}))))
          (let [{:keys [files]} @state]
            (into-array String (sort (into (set (keys files)) @session)))))
 
@@ -978,7 +1027,7 @@
   a snapshot fetches only the files actually read and shares inodes with any
   branch holding the same blobs."
   ^Directory [store ^String cache address]
-  (let [files (read-snapshot store address)
+  (let [files (snapshot-files store address)
         view (str cache "/" snapshot-view-dir "/" address)
         _ (.mkdirs (io/file view))
         live (MMapDirectory/open (->path view))
@@ -1045,7 +1094,7 @@
             (k/assoc store (manifest-key to) address {:sync? true})
             (if (and (= address (branch-snapshot store from))
                      (k/exists? store (snapshot-key address) {:sync? true}))
-              (read-snapshot store address)
+              (snapshot-files store address)
               (if (< attempt 3)
                 (recur (inc attempt))
                 ;; LEAVE NO DANGLING POINTER BEHIND. `mark` resolves every branch
@@ -1102,7 +1151,7 @@
         registered-here? (register-branch! store branch)]
     (k/assoc store (manifest-key branch) address {:sync? true})
     (if (k/exists? store (snapshot-key address) {:sync? true})
-      (read-snapshot store address)
+      (snapshot-files store address)
       (do
         ;; Undo, leaving the branch as it was rather than dangling.
         (if previous
@@ -1178,7 +1227,7 @@
          ;; and it names the branch so an operator can act on it.
          branch-files (into {}
                             (map (fn [[b a]]
-                                   [a (try (read-snapshot store a)
+                                   [a (try (snapshot-files store a)
                                            (catch clojure.lang.ExceptionInfo e
                                              (throw (ex-info
                                                      (str "scriptum: branch " b " points at "
@@ -1192,7 +1241,7 @@
          extra-files (into {} (keep (fn [a]
                                       (when-let [m (k/get store (snapshot-key a) nil
                                                           {:sync? true})]
-                                        [a m])))
+                                        [a (:files m)])))
                            extra-snapshots)
          files (merge branch-files extra-files)]
      {:known known

@@ -664,13 +664,17 @@
         (add-doc! d "first"))
       (let [a1 (sk/branch-snapshot s "main")]
         (is (uuid? a1) "the branch cell holds an address")
-        (is (= (sk/read-snapshot s a1) (sk/read-manifest s "main")))
-        (is (= a1 (sk/snapshot-address (sk/read-snapshot s a1)))
-            "and the address is the content of what it names")
+        (is (= (sk/snapshot-files s a1) (sk/read-manifest s "main")))
+        (is (nil? (sk/snapshot-parent s a1)) "the first commit descends from nothing")
+        (is (= a1 (sk/snapshot-address (sk/snapshot-files s a1)
+                                       (sk/snapshot-parent s a1)))
+            "and the address is the content of what it names, parent included")
         (with-open [d (sk/konserve-directory s (cache) "main")]
           (add-doc! d "second"))
         (let [a2 (sk/branch-snapshot s "main")]
           (is (not= a1 a2) "committing moves the pointer")
+          (is (= a1 (sk/snapshot-parent s a2))
+              "and the new commit records the one it descends from")
           (is (= #{"first"} (bodies-at s (cache) a1))
               "and the OLD snapshot still resolves to the old index state"))))))
 
@@ -785,7 +789,7 @@
         ;; rewrite the store into the v1 shape
         (k/assoc s (sk/manifest-key "main") files {:sync? true})
         (k/assoc s sk/format-key {:version 1} {:sync? true})
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"never released"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no migration"
                               (sk/konserve-directory s (cache) "main"))
             "opening refuses rather than guessing")
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"v1 file map"
@@ -1507,3 +1511,45 @@
             (is (not (contains? (sk/branches s) "feature"))
                 "and deleting it must remove it from the store too")))
         (finally (y/close! sys))))))
+
+(deftest identical-content-in-two-lineages-does-not-collide
+  (testing "WHY THE ADDRESS COVERS THE PARENT. Addressing the file map alone
+            gives two commits with identical content the same address, so the
+            second write replaces the first's parent — and once a mark walks
+            parents, one lineage's history silently becomes the other's.
+
+            Git draws this line the same way: a tree hash is content, a commit
+            hash is content plus parent."
+    (let [files {"_0.cfs" (random-uuid) "_0.si" (random-uuid)}
+          p1 (random-uuid)
+          p2 (random-uuid)]
+      (is (= (sk/snapshot-address files p1) (sk/snapshot-address files p1))
+          "deterministic")
+      (is (not= (sk/snapshot-address files p1) (sk/snapshot-address files p2))
+          "same content, different lineage, different address")
+      (is (not= (sk/snapshot-address files p1)
+                (sk/snapshot-address (assoc files "_1.si" (random-uuid)) p1))
+          "and content still moves it"))))
+
+(deftest a-head-address-covers-every-ancestor
+  (testing "the merkle claim, made real. The values are blob addresses, which are
+            content hashes of segments, so a head address covers every segment in
+            the index AND every ancestor: tamper anywhere in the history and the
+            head changes. Addressing the file map alone covered only the newest
+            commit."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "one"))
+      (let [a1 (sk/branch-snapshot s "main")]
+        (with-open [d (sk/konserve-directory s (cache) "main")]
+          (add-doc! d "two"))
+        (let [a2 (sk/branch-snapshot s "main")]
+          ;; recomputing the head from its own parts must reproduce it
+          (is (= a2 (sk/snapshot-address (sk/snapshot-files s a2)
+                                         (sk/snapshot-parent s a2))))
+          ;; and the chain is walkable, which is what retention will need
+          (is (= a1 (sk/snapshot-parent s a2)))
+          (is (nil? (sk/snapshot-parent s a1)))
+          ;; a different ancestor yields a different head for the same content
+          (is (not= a2 (sk/snapshot-address (sk/snapshot-files s a2) (random-uuid)))
+              "the head moves if its history does"))))))
