@@ -65,7 +65,7 @@
   (:import [org.replikativ.scriptum ContentHash]
            [org.apache.lucene.index IndexWriter]
            [org.apache.lucene.store Directory FilterDirectory MMapDirectory]
-           [java.nio.file Paths Files FileAlreadyExistsException NoSuchFileException]))
+           [java.nio.file Paths Files LinkOption FileAlreadyExistsException NoSuchFileException]))
 
 ;; =============================================================================
 ;; Keys
@@ -141,15 +141,33 @@
                               {:address address :cache cache}))))))
     pf))
 
+(defn- same-inode? [^java.io.File a ^java.io.File b]
+  (= (Files/getAttribute (->path (.getPath a)) "unix:ino" (make-array LinkOption 0))
+     (Files/getAttribute (->path (.getPath b)) "unix:ino" (make-array LinkOption 0))))
+
 (defn- link-into-view!
   "Hard-link the pooled blob into `branch`'s view under its Lucene name.
 
   A hard link rather than a copy: branches that share a segment then share one
   inode, so the bytes sit on disk once and mmap'd pages are shared between
-  branches instead of duplicated."
+  branches instead of duplicated.
+
+  A view entry that is NOT that inode is stale — the same Lucene name mapped to
+  a different address in an earlier session, and the file survived into this
+  one. Serving it would hand Lucene content the manifest does not name. Lucene
+  catches some of these itself, because `segments_N` embeds its generation in a
+  header suffix and codecs checksum their files, but it reports them as index
+  corruption, which is both alarming and wrong: the store is intact and only
+  the derived cache is stale. Repair it instead — the cache is disposable by
+  design, so the fix is to drop the entry and re-link from the pool.
+
+  Compared by INODE rather than by re-hashing, because a view entry is a hard
+  link into a pool whose filename IS the content address. Two stats, no read."
   [store cache branch name address]
   (let [pf (ensure-pooled! store cache address)
         vf (view-file cache branch name)]
+    (when (and (.exists vf) (not (same-inode? vf pf)))
+      (.delete vf))
     (when-not (.exists vf)
       (io/make-parents vf)
       (Files/createLink (->path (.getPath vf)) (->path (.getPath pf))))

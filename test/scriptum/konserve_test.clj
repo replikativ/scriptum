@@ -429,3 +429,42 @@
                              (clojure.string/starts-with? % "segments_"))
                         changed)
                 "and nothing else may change address")))))))
+
+(deftest a-stale-view-entry-is-repaired-not-served
+  (testing "a view entry is a hard link into a content-addressed pool, so a
+            name that links to the WRONG blob is detectable by inode alone —
+            two stats, no re-hash.
+
+            It arises when the manifest advances without this cache following:
+            another process wrote the branch, or a session died. Lucene catches
+            some of these itself, because `segments_N` embeds its generation in
+            a header suffix, but it reports them as INDEX CORRUPTION — alarming
+            and wrong, since the store is intact and only the derived cache is
+            stale. The cache is disposable by design, so the fix is to repair
+            it rather than fail."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "first"))
+      (let [seg1 (first (filter #(clojure.string/starts-with? % "segments_")
+                                (keys (sk/read-manifest s "main"))))
+            ;; keep the OLD blob reachable by a hard link, so copying it later
+            ;; cannot write through to the pool
+            stash (io/file *root* "stash")]
+        (Files/createLink (Paths/get (.getPath stash) (make-array String 0))
+                          (Paths/get (str (cache) "/main/" seg1) (make-array String 0)))
+        (with-open [d (sk/konserve-directory s (cache) "main")]
+          (add-doc! d "second"))
+        (let [m (sk/read-manifest s "main")
+              seg2 (first (filter #(clojure.string/starts-with? % "segments_") (keys m)))
+              pooled (str (cache) "/pool/" (get m seg2))]
+          ;; the view names the current file but links to the previous blob
+          (.delete (io/file (cache) "main" seg2))
+          (Files/createLink (Paths/get (str (cache) "/main/" seg2) (make-array String 0))
+                            (Paths/get (.getPath stash) (make-array String 0)))
+          (is (not= (inode (str (cache) "/main/" seg2)) (inode pooled))
+              "precondition: the view entry is the wrong blob")
+          (with-open [d (sk/konserve-directory s (cache) "main")]
+            (is (= #{"first" "second"} (bodies d))
+                "the index must read correctly despite the stale view")
+            (is (= (inode (str (cache) "/main/" seg2)) (inode pooled))
+                "and the view entry must now be the blob the manifest names")))))))
