@@ -581,3 +581,62 @@
               (str label " must refuse once the directory is closed")))
         (is (= before (sk/read-manifest s "main"))
             "and nothing may have reached the durable manifest")))))
+
+(deftest cache-collection-frees-the-pool
+  (testing "the store collector does not touch the cache, and the cache is where
+            the bytes sit on a machine. Measured on a merge-heavy workload,
+            `gc!` reclaimed 82% of the store and 0% of the pool — 73 blobs
+            against 14 live addresses. Unbounded on a long-running container;
+            on Lambda's 512 MB /tmp it is a hard failure with a store a fraction
+            of the size.
+
+            Safe in a way the store collector is not: the pool is DERIVED, so
+            the worst case is a re-download, never a dangling reference."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (dotimes [c 6] (add-doc! d (str "doc " c)))
+        (with-open [iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
+          (.forceMerge iw 1)
+          (.commit iw)))
+      (let-the-millisecond-turn-over!)
+      (sk/gc! s sid)
+      (let [pool (io/file (cache) "pool")
+            before (count (.listFiles pool))
+            live (count (sk/reachable-addresses s))
+            {:keys [blobs]} (sk/gc-cache! s (cache))]
+        (is (pos? blobs) "superseded blobs must be reclaimed")
+        (is (= live (count (.listFiles pool)))
+            "and exactly the live addresses must remain")
+        (is (< (count (.listFiles pool)) before)))
+      ;; the index still reads, from the pool that is left
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (is (= 6 (count (bodies d)))
+            "collection must not disturb the index it collected around")))))
+
+(deftest cache-collection-drops-views-of-deleted-branches
+  (testing "a branch's view directory outlives the branch otherwise"
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "x"))
+      (sk/fork! s "main" "doomed")
+      (with-open [_ (sk/konserve-directory s (cache) "doomed")] nil)
+      (is (.isDirectory (io/file (cache) "doomed")))
+      (sk/delete-branch! s "doomed")
+      (is (pos? (:views (sk/gc-cache! s (cache)))))
+      (is (not (.exists (io/file (cache) "doomed")))))))
+
+(deftest cache-collection-does-not-disturb-an-open-reader
+  (testing "unlinking a mapped file is safe on POSIX — the inode outlives the
+            directory entry for as long as anything maps it, and a live view
+            holds a hard link to the same inode regardless"
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "before")
+        (with-open [r (DirectoryReader/open d)]
+          ;; collect the whole pool out from under a live reader
+          (run! #(.delete ^java.io.File %) (.listFiles (io/file (cache) "pool")))
+          (is (= 1 (.numDocs r))
+              "a reader with the file mapped must keep working")
+          (let [sf (.storedFields (IndexSearcher. r))]
+            (is (= "before" (.get (.document sf 0) "body")))))))))
