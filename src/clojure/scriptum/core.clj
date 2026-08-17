@@ -231,11 +231,16 @@
          ;; attaches it. `konserve.filestore/connect-fs-store` carries no config
          ;; and answers nil; see `scriptum.konserve/store-id-for`.
          store-id (or store-id ((sk 'store-id-for) store))
-         dir ((sk 'konserve-directory) store cache branch store-id)
+         ;; Where `merge-from!` records the lineage it brought in, so the next
+         ;; commit can name it as a parent. It has to be created out here
+         ;; because the Directory is a proxy with no way to reach into it.
+         pending-parents (atom #{})
+         dir ((sk 'konserve-directory) store cache branch store-id pending-parents)
          writer (BranchIndexWriter/createOver dir branch analyzer)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer metadata-index
                        {:store store :cache cache :directory dir :store-id store-id
+                        :pending-parents pending-parents
                         ;; Kept so `fork` can reproduce them. Lucene's config is
                         ;; per-writer and a fork builds a fresh one, so anything
                         ;; not carried here silently reverts to Lucene's defaults.
@@ -253,9 +258,9 @@
   and `:dataset-commit-id` for stratum, and scriptum was the outlier naming a
   branch.
 
-  It is also a merkle root over the segments it names (`ContentHash/hashMap`
-  over the file map, the same hash family as the blob addresses), so it doubles
-  as a content hash without `:crypto-hash?` being on.
+  It is also a merkle root over the whole history — `ContentHash/hashMap` over
+  the file map AND the parents, whose values are themselves content hashes of
+  segments — so it doubles as a content hash without `:crypto-hash?` being on.
 
   Reflects the last COMMIT, since the branch pointer moves at commit time —
   buffered writes are not in it. Store-backed indices only; nil otherwise."
@@ -888,6 +893,13 @@
   [target source]
   (let [^BranchIndexWriter tw (->writer target)
         ^BranchIndexWriter sw (->writer source)]
+    ;; RECORD THE LINEAGE BEING MERGED IN, so the commit that follows names it
+    ;; as a parent. Without this the merged branch's history is not an ancestor
+    ;; of the result: it survives as segments, but nothing walking parents can
+    ;; reach it, and the head address stops covering it.
+    (when (and (store-backed? target) (store-backed? source))
+      (when-let [a (snapshot-address source)]
+        (swap! (:pending-parents (:backing target)) conj a)))
     (.mergeFrom tw sw)))
 
 (defn close!

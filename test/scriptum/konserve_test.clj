@@ -665,15 +665,15 @@
       (let [a1 (sk/branch-snapshot s "main")]
         (is (uuid? a1) "the branch cell holds an address")
         (is (= (sk/snapshot-files s a1) (sk/read-manifest s "main")))
-        (is (nil? (sk/snapshot-parent s a1)) "the first commit descends from nothing")
+        (is (empty? (sk/snapshot-parents s a1)) "the first commit descends from nothing")
         (is (= a1 (sk/snapshot-address (sk/snapshot-files s a1)
-                                       (sk/snapshot-parent s a1)))
+                                       (sk/snapshot-parents s a1)))
             "and the address is the content of what it names, parent included")
         (with-open [d (sk/konserve-directory s (cache) "main")]
           (add-doc! d "second"))
         (let [a2 (sk/branch-snapshot s "main")]
           (is (not= a1 a2) "committing moves the pointer")
-          (is (= a1 (sk/snapshot-parent s a2))
+          (is (= [a1] (sk/snapshot-parents s a2))
               "and the new commit records the one it descends from")
           (is (= #{"first"} (bodies-at s (cache) a1))
               "and the OLD snapshot still resolves to the old index state"))))))
@@ -745,7 +745,7 @@
           (add-doc! d "newer"))
         (let-the-millisecond-turn-over!)
         (sk/gc! s sid (ku/now) #{held})
-        (is (seq (sk/read-snapshot s held)) "the held snapshot survives")
+        (is (seq (sk/snapshot-files s held)) "the held snapshot survives")
         (is (= #{"held"} (bodies-at s (cache) held))
             "and still resolves to the index state it named")))))
 
@@ -1523,12 +1523,12 @@
     (let [files {"_0.cfs" (random-uuid) "_0.si" (random-uuid)}
           p1 (random-uuid)
           p2 (random-uuid)]
-      (is (= (sk/snapshot-address files p1) (sk/snapshot-address files p1))
+      (is (= (sk/snapshot-address files [p1]) (sk/snapshot-address files [p1]))
           "deterministic")
-      (is (not= (sk/snapshot-address files p1) (sk/snapshot-address files p2))
+      (is (not= (sk/snapshot-address files [p1]) (sk/snapshot-address files [p2]))
           "same content, different lineage, different address")
-      (is (not= (sk/snapshot-address files p1)
-                (sk/snapshot-address (assoc files "_1.si" (random-uuid)) p1))
+      (is (not= (sk/snapshot-address files [p1])
+                (sk/snapshot-address (assoc files "_1.si" (random-uuid)) [p1]))
           "and content still moves it"))))
 
 (deftest a-head-address-covers-every-ancestor
@@ -1546,10 +1546,69 @@
         (let [a2 (sk/branch-snapshot s "main")]
           ;; recomputing the head from its own parts must reproduce it
           (is (= a2 (sk/snapshot-address (sk/snapshot-files s a2)
-                                         (sk/snapshot-parent s a2))))
+                                         (sk/snapshot-parents s a2))))
           ;; and the chain is walkable, which is what retention will need
-          (is (= a1 (sk/snapshot-parent s a2)))
-          (is (nil? (sk/snapshot-parent s a1)))
+          (is (= [a1] (sk/snapshot-parents s a2)))
+          (is (empty? (sk/snapshot-parents s a1)))
           ;; a different ancestor yields a different head for the same content
-          (is (not= a2 (sk/snapshot-address (sk/snapshot-files s a2) (random-uuid)))
+          (is (not= a2 (sk/snapshot-address (sk/snapshot-files s a2) [(random-uuid)]))
               "the head moves if its history does"))))))
+
+(defn- ancestors-of
+  "Every address reachable from `a` by walking parents, `a` included.
+
+  Stops at a parent that is not in the store rather than raising — a chain whose
+  tail has been collected is the normal state today, not corruption."
+  [s a]
+  (loop [queue [a] seen #{}]
+    (if-let [x (first queue)]
+      (if (contains? seen x)
+        (recur (rest queue) seen)
+        (recur (into (vec (rest queue))
+                     (try (sk/snapshot-parents s x) (catch Exception _ nil)))
+               (conj seen x)))
+      seen)))
+
+(deftest a-merge-keeps-both-lineages-reachable
+  (testing "WHY :parents IS PLURAL. `merge-from!` brings another branch's
+            history in, and a commit recording only the target's previous head
+            leaves that lineage unreachable the moment anything walks parents —
+            and makes the head address stop covering it, so the merkle claim
+            would be false after any merge.
+
+            The codebase already models this one layer up: Lucene commit
+            user-data carries `scriptum.parent-ids` as a list and yggdrasil's
+            `commit-info` returns a set. A scalar here would have been the
+            outlier, and widening it later is exactly the migration this layout
+            exists to avoid.
+
+            Reachability, not direct parenthood, is the assertion: `.mergeFrom`
+            commits internally, so the merged lineage is recorded on that commit
+            and the caller's own commit makes it a grandparent."
+    (let [s (store)
+          main (sc/open-store-index s (cache) "main")]
+      (try
+        (sc/add-doc main {:body {:type :text :value "on main"}})
+        (sc/commit! main "m1")
+        (let [feature (sc/fork main "feature")]
+          (try
+            (sc/add-doc feature {:body {:type :text :value "on feature"}})
+            (sc/commit! feature "f1")
+            (let [feature-head (sc/snapshot-address feature)]
+              (sc/merge-from! main feature)
+              (sc/commit! main "merged")
+              (let [head (sc/snapshot-address main)
+                    reachable (ancestors-of s head)]
+                (is (contains? reachable feature-head)
+                    "the merged lineage must be an ancestor of the result")
+                ;; and the commit that took it in names BOTH, so the address covers both
+                (let [merge-commit (first (filter #(< 1 (count (sk/snapshot-parents s %)))
+                                                  reachable))]
+                  (is (some? merge-commit) "some commit records two parents")
+                  (is (contains? (set (sk/snapshot-parents s merge-commit)) feature-head))
+                  (is (= merge-commit
+                         (sk/snapshot-address (sk/snapshot-files s merge-commit)
+                                              (sk/snapshot-parents s merge-commit)))
+                      "and its address is computed over both"))))
+            (finally (sc/close! feature))))
+        (finally (sc/close! main))))))

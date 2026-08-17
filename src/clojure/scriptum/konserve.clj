@@ -113,41 +113,56 @@
 (defn blob-key [address] [:scriptum :blob address])
 
 (defn snapshot-key
-  "An immutable `{lucene-filename -> blob-address}` map, addressed by content."
+  "An immutable commit — `{:files {lucene-filename -> blob-address} :parents [...]}`
+  — addressed by `snapshot-address` over both halves."
   [address]
   [:scriptum :snapshot address])
 
+(defn normalize-parents
+  "The canonical form of a parent set: distinct, nil-free, sorted by string.
+
+  Sorted because the address is computed over it and `ContentHash` serializes a
+  collection in iteration order — so an unordered set would give one commit two
+  addresses depending on how it happened to iterate."
+  [parents]
+  (vec (sort-by str (distinct (remove nil? parents)))))
+
 (defn snapshot-address
-  "The content address of a commit: `files` plus the `parent` it descends from.
+  "The content address of a commit: `files` plus the `parents` it descends from.
 
   A COMMIT HASH, NOT A TREE HASH, and the distinction is git's. Addressing the
   file map alone gives two commits with identical content the same address — so
   two branches that happen to produce the same segments would collide, and the
-  second write would silently replace the first's parent. Covering the parent
+  second write would silently replace the first's parents. Covering the parents
   makes an address name a position in history rather than a set of bytes.
 
   It also makes the merkle claim a real one. The values are blob addresses,
   themselves content hashes of segments, so a head address covers every segment
   in the index AND every ancestor: tamper with any byte at any point in the
-  history and the head changes. Addressing the file map alone covered only the
-  current commit.
+  history and the head changes.
+
+  PARENTS, PLURAL, because a merge has two. `merge-from!` brings another
+  lineage in, and the codebase already models that one layer up — Lucene commit
+  user-data carries `scriptum.parent-ids` as a list and yggdrasil's
+  `commit-info` returns a set. A scalar here would have been the outlier, and
+  widening it later is precisely the migration this layout exists to avoid.
 
   The cost is that two lineages holding identical content store the map twice.
   That map is metadata — measured at ~1KB across 200 commits — while the bytes
   live in blobs, which stay deduplicated because their addresses are unchanged."
-  ([files] (snapshot-address files nil))
-  ([files parent]
-   ;; String keys, not keywords: `ContentHash/hashMap` sorts and serializes keys
-   ;; as strings, and pinning them here keeps the address independent of how the
-   ;; value happens to be spelled in Clojure.
-   (ContentHash/hashMap {"files" files "parent" (str parent)})))
+  [files parents]
+  ;; String keys, not keywords: `ContentHash/hashMap` sorts and serializes keys
+  ;; as strings, and pinning them here keeps the address independent of how the
+  ;; value happens to be spelled in Clojure.
+  (ContentHash/hashMap {"files" files
+                        "parents" (mapv str (normalize-parents parents))}))
 
 (defn read-snapshot
-  "The commit at `address`: `{:files {filename -> blob-address} :parent address}`.
+  "The commit at `address`: `{:files {filename -> blob-address} :parents [...]}`.
   Throws when the address names nothing.
 
   NOT `{}` on a miss. A pointer into a snapshot that does not exist is
-  corruption — a swept snapshot, an interrupted fork, an unmigrated store — and
+  corruption — a swept snapshot, an interrupted fork, an unreadable store — and
   returning an empty map made every one of those look like an empty branch.
   That is the worst possible reading: the mark then whitelists nothing for the
   branch, so the next `gc!` deletes the blobs that would have made the damage
@@ -159,24 +174,34 @@
                       {:address address}))))
 
 (defn snapshot-files
-  "Just the `{filename -> blob-address}` map at `address`."
+  "Just the `{filename -> blob-address}` map at `address`.
+
+  Throws on a commit with no `:files`, rather than answering nil. Returning nil
+  here would undo exactly what `read-snapshot` throws for: `mark` would find no
+  blobs for the branch and, `sweep!` being allow-list, the next collection would
+  delete every segment it names."
   [store address]
-  (:files (read-snapshot store address)))
+  (let [v (read-snapshot store address)]
+    (or (:files v)
+        (throw (ex-info (str "scriptum: snapshot " address " has no :files — it was "
+                             "not written by this layout")
+                        {:address address :value v})))))
 
-(defn snapshot-parent
-  "The address this commit descends from, or nil at the start of a lineage.
+(defn snapshot-parents
+  "The addresses this commit descends from: empty at the start of a lineage,
+  one in ordinary history, two or more after a merge.
 
-  RECORDED BUT NOT YET WALKED. Nothing marks through it today, so a superseded
-  commit is still collected exactly as before and chains stay short. It is here
-  because retention needs it and adding it later would have forced a second
-  layout change on published stores — the shape is settled now, and turning it
-  on is a change to the mark rather than to the store.
+  RECORDED BUT NOT YET WALKED. Nothing marks through them today, so a superseded
+  commit is still collected exactly as before and chains stay short. They are
+  here because retention needs them and adding them later would have forced a
+  second layout change on published stores — the shape is settled now, and
+  turning it on is a change to the mark rather than to the store.
 
-  When the mark does walk it, a parent that is not in the store must terminate
+  When the mark does walk them, a parent that is not in the store must terminate
   the chain rather than raise: stores written before retention was switched on
   have their history collected already, and that is not corruption."
   [store address]
-  (:parent (read-snapshot store address)))
+  (vec (:parents (read-snapshot store address))))
 
 (defn branch-snapshot
   "The snapshot address `branch` points at, or nil for a branch with no commit.
@@ -626,6 +651,8 @@
                           "4-arity opts out for a store that is never collected.")
                      {:store-type (type store)}))))
   (^Directory [store ^String cache ^String branch store-id]
+   (konserve-directory store cache branch store-id (atom #{})))
+  (^Directory [store ^String cache ^String branch store-id pending-parents]
    (check-branch-name branch)
    (.mkdirs (io/file cache branch))
    ;; Refuse a layout we cannot read before touching anything, then register the
@@ -737,22 +764,33 @@
                  (locking lock
                    (when @synced-since-flip
                      (let [{:keys [files pointer]} @state
-                           ;; THE PARENT IS WHERE THIS BRANCH WAS, which is what
-                           ;; the pointer still holds until the line below moves
-                           ;; it. Recording it costs nothing — the commit is one
-                           ;; write either way — and it is what lets retention
-                           ;; become a change to the mark rather than a second
-                           ;; layout change on published stores.
-                           address (snapshot-address files pointer)]
+                           ;; WHERE THIS BRANCH WAS, which is what the pointer
+                           ;; still holds until the line below moves it, PLUS any
+                           ;; lineage merged in since the last flip. Recording
+                           ;; them costs nothing — the commit is one write either
+                           ;; way — and it is what lets retention become a change
+                           ;; to the mark rather than a second layout change on
+                           ;; published stores.
+                           ;;
+                           ;; A merge is why this is a set: `merge-from!` brings
+                           ;; another branch's history in, and a commit that
+                           ;; recorded only the target's previous head would
+                           ;; leave the merged lineage unreachable the moment
+                           ;; anything walks parents.
+                           parents (normalize-parents (cons pointer @pending-parents))
+                           address (snapshot-address files parents)]
                        ;; Values then pointer: the snapshot must exist before
                        ;; anything names it. Being content-addressed, rewriting
                        ;; an identical snapshot is harmless.
                        (k/assoc store (snapshot-key address)
-                                {:files files :parent pointer} {:sync? true})
+                                {:files files :parents parents} {:sync? true})
                        (k/assoc store (manifest-key branch) address {:sync? true})
                        (swap! state assoc :pointer address)
                        (reset! dirty false)
-                       (reset! synced-since-flip false))))
+                       (reset! synced-since-flip false)
+                       ;; Consumed: they belong to the commit just written, not
+                       ;; to whatever is committed next.
+                       (reset! pending-parents #{}))))
                  ;; After the pointer lands, everything this sequence wrote is
                  ;; reachable — or garbage, if a later pointer superseded it.
                  (close-guard!))]
