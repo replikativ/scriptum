@@ -596,3 +596,34 @@
 
       (finally
         (delete-dir-recursive path)))))
+
+(deftest index-size-knobs-take-effect
+  (testing "the two knobs that matter against a remote store, where a segment is
+            a blob written and read whole rather than a file on local disk.
+            Lucene's defaults (5120 MB merged, 16 MB flush) are tuned for the
+            latter; both are live settings, so scriptum applies them after the
+            writer is constructed."
+    (let [path (str "/tmp/scriptum-tuning-" (random-uuid))]
+      (try
+        (let [w (sc/create-index path "main" {:max-merged-segment-mb 128
+                                              :ram-buffer-mb 48})
+              bw (sc/->writer w)]
+          (try
+            (is (= 128.0 (.getMaxMergedSegmentMB bw)))
+            (is (= 48.0 (.getRAMBufferSizeMB bw)))
+            (finally (sc/close! w))))
+        ;; and the defaults are Lucene's when nothing is asked for
+        (let [w (sc/create-index (str path "-default") "main")
+              bw (sc/->writer w)]
+          (try
+            (is (= 5120.0 (.getMaxMergedSegmentMB bw))
+                "untuned must stay on Lucene's default")
+            (finally (sc/close! w))))
+        (finally
+          (doseq [p [path (str path "-default")]]
+            (let [f (clojure.java.io/file p)]
+              (when (.exists f)
+                (letfn [(rm [^java.io.File x]
+                          (when (.isDirectory x) (run! rm (.listFiles x)))
+                          (.delete x))]
+                  (rm f))))))))))

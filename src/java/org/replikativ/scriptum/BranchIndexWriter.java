@@ -1011,6 +1011,38 @@ public class BranchIndexWriter implements Closeable {
     return branchName;
   }
 
+  /**
+   * Cap the size of a merged segment, in megabytes. See {@link
+   * BranchAwareMergePolicy#setMaxMergedSegmentMB(double)} for why a remote store wants a much lower
+   * value than Lucene's 5 GB default.
+   */
+  public void setMaxMergedSegmentMB(double mb) {
+    mergePolicy.setMaxMergedSegmentMB(mb);
+  }
+
+  /** The current merged-segment cap in megabytes. */
+  public double getMaxMergedSegmentMB() {
+    return mergePolicy.getMaxMergedSegmentMB();
+  }
+
+  /**
+   * Set the in-memory buffer a flush accumulates before writing a segment, in megabytes.
+   *
+   * <p>This bounds the size of segments created by a FLUSH, as distinct from a merge — so it sets
+   * the floor of the blob-size distribution where the cap above sets the ceiling. Lucene's default
+   * is 16 MB.
+   *
+   * <p>Live-settable: this reaches {@code IndexWriter.getConfig()}, which applies to the next flush.
+   */
+  public void setRAMBufferSizeMB(double mb) {
+    writer.getConfig().setRAMBufferSizeMB(mb);
+  }
+
+  /** The current flush buffer size in megabytes. */
+  public double getRAMBufferSizeMB() {
+    return writer.getConfig().getRAMBufferSizeMB();
+  }
+
   /** Returns the underlying Directory. */
   public Directory getDirectory() {
     return directory;

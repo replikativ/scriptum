@@ -50,6 +50,18 @@
 
 ;; --- Index Lifecycle ---
 
+(defn- tune!
+  "Apply the segment-size knobs to a freshly opened writer.
+
+  Both are live settings on Lucene's side — the merge policy re-reads its cap on
+  every merge decision and the flush buffer applies to the next flush — so they
+  are set after construction rather than threaded through the Java
+  constructors."
+  [^BranchIndexWriter writer max-merged-segment-mb ram-buffer-mb]
+  (when max-merged-segment-mb (.setMaxMergedSegmentMB writer (double max-merged-segment-mb)))
+  (when ram-buffer-mb (.setRAMBufferSizeMB writer (double ram-buffer-mb)))
+  writer)
+
 (defn create-index
   "Create a new branched index at the given path.
 
@@ -58,16 +70,32 @@
   Options:
     :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)
     :crypto-hash? - enable merkle hashing for commits (default: false)
+    :max-merged-segment-mb - cap on a merged segment, in MB (Lucene default: 5120)
+    :ram-buffer-mb - flush buffer, in MB (Lucene default: 16)
+
+  THE TWO SIZE KNOBS ARE THE ONES THAT MATTER FOR A REMOTE STORE. Lucene's
+  defaults are tuned for a local disk, where a segment is just a file and 5 GB
+  costs nothing to leave lying there. Against an object store a segment is a
+  blob written and read whole, so the merged-segment cap sets the peak memory a
+  commit costs — konserve's S3 backing holds a blob in the heap to PUT it — and
+  it has to stay clear of S3's 5 GB single-PUT limit. A few hundred MB is a
+  reasonable cap there; `scriptum.konserve/remote-tuning` carries defaults.
+
+  The flush buffer sets the other end of the distribution: it bounds segments
+  created by a flush, before any merge, and so governs how small the small
+  objects are.
 
   Returns a ScriptumWriter wrapping BranchIndexWriter + metadata index."
   ([^String path ^String branch-name]
    (create-index path branch-name {}))
-  ([^String path ^String branch-name {:keys [analyzer crypto-hash?]}]
+  ([^String path ^String branch-name {:keys [analyzer crypto-hash?
+                                             max-merged-segment-mb ram-buffer-mb]}]
    (let [base-path (->path path)
          analyzer (or analyzer (StandardAnalyzer.))
          crypto-hash (boolean crypto-hash?)
          writer (BranchIndexWriter/create base-path branch-name analyzer crypto-hash)
          mi (metadata/create-metadata-index path)]
+     (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer mi))))
 
 (defn open-branch
@@ -77,14 +105,30 @@
 
   Options:
     :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)
-    :metadata-index - shared metadata index (default: creates new one)"
+    :metadata-index - shared metadata index (default: creates new one)
+    :max-merged-segment-mb - cap on a merged segment, in MB (Lucene default: 5120)
+    :ram-buffer-mb - flush buffer, in MB (Lucene default: 16)
+
+  THE TWO SIZE KNOBS ARE THE ONES THAT MATTER FOR A REMOTE STORE. Lucene's
+  defaults are tuned for a local disk, where a segment is just a file and 5 GB
+  costs nothing to leave lying there. Against an object store a segment is a
+  blob written and read whole, so the merged-segment cap sets the peak memory a
+  commit costs — konserve's S3 backing holds a blob in the heap to PUT it — and
+  it has to stay clear of S3's 5 GB single-PUT limit. A few hundred MB is a
+  reasonable cap there; `scriptum.konserve/remote-tuning` carries defaults.
+
+  The flush buffer sets the other end of the distribution: it bounds segments
+  created by a flush, before any merge, and so governs how small the small
+  objects are."
   ([^String path ^String branch-name]
    (open-branch path branch-name {}))
-  ([^String path ^String branch-name {:keys [analyzer metadata-index]}]
+  ([^String path ^String branch-name {:keys [analyzer metadata-index
+                                             max-merged-segment-mb ram-buffer-mb]}]
    (let [base-path (->path path)
          analyzer (or analyzer (StandardAnalyzer.))
          writer (BranchIndexWriter/open base-path branch-name analyzer)
          mi (or metadata-index (metadata/create-metadata-index path))]
+     (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer mi))))
 
 (defn fork

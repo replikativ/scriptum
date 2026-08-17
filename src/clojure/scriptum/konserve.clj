@@ -169,6 +169,34 @@
 ;; The Directory
 ;; =============================================================================
 
+(def remote-tuning
+  "Lucene size knobs for an index whose segments are blobs in a remote store.
+
+  Lucene's defaults assume a local disk, where a segment is a file and a 5 GB
+  one costs nothing to leave lying there. Against an object store the same
+  segment is a blob written and read WHOLE, which changes what the defaults
+  buy you:
+
+    :max-merged-segment-mb 256   (Lucene: 5120)
+      The largest blob, and so the peak memory a commit costs — konserve's S3
+      backing assembles a blob in the heap to PUT it, roughly twice its size.
+      It also has to stay clear of S3's 5 GB single-PUT ceiling, since that
+      backing does not do multipart. 256 MB bounds the heap at ~0.5 GB and
+      leaves an order of magnitude of headroom.
+
+    :ram-buffer-mb 32            (Lucene: 16)
+      The other end of the distribution: this bounds segments created by a
+      FLUSH, before any merge. Raised rather than lowered, because against a
+      remote store the cost is per REQUEST — measured at ~5 objects per commit
+      with a median blob of ~500 bytes — so fewer, larger flushes are cheaper
+      than many small ones.
+
+  Pass to `scriptum.core/create-index` or `open-branch`. These are defaults to
+  start from, not tuned constants: the right cap depends on the heap you have
+  and how large the index gets."
+  {:max-merged-segment-mb 256
+   :ram-buffer-mb 32})
+
 (defn konserve-directory
   "A Lucene `Directory` for `branch`, durable in `store`, read through an
   mmap'd local cache under `cache`.
