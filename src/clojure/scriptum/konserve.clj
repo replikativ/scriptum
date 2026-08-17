@@ -239,7 +239,13 @@
          ;; manifest, derive a new one, put it in the store and only then
          ;; install it — three steps that interleave and lose one of two edits.
          lock (Object.)]
-     (doseq [[n address] @manifest] (link-into-view! store cache branch n address))
+     ;; NOT materialized eagerly. `openInput` and `fileLength` link a file into
+     ;; the view on first touch, so fetching the whole manifest here only moved
+     ;; that cost to open time and paid it for files no query ever reads. On a
+     ;; local filestore that was a hard-link walk; against a remote store it is
+     ;; the entire branch downloaded before the first query — the difference
+     ;; between fetching a term dictionary and fetching a gigabyte.
+     ;;
      ;; Reconcile the view with the manifest before anything reads it. A cached
      ;; file the manifest does not name is debris from a session that died
      ;; mid-write, and nothing else will ever remove it: `listAll` never names
@@ -347,6 +353,14 @@
        (syncMetaData [] nil)
 
        (rename [source dest]
+         ;; Materialize first: nothing else guarantees `source` is local now
+         ;; that files are fetched on first touch, and `.rename` on the live
+         ;; directory needs the file to be there. In practice Lucene renames
+         ;; `pending_segments_N`, which this session just wrote — but a manifest
+         ;; file renamed without ever being read would otherwise fail.
+         (when-let [a (get @manifest source)]
+           (when-not (.exists (view-file cache branch source))
+             (link-into-view! store cache branch source a)))
          (.rename live source dest)
          (locking lock
            ;; The session has to follow the rename too. Without this, `listAll`

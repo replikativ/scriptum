@@ -113,7 +113,12 @@
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (add-doc! d "shared base"))
       (sk/fork! s "main" "feature")
-      (with-open [_ (sk/konserve-directory s (cache) "feature")]
+      (with-open [d (sk/konserve-directory s (cache) "feature")]
+        ;; Touch every file first: materialization is LAZY, so a branch's view
+        ;; is populated on first read rather than at open. The inode sharing is
+        ;; a property of how a file arrives in the view, not of when.
+        (doseq [^String n (vec (.listAll d))]
+          (.close (.openInput d n org.apache.lucene.store.IOContext/DEFAULT)))
         (let [mm (sk/read-manifest s "main")
               fm (sk/read-manifest s "feature")
               shared (filter (fn [[n a]] (= a (get fm n))) mm)]
