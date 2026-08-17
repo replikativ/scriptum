@@ -572,7 +572,7 @@
       (let [e (try (sk/konserve-directory s (cache) "main") nil
                    (catch clojure.lang.ExceptionInfo e e))]
         (is (some? e) "opening must refuse, not proceed")
-        (is (re-find #"newer scriptum" (ex-message e)))
+        (is (re-find #"reads only" (ex-message e)))
         (is (= {:store-version (inc sk/format-version) :supported sk/format-version}
                (ex-data e))
             "and says which layouts are involved, not merely that it failed"))
@@ -724,17 +724,26 @@
           (add-doc! d "second"))
         (let-the-millisecond-turn-over!)
         (sk/gc! s sid)
-        (is (empty? (sk/read-snapshot s superseded))
-            "the superseded snapshot is gone")
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is missing"
+                              (sk/read-snapshot s superseded))
+            "the superseded snapshot is gone, and reading it says so rather
+             than returning an empty map that looks like an empty branch")
         (with-open [d (sk/konserve-directory s (cache) "main" sid)]
           (is (= #{"first" "second"} (bodies d))
               "and the live branch is untouched"))))))
 
-(deftest a-v1-store-migrates-on-open
-  (testing "v1 held the file map in the branch cell. Migration writes it as a
-            snapshot and repoints — no bytes move, since every blob keeps its
-            address. Values before pointer, so an interrupted run leaves an
-            unreferenced snapshot rather than a pointer into nothing."
+(deftest an-older-layout-is-refused-not-migrated
+  (testing "there is NO migration, on purpose. Layout 1 was never released — no
+            released scriptum contains this namespace, and the version stamp
+            itself postdates every build — so the only v1 stores are development
+            ones, cheaper to discard than to convert.
+
+            The converter that did exist was worse than nothing: it read the
+            branch REGISTRY to decide what to convert, and an incomplete
+            registry is exactly what this repository's earlier missing-GC-root
+            bug produced. Branches it missed kept their v1 maps, the stamp
+            recorded the store as converted so it never retried, those branches
+            read as empty, and the next `gc!` swept their blobs."
     (let [s (store)]
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (add-doc! d "written-as-v2"))
@@ -742,14 +751,137 @@
         ;; rewrite the store into the v1 shape
         (k/assoc s (sk/manifest-key "main") files {:sync? true})
         (k/assoc s sk/format-key {:version 1} {:sync? true})
-        (is (map? (k/get s (sk/manifest-key "main") nil {:sync? true}))
-            "precondition: the branch cell holds the tree")
-        (is (= #{"main"} (sk/migrate-v1->v2! s)))
-        (is (uuid? (sk/branch-snapshot s "main")) "the cell now holds an address")
-        (is (= files (sk/read-manifest s "main")) "naming the same tree")
-        (is (empty? (sk/migrate-v1->v2! s)) "and re-running converts nothing")
-        (with-open [d (sk/konserve-directory s (cache) "main")]
-          (is (= #{"written-as-v2"} (bodies d)) "the index still reads"))))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"never released"
+                              (sk/konserve-directory s (cache) "main"))
+            "opening refuses rather than guessing")
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"v1 file map"
+                              (sk/branch-snapshot s "main"))
+            "and a v1 cell read directly says so, rather than being treated as
+             an address that resolves to nothing")))))
+
+(deftest a-store-written-before-the-stamp-is-refused
+  (testing "an unstamped store is fresh ONLY if nothing has registered a branch
+            in it — `register-branch!` runs immediately after `ensure-format!`
+            on the first open, so a registry means the store predates this
+            layout. Without that check an unstamped v1 store would be silently
+            stamped v2 and then read as empty."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "pre-stamp"))
+      ;; strip the stamp: the state any store written before today would be in
+      (k/dissoc s sk/format-key {:sync? true})
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"predates"
+                            (sk/konserve-directory s (cache) "main"))))))
+
+(deftest a-fresh-store-is-stamped-not-refused
+  (testing "the other side of that check: an empty store has no registry, so it
+            is stamped and opened normally. Getting this wrong would refuse
+            every new index."
+    (let [s (store)]
+      (is (nil? (k/get s sk/format-key nil {:sync? true})) "precondition: unstamped")
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "fresh"))
+      (is (= {:version sk/format-version} (k/get s sk/format-key nil {:sync? true})))
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (is (= #{"fresh"} (bodies d)))))))
+
+;; =============================================================================
+;; Root sets and cache reclamation
+;; =============================================================================
+
+(deftest the-root-set-is-exported-not-inlined
+  (testing "an embedder — datahike, via `sec/mark-from-key-map` — builds ONE
+            whitelist from every index and sweeps everything else. With the root
+            set inline in `gc!` it had to re-derive this by hand, and the two
+            roots easy to miss are the two already missed once here: the branch
+            registry and the format stamp. A swept registry makes the next mark
+            find no branches and take the whole index."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "one"))
+      (sk/fork! s "main" "feature")
+      (let [m (sk/mark s)
+            all (into #{} (map :key) (k/keys s {:sync? true}))]
+        (is (contains? m sk/branches-key) "the registry is a root")
+        (is (contains? m sk/format-key) "so is the format stamp")
+        (is (contains? m (sk/manifest-key "main")))
+        (is (contains? m (sk/manifest-key "feature")))
+        (is (empty? (set/difference all m))
+            "and on a store scriptum owns outright, the mark covers every key —
+             so an embedder unioning this cannot lose anything of ours")))))
+
+(deftest cache-collection-reclaims-snapshot-views
+  (testing "REGRESSION: snapshot views were exempted from collection wholesale,
+            so they grew once per address ever opened — and because their
+            entries are hard links into the pool, a pool blob deleted here kept
+            its inode alive underneath. `gc-cache!` reported bytes it had not
+            freed, which on the 512 MB Lambda /tmp it exists for is the exact
+            failure it claims to prevent."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "first"))
+      (let [old (sk/branch-snapshot s "main")]
+        (is (= #{"first"} (bodies-at s (cache) old)) "materializes a snapshot view")
+        (is (.isDirectory (io/file (cache) "snapshots" (str old))))
+        (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+          (add-doc! d "second"))
+        ;; nobody holds `old` any more
+        (let [r (sk/gc-cache! s (cache))]
+          (is (pos? (:snapshot-views r)) "the superseded view is reclaimed")
+          (is (not (.isDirectory (io/file (cache) "snapshots" (str old))))))))))
+
+(deftest cache-collection-keeps-a-held-snapshot-view
+  (testing "the other side: a snapshot passed as held must not be thrashed, or
+            every call re-downloads its blobs."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "first"))
+      (let [held (sk/branch-snapshot s "main")]
+        (is (= #{"first"} (bodies-at s (cache) held)))
+        (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+          (add-doc! d "second"))
+        (sk/gc-cache! s (cache) #{held})
+        (is (.isDirectory (io/file (cache) "snapshots" (str held)))
+            "a held snapshot keeps its view")))))
+
+(deftest cache-collection-spares-a-live-writers-lock
+  (testing "REGRESSION: view deletion unlinked the whole directory including
+            Lucene's `write.lock`, so a writer whose branch had drifted out of
+            the registry failed its next commit with NoSuchFileException on the
+            lock itself. The lock is Lucene's, not ours — the open-time reconcile
+            already exempts it and this must too."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "one")
+        (with-open [iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
+          ;; drift: the registry forgets a branch that is open and being written
+          (k/assoc s sk/branches-key #{} {:sync? true})
+          (sk/gc-cache! s (cache))
+          (is (.exists (io/file (cache) "main" "write.lock"))
+              "the lock survives collection")
+          (let [doc (Document.)]
+            (.add doc (TextField. "body" "two" Field$Store/YES))
+            (.addDocument iw doc))
+          (.commit iw))))))
+
+(deftest reserved-branch-names-are-refused
+  (testing "a branch view is `cache/<branch>`, and `pool`/`snapshots` are
+            siblings of it. `pool` is the dangerous one: opening that branch runs
+            the reconcile, which deletes everything its manifest does not name —
+            the entire content pool, for every branch."
+    (let [s (store)]
+      (doseq [n sk/reserved-branch-names]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved"
+                              (sk/konserve-directory s (cache) n))
+            (str n " must be refused at open")))
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "x"))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved"
+                            (sk/fork! s "main" "pool"))
+          "and forking to one must be refused too"))))
 
 (deftest concurrent-readers-may-materialize-the-same-file
   (testing "REGRESSION: `link-into-view!` checked `.exists` then linked, so two
