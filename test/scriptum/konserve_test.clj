@@ -4,7 +4,13 @@
   Each test names a property the manifest design claims, and several of them
   are regressions for mistakes made while arriving at it — a flat cache that let
   one branch continue another's index, and a cached manifest that left a
-  long-lived reader blind to new commits."
+  long-lived reader blind to new commits.
+
+  The Lucene `Directory` CONTRACT is not tested here. Lucene ships its own
+  conformance suite for that and scriptum runs it — see `scriptum.tck-runner`,
+  which is where exception types, concurrent `listAll`, slices and clones, and
+  use-after-close are covered far better than by hand. What stays here is what
+  that suite cannot know about: the storage model, and the cost of using it."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.java.io :as io]
             [konserve.filestore :refer [connect-fs-store]]
@@ -13,12 +19,13 @@
             [konserve.gc-guard :as guard]
             [konserve.utils :as ku]
             [scriptum.konserve :as sk])
-  (:import [org.apache.lucene.analysis.standard StandardAnalyzer]
+  (:import [org.replikativ.scriptum ContentHash]
+           [org.apache.lucene.analysis.standard StandardAnalyzer]
            [org.apache.lucene.document Document TextField Field$Store]
            [org.apache.lucene.index IndexWriter IndexWriterConfig DirectoryReader]
            [org.apache.lucene.search IndexSearcher]
-           [org.apache.lucene.store LockObtainFailedException]
-           [java.nio.file Files LinkOption Paths]))
+           [org.apache.lucene.store IOContext LockObtainFailedException]
+           [java.nio.file Files LinkOption Paths FileAlreadyExistsException]))
 
 (def ^:dynamic *root* nil)
 
@@ -211,6 +218,89 @@
         (with-open [d (sk/konserve-directory s (cache) "main")]
           (is (= #{"keep me"} (bodies d))
               "and main must be entirely intact"))))))
+
+(deftest a-segment-costs-a-buffer-not-its-own-size
+  (testing "REGRESSION: sync hashed and stored a segment by slurping it into a
+            byte-array, so a commit cost the size of the segment in heap — and
+            a merged segment above Integer/MAX_VALUE could not be allocated at
+            all. Both directions stream now.
+
+            The property under test is the DIGEST agreeing across chunk
+            boundaries, which is what a streaming hash can plausibly get wrong;
+            the memory bound itself is structural. The buffer is 64 KiB and the
+            chunks here are deliberately co-prime with it."
+    (let [f (io/file *root* "chunky.bin")]
+      (io/make-parents f)
+      (with-open [o (java.io.FileOutputStream. f)]
+        (let [r (java.util.Random. 42)
+              chunk (byte-array 65537)]
+          (dotimes [_ 24] (.nextBytes r chunk) (.write o chunk))))
+      (is (= (ContentHash/hashBytes (Files/readAllBytes (.toPath f)))
+             (ContentHash/hashFile (.toPath f)))
+          "the streamed digest must equal the whole-file digest"))))
+
+(deftest a-multi-segment-index-round-trips-through-the-store
+  (testing "end-to-end over the streaming paths: enough documents to make
+            several segments, then a cache wipe forcing every one of them back
+            out of konserve and into a fresh view"
+    (let [s (store)
+          texts (into #{} (map #(str "document number " %)) (range 500))]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (doseq [batch (partition-all 100 texts)]
+          (with-open [iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
+            (doseq [t batch]
+              (let [doc (Document.)]
+                (.add doc (TextField. "body" ^String t Field$Store/YES))
+                (.addDocument iw doc)))
+            (.commit iw))))
+      (rm-rf (io/file (cache)))
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (is (= texts (bodies d))
+            "every document must survive the round trip through konserve")))))
+
+(deftest rename-keeps-listAll-truthful
+  (testing "REGRESSION: `rename` updated the manifest but never the session, so
+            an unsynced file renamed before its first sync left `listAll` naming
+            the OLD name — which no longer existed — and hiding the NEW one,
+            which did. `deleteFile` then threw NoSuchFile for a file that was
+            right there, and `createOutput` on the new name saw no conflict and
+            deleted the renamed content.
+
+            Invisible until now because Lucene's commit path only ever renames a
+            file already in the manifest, and neither this suite nor Lucene's own
+            `testRename` asserts `listAll` afterwards."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (with-open [o (.createOutput d "before.tmp" IOContext/DEFAULT)]
+          (.writeInt o 42))
+        (.rename d "before.tmp" "after.tmp")
+        (is (= ["after.tmp"] (vec (.listAll d)))
+            "listAll must name the file that exists, not the one that doesn't")
+        (is (= 4 (.fileLength d "after.tmp"))
+            "and the renamed file must be readable under its new name")
+        (is (thrown? FileAlreadyExistsException
+                     (.createOutput d "after.tmp" IOContext/DEFAULT))
+            "creating over the renamed file must be refused, not silently obeyed")
+        (.deleteFile d "after.tmp")
+        (is (= [] (vec (.listAll d))))))))
+
+(deftest debris-from-a-dead-session-is-reclaimed
+  (testing "REGRESSION: once `deleteFile` correctly refused files the manifest
+            does not name, nothing reclaimed a segment left by a session that
+            died mid-write — `listAll` never names it, so Lucene never asks for
+            it. It pinned an inode forever. Reconciling the view against the
+            manifest on open is what collects it."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "real content"))
+      (let [debris (io/file (cache) "main" "_9999.cfs")]
+        (spit debris "half-written garbage")
+        (is (.exists debris))
+        (with-open [d (sk/konserve-directory s (cache) "main")]
+          (is (not (.exists debris))
+              "a cached file no manifest names must be reclaimed on open")
+          (is (= #{"real content"} (bodies d))
+              "and the real index must be untouched"))))))
 
 (deftest gc-spares-blobs-whose-manifest-has-not-landed
   (testing "the values-then-pointer race: a sweep running while a sync is in

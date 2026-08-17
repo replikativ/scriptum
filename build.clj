@@ -1,6 +1,7 @@
 (ns build
   (:refer-clojure :exclude [test])
-  (:require [clojure.tools.build.api :as b]
+  (:require [clojure.string :as str]
+            [clojure.tools.build.api :as b]
             [deps-deploy.deps-deploy :as dd])
   (:import [clojure.lang ExceptionInfo]))
 
@@ -19,6 +20,30 @@
             :class-dir "classes"
             :basis @basis
             :javac-opts ["--release" "21" "-Xlint:unchecked"]}))
+
+(def tck-basis
+  "Basis with Lucene's test framework, which carries `BaseDirectoryTestCase`."
+  (delay (b/create-basis {:project "deps.edn" :aliases [:tck]})))
+
+(defn compile-tck
+  "Compile the JUnit classes that run Lucene's Directory conformance suite.
+
+  Separate from `compile-java` because these are TESTS that happen to be Java —
+  they belong on the test classpath, never in the jar, and they need the Lucene
+  test framework that production code must not depend on.
+
+  The classpath is passed explicitly: `b/javac` composes one from the basis's
+  LIBS alone, so the project's own `:paths` — and hence `classes/`, where
+  `compile-java` just put `BranchedDirectory` — are invisible to it. A trailing
+  `-classpath` wins over the one it prepends."
+  [_]
+  (compile-java nil)
+  (let [cp (str/join java.io.File/pathSeparator
+                     (concat ["classes"] (mapcat :paths (vals (:libs @tck-basis)))))]
+    (b/javac {:src-dirs ["test/java"]
+              :class-dir "target/test-classes"
+              :basis @tck-basis
+              :javac-opts ["--release" "21" "-Xlint:unchecked" "-classpath" cp]})))
 
 (defn jar [_]
   (compile-java nil)
