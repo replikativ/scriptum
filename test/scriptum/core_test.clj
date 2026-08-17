@@ -774,3 +774,35 @@
                         (when (.isDirectory x) (run! rm (.listFiles x)))
                         (.delete x))]
                 (rm f)))))))))
+
+;; ============================================================
+;; What commit! returns, and what createOver sets up
+;; ============================================================
+
+(deftest commit-returns-a-generation-not-a-sequence-number
+  (testing "REGRESSION: `commit!` returned `IndexWriter.commit()`'s value, which
+            is Lucene's SEQUENCE NUMBER — its ordering token for concurrent
+            operations — bearing no relation to the `segments_N` generation. It
+            was documented and consumed as `:generation`, stored under that name
+            by the metadata index and handed back by `find-generation`, so
+            `open-reader-at` on it always failed: four commits reported 3, 6, 9,
+            12 where the generations were 1, 2, 3, 4.
+
+            The round trip is the assertion — a value `commit!` returns must be
+            one `open-reader-at` accepts."
+    (let [path (temp-dir)
+          w (sc/create-index path "main")]
+      (try
+        (dotimes [i 4]
+          (sc/add-doc w {:body (str "doc " i)})
+          (let [r (sc/commit! w (str "commit " i))
+                ;; `commit!` returns a bare generation without :crypto-hash?,
+                ;; and a map with it — both carry the same number.
+                generation (if (map? r) (:generation r) r)]
+            (is (some? generation) (str "commit " i " must report a generation"))
+            (is (sc/commit-available? w generation)
+                (str "generation " generation " must exist, got " (pr-str r)))
+            (with-open [rdr (sc/open-reader-at w generation)]
+              (is (= (inc i) (.numDocs rdr))
+                  "and opening at it must show exactly the commits so far"))))
+        (finally (sc/close! w) (delete-dir-recursive path))))))

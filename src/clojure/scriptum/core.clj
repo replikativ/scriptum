@@ -167,7 +167,8 @@
     ;; Forking a store-backed index copies a manifest — no bytes move and no
     ;; directory is created. The parent must land its buffered writes first, or
     ;; the copy names a manifest that does not yet describe them.
-    (let [{:keys [store cache store-id]} (:backing sw)]
+    (let [{:keys [store cache store-id analyzer
+                  max-merged-segment-mb ram-buffer-mb]} (:backing sw)]
       (.commit (->writer sw))
       ((sk 'fork!) store (.getBranchName (->writer sw)) new-branch-name)
       ;; CARRY THE PARENT'S GUARD ID. Dropping it left a caller who passed
@@ -175,9 +176,17 @@
       ;; guarded under the derived one — two ids for one store, which is the
       ;; case `konserve.gc-guard` names as deleting live data, and which
       ;; measured as thousands of lost blobs and a branch that would not open.
+      ;; CARRY THE PARENT'S SETTINGS, not just its guard id. A fork builds a
+      ;; fresh IndexWriterConfig, so anything not passed reverts to Lucene's
+      ;; defaults — including the 5 GB merged-segment cap the remote-store
+      ;; guidance exists to keep clear of S3's single-PUT limit. A parent tuned
+      ;; to 256 MB silently produced a fork at 5120.
       (open-store-index store cache new-branch-name
                         {:metadata-index (->metadata-index sw)
-                         :store-id store-id}))
+                         :store-id store-id
+                         :analyzer analyzer
+                         :max-merged-segment-mb max-merged-segment-mb
+                         :ram-buffer-mb ram-buffer-mb}))
     (let [w (->writer sw)
           mi (->metadata-index sw)
           new-writer (.fork w new-branch-name)]
@@ -226,7 +235,13 @@
          writer (BranchIndexWriter/createOver dir branch analyzer)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer metadata-index
-                       {:store store :cache cache :directory dir :store-id store-id}))))
+                       {:store store :cache cache :directory dir :store-id store-id
+                        ;; Kept so `fork` can reproduce them. Lucene's config is
+                        ;; per-writer and a fork builds a fresh one, so anything
+                        ;; not carried here silently reverts to Lucene's defaults.
+                        :analyzer analyzer
+                        :max-merged-segment-mb max-merged-segment-mb
+                        :ram-buffer-mb ram-buffer-mb}))))
 
 (defn branches
   "Every branch of a store-backed index, from its manifests."

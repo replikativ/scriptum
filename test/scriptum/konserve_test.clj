@@ -1291,3 +1291,81 @@
                   "the fork must carry the parent's id, not re-derive one")
               (finally (sc/close! f))))
           (finally (sc/close! w)))))))
+
+;; =============================================================================
+;; What createOver sets up
+;; =============================================================================
+
+(deftest a-reopened-store-branch-records-its-parent
+  (testing "REGRESSION: `createOver` never called `initLastCommitId`, which
+            `create` and `open` both do. So every store-backed reopen started
+            with a null last-commit-id and the next commit recorded NO parent —
+            a spurious root per open, and a fork whose first commit had no parent
+            at all, leaving the fork point nowhere in the graph. That breaks
+            `ancestors`, `common-ancestor` and `commit-graph`."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try (sc/add-doc w {:body {:type :text :value "first"}})
+             (sc/commit! w "one")
+             (finally (sc/close! w))))
+      ;; a fresh writer over the same branch must adopt the existing head
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try
+          (is (some? (.getLastCommitId (sc/->writer w)))
+              "the reopened writer must adopt the branch's head")
+          (sc/add-doc w {:body {:type :text :value "second"}})
+          (sc/commit! w "two")
+          (let [snaps (sc/list-snapshots w)
+                newest (last (sort-by :generation snaps))]
+            (is (seq (:parent-ids newest))
+                "and its commit must record a parent, not read as a new root"))
+          (finally (sc/close! w)))))))
+
+(deftest a-store-backed-fork-is-not-the-main-branch
+  (testing "REGRESSION: `createOver` hardcoded `isMainBranch` true, so every
+            store-backed branch — forks included — answered true."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try
+          (sc/add-doc w {:body {:type :text :value "x"}})
+          (sc/commit! w "seed")
+          (is (sc/main-branch? w) "main is main")
+          (let [f (sc/fork w "feature")]
+            (try (is (not (sc/main-branch? f)) "a fork is not")
+                 (finally (sc/close! f))))
+          (finally (sc/close! w)))))))
+
+(deftest path-only-operations-refuse-a-store-backed-writer
+  (testing "REGRESSION: these dereferenced a null `basePath` and threw
+            NullPointerException naming an implementation field, despite the
+            docstring claiming they throw and `hasBasePath()` existing for
+            exactly this and never being called."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try
+          (sc/add-doc w {:body {:type :text :value "x"}})
+          (sc/commit! w "seed")
+          (let [bw (sc/->writer w)]
+            (is (thrown-with-msg? java.io.IOException #"directory-backed"
+                                  (.gc bw (java.time.Instant/now))))
+            (is (thrown-with-msg? java.io.IOException #"directory-backed"
+                                  (.fork bw "nope"))))
+          (finally (sc/close! w)))))))
+
+(deftest a-fork-inherits-the-parents-tuning
+  (testing "REGRESSION: `fork` passed neither the analyzer nor the size knobs, and
+            a fork builds a fresh IndexWriterConfig — so a parent capped at 256 MB
+            produced a fork at Lucene's 5120 MB default, the cap the remote-store
+            guidance exists to keep clear of S3's single-PUT limit."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main"
+                                   {:max-merged-segment-mb 256 :ram-buffer-mb 32})]
+        (try
+          (sc/add-doc w {:body {:type :text :value "x"}})
+          (sc/commit! w "seed")
+          (let [f (sc/fork w "feature")]
+            (try
+              (is (= 256.0 (.getMaxMergedSegmentMB (sc/->writer f)))
+                  "the fork must inherit the merged-segment cap")
+              (finally (sc/close! f))))
+          (finally (sc/close! w)))))))

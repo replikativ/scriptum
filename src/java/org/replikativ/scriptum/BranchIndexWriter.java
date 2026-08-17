@@ -81,6 +81,9 @@ public class BranchIndexWriter implements Closeable {
 
   private static final ObjectMapper JSON = new ObjectMapper();
 
+  /** The branch that "self-overlays" the base path in the directory-backed model. */
+  private static final String MAIN_BRANCH_NAME = "main";
+
   private static final String COMMIT_TIMESTAMP_KEY = "scriptum.timestamp";
   private static final String COMMIT_MESSAGE_KEY = "scriptum.message";
   private static final String COMMIT_BRANCH_KEY = "scriptum.branch";
@@ -135,6 +138,25 @@ public class BranchIndexWriter implements Closeable {
   }
 
   /** Initialize lastCommitId from the latest existing commit's UUID. */
+  /**
+   * The generation of the newest commit point, after a commit has landed.
+   *
+   * <p>NOT {@code IndexWriter.commit()}'s return value, which is a SEQUENCE NUMBER — Lucene's
+   * ordering token for concurrent operations — and bears no relation to the {@code segments_N}
+   * generation. It was returned as {@code :generation} anyway, stored under that name by the
+   * metadata index and handed back by {@code find-generation}, so {@code open-reader-at} on it
+   * always failed: four commits reported 3, 6, 9, 12 where the generations were 1, 2, 3, 4.
+   * {@code gc!} then rebuilt the same entries from {@code listSnapshots} with real generations,
+   * so one key answered differently before and after a collection.
+   *
+   * <p>Falls back to the sequence number only when there is no commit point to read, which cannot
+   * happen after a successful commit.
+   */
+  private long lastCommitGeneration(long fallback) {
+    IndexCommit last = deletionPolicy.getLastCommit();
+    return last != null ? last.getGeneration() : fallback;
+  }
+
   private void initLastCommitId() {
     IndexCommit last = deletionPolicy.getLastCommit();
     if (last != null) {
@@ -221,8 +243,25 @@ public class BranchIndexWriter implements Closeable {
 
     IndexWriter writer = new IndexWriter(directory, config);
 
-    return new BranchIndexWriter(
-        writer, directory, deletionPolicy, mergePolicy, branchName, null, analyzer, true, false);
+    // isMainBranch from the NAME, not a constant. It was hardcoded true, so every
+    // store-backed branch — forks included — answered true to isMainBranch(), and
+    // scriptum.core/main-branch? with it. In the manifest model the flag only
+    // means "is this the branch called main"; the path-overlay sense it carries
+    // for directory-backed writers has no counterpart here.
+    BranchIndexWriter biw =
+        new BranchIndexWriter(
+            writer, directory, deletionPolicy, mergePolicy, branchName, null, analyzer,
+            MAIN_BRANCH_NAME.equals(branchName), false);
+
+    // Adopt the branch's existing head, exactly as create() and open() do.
+    // Skipping it left lastCommitId null on every reopen, so the next commit
+    // recorded NO parent — a spurious root per open, and a fork whose first
+    // commit had no parent at all, leaving the fork point nowhere in the graph.
+    // That breaks ancestors, common-ancestor and commit-graph for store-backed
+    // indices.
+    biw.initLastCommitId();
+
+    return biw;
   }
 
   /** Whether this writer has a base path, i.e. is the directory-backed kind. */
@@ -234,7 +273,7 @@ public class BranchIndexWriter implements Closeable {
       Path basePath, String branchName, Analyzer analyzer, boolean cryptoHash) throws IOException {
     Files.createDirectories(basePath);
 
-    boolean isMain = "main".equals(branchName);
+    boolean isMain = MAIN_BRANCH_NAME.equals(branchName);
 
     // All branches — including main — go through BranchedDirectory so the
     // write lock is per-branch (branchName + "_write.lock") instead of the
@@ -473,6 +512,7 @@ public class BranchIndexWriter implements Closeable {
    * @return a new BranchIndexWriter for the forked branch
    */
   public synchronized BranchIndexWriter fork(String newBranchName) throws IOException {
+    requireBasePath("fork()");
     // 1. Flush and commit current state
     writer.flush();
     String forkUuid = setCommitData("Fork point for " + newBranchName);
@@ -686,9 +726,9 @@ public class BranchIndexWriter implements Closeable {
     } else {
       String uuid = setCommitData(message, customMetadata);
       pendingCommitMessage = null;
-      long gen = writer.commit();
+      long seqNo = writer.commit();
       lastCommitId = uuid;
-      return gen;
+      return lastCommitGeneration(seqNo);
     }
   }
 
@@ -707,7 +747,7 @@ public class BranchIndexWriter implements Closeable {
     // Phase 1: Commit with Lucene's random UUID
     String luceneUuid = setCommitData(message, customMetadata);
     pendingCommitMessage = null;
-    long gen = writer.commit();
+    long seqNo = writer.commit();
     lastCommitId = luceneUuid;
 
     // Phase 2: Compute complete merkle root
@@ -741,7 +781,7 @@ public class BranchIndexWriter implements Closeable {
       lastContentHash = null;
     }
 
-    return gen;
+    return lastCommitGeneration(seqNo);
   }
 
   /**
@@ -911,7 +951,26 @@ public class BranchIndexWriter implements Closeable {
    * @param before delete commits with timestamps before this instant
    * @return number of commit points removed
    */
+  /**
+   * Refuse a path-only operation on a store-backed writer.
+   *
+   * <p>These reach through {@code basePath}, which is null for {@link #createOver}. They used to
+   * dereference it and throw NullPointerException on {@code "this.basePath" is null} — a message
+   * naming an implementation field rather than the mistake. {@link #hasBasePath()} existed for
+   * exactly this and was never called.
+   */
+  private void requireBasePath(String operation) throws IOException {
+    if (!hasBasePath()) {
+      throw new IOException(
+          operation
+              + " is only available on a directory-backed index; this writer is backed by a store,"
+              + " where branches are manifests rather than directories. Use the scriptum.konserve"
+              + " equivalent.");
+    }
+  }
+
   public int gc(Instant before) throws IOException {
+    requireBasePath("gc()");
     if (!isMainBranch) {
       throw new IOException("gc() can only be called on the main branch writer");
     }
