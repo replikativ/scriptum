@@ -105,6 +105,23 @@ public class BranchedDirectory extends Directory {
   @Override
   public IndexOutput createOutput(String name, IOContext context) throws IOException {
     ensureOpen();
+    // KNOWN DEVIATION from Directory, which says "Calling createOutput on an
+    // existing file must throw FileAlreadyExistsException" — a base file is an
+    // existing file of this Directory, since listAll reports it and openInput
+    // serves it, and writing the same name into the overlay shadows it instead.
+    //
+    // Enforcing it was tried and reverted: shadowing is the MECHANISM here, not
+    // an accident. `segments_N` must shadow, or a fork could not have a commit
+    // history of its own. Main writes through a BranchedDirectory whose overlay
+    // IS the base, so every file it creates is already "in the base". And a fork
+    // legitimately writes `_1.cfs` while main later writes its own `_1.cfs` into
+    // the base, because main's segment counter is independent and catches up —
+    // the fork's commits reference its own file and never inherited main's,
+    // which did not exist when the fork was taken.
+    //
+    // The harmful case is narrower: a fork shadowing a segment the base held AT
+    // FORK TIME and the fork still references. `nextFreeSegmentOrdinal` prevents
+    // exactly that by starting the fork past every ordinal then in use.
     IndexOutput out = overlayDir.createOutput(name, context);
     overlayFiles.add(name);
     return out;
