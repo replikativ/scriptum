@@ -59,10 +59,21 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
       if (keepIds != null && keepIds.contains(uuid)) {
         return false;
       }
-      if (commitIds != null) {
-        return commitIds.contains(uuid);
-      }
-      return true;
+      // OR, not AND, when both are given: "drop these, AND ALSO anything older
+      // than this". The two layers disagreed — the caller's precheck ignored the
+      // cutoff whenever ids were present while this ANDed them — so a sweep given
+      // both committed (the precheck said something would go) and then dropped
+      // nothing (a candidate newer than the cutoff failed the AND). That is the
+      // collector growing the index while reclaiming nothing, and the coordinator
+      // deregistering candidates it believes were deleted.
+      boolean byId = commitIds != null && commitIds.contains(uuid);
+      boolean byAge = cutoff != null && isBeforeCutoff(commit, cutoff);
+      return byId || byAge;
+    }
+
+    private static boolean isBeforeCutoff(IndexCommit commit, Instant cutoff) throws IOException {
+      String ts = commit.getUserData().get(TIMESTAMP_KEY);
+      return ts != null && Instant.parse(ts).isBefore(cutoff);
     }
   }
 
@@ -88,7 +99,6 @@ public class BranchDeletionPolicy extends IndexDeletionPolicy {
         boolean isLast = (i == commits.size() - 1);
         if (!isLast
             && gc.selects(commit)
-            && (gc.cutoff == null || isBeforeCutoff(commit, gc.cutoff))
             && !hasProtectedFiles(commit, gc.protectedFiles)) {
           commit.delete();
           lastGcDeleted++;

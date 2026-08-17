@@ -963,16 +963,33 @@
     ;; as a parent. Without this the merged branch's history is not an ancestor
     ;; of the result: it survives as segments, but nothing walking parents can
     ;; reach it, and the head address stops covering it.
-    (.mergeFrom tw sw)
-    ;; AFTER the merge, not before. `mergeFrom` commits the source so it can read
-    ;; a consistent view of it, and that commit produces a NEW source snapshot —
-    ;; which is the state actually merged. Capturing the address first recorded
-    ;; the source's PREVIOUS head as the parent, so the lineage the target really
-    ;; took in was not an ancestor of the result, and the head address did not
-    ;; cover it. Both are claims this layout is built on.
-    (when (and (store-backed? target) (store-backed? source))
-      (when-let [a (snapshot-address source)]
-        (swap! (:pending-parents (:backing target)) conj a)))))
+    ;; COMMIT THE SOURCE FIRST, THEN RECORD, THEN MERGE — and the ordering took
+    ;; two attempts to get right, so it is worth spelling out. `mergeFrom` commits
+    ;; the source (for a consistent read), then commits the TARGET twice: once
+    ;; pre-merge and once for the merge itself.
+    ;;
+    ;; Recording before that sequence attached the source's PRE-commit head — not
+    ;; the state actually merged. Recording after it attached nothing at all: the
+    ;; target's own commits inside `mergeFrom` had already consumed and cleared
+    ;; the pending set, so the address sat in an atom nobody read, and the merged
+    ;; lineage was not an ancestor of the result by any route.
+    ;;
+    ;; Committing the source ourselves makes its address the merged state, and
+    ;; recording it before `mergeFrom` lets the target's pre-merge commit carry
+    ;; it — which the merge commit then descends from. Both invariants hold: the
+    ;; merged lineage is reachable, and it is the lineage that was merged. The
+    ;; source commit inside `mergeFrom` is then a no-op, since nothing changed.
+    (if (and (store-backed? target) (store-backed? source))
+      (do
+        ;; Commit the source HERE, so the address recorded is the state the merge
+        ;; will actually read, and tell `mergeFrom` not to commit it again —
+        ;; `commit` always writes fresh commit data, so it is never a no-op and
+        ;; would supersede the address with one nothing points at.
+        (.commit sw "Pre-merge snapshot")
+        (when-let [a (snapshot-address source)]
+          (swap! (:pending-parents (:backing target)) conj a))
+        (.mergeFrom tw sw false))
+      (.mergeFrom tw sw))))
 
 (defn close!
   "Close a branch writer and its resources."

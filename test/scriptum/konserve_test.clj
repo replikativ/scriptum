@@ -1649,13 +1649,13 @@
             (sc/add-doc feature {:body {:type :text :value "on feature"}})
             (sc/commit! feature "f1")
             (let [_ (sc/merge-from! main feature)
-                  ;; AFTER the merge: `mergeFrom` commits the source so it can
-                  ;; read a consistent view, and that commit produces the source
-                  ;; snapshot actually merged. Capturing before it recorded the
-                  ;; source's PREVIOUS head, so the lineage really taken in was
-                  ;; not an ancestor of the result.
+                  ;; The source's head AFTER the merge is the state that was
+                  ;; merged — `merge-from!` commits it before recording.
                   feature-head (sc/snapshot-address feature)]
-              (sc/commit! main "merged")
+              ;; NO further commit: the link must exist as soon as the merge
+              ;; returns. Requiring one hid a version where the address was
+              ;; recorded into a pending set nothing ever consumed.
+
               (let [head (sc/snapshot-address main)
                     reachable (ancestors-of s head)]
                 (is (contains? reachable feature-head)

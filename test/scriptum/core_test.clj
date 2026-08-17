@@ -2,7 +2,9 @@
   "Unit tests for scriptum.core Lucene functionality."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [scriptum.core :as sc]
-            [konserve.store :as kstore])
+            [konserve.store :as kstore]
+            [scriptum.yggdrasil :as sy]
+            [yggdrasil.protocols :as p])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
            [java.time Instant Duration]))
@@ -886,3 +888,65 @@
             (try (is (= 1 (sc/num-docs w2)))
                  (finally (sc/close! w2)))))
         (finally (delete-dir-recursive path))))))
+
+(deftest a-deleted-branch-can-be-recreated
+  (testing "REGRESSION from the fork guard: `fork` refuses a name
+            `discover-branches` still reports, and path-model `delete-branch!`
+            left the overlay directory behind — so `branches` said the branch was
+            gone while `branch!` said it already existed, and no API could remove
+            it. Previously the stale overlay was merely reused, dirty."
+    (let [path (temp-dir)
+          sys (sy/create path)]
+      (try
+        (let [w (get (:writers sys) "main")]
+          (sc/add-doc w {:body "m"})
+          (sc/commit! w "m"))
+        (let [sys (p/branch! sys :feature)
+              f (get (:writers sys) "feature")]
+          (sc/add-doc f {:body "f"})
+          (sc/commit! f "f")
+          (let [sys (p/delete-branch! sys :feature)]
+            (is (not (contains? (p/branches sys) :feature)))
+            ;; and it can be created again, cleanly
+            (let [sys (p/branch! sys :feature)
+                  f2 (get (:writers sys) "feature")]
+              (is (= 1 (sc/num-docs f2))
+                  "a recreated branch forks the current state, not the dead one"))))
+        (finally (sy/close! sys) (delete-dir-recursive path))))))
+
+(deftest forking-onto-main-is-refused
+  (testing "REGRESSION: the guard tested for a `segments*` file under
+            `branches/<name>`, which cannot see MAIN — main's overlay IS the base
+            path. So forking onto \"main\" was allowed and left a stale shadow
+            overlay that later reads resolved through, reporting one document
+            where the index had five."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "a"})
+        (sc/commit! main "one")
+        (is (thrown? java.io.IOException (sc/fork main "main")))
+        (dotimes [i 4]
+          (sc/add-doc main {:body (str "x" i)})
+          (sc/commit! main (str "c" i)))
+        (sc/close! main)
+        (let [reopened (sc/open-branch path "main")]
+          (try (is (= 5 (sc/num-docs reopened))
+                   "main must still resolve to its own index")
+               (finally (sc/close! reopened))))
+        (finally (delete-dir-recursive path))))))
+
+(deftest a-refused-fork-leaves-no-trace
+  (testing "REGRESSION: the guard sat AFTER the source's flush-and-commit, so a
+            refused fork still left a \"Fork point for X\" commit on the source
+            forever — two failed attempts, two junk commit points."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "a"})
+        (sc/commit! main "one")
+        (let [before (count (sc/list-snapshots main))]
+          (dotimes [_ 3] (is (thrown? java.io.IOException (sc/fork main "main"))))
+          (is (= before (count (sc/list-snapshots main)))
+              "a refused fork must not commit the source"))
+        (finally (sc/close! main) (delete-dir-recursive path))))))

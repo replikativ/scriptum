@@ -519,6 +519,28 @@ public class BranchIndexWriter implements Closeable {
    */
   public synchronized BranchIndexWriter fork(String newBranchName) throws IOException {
     requireBasePath("fork()");
+
+    // REFUSE FIRST, BEFORE TOUCHING ANYTHING. Two things went wrong when this
+    // check sat lower down. It came after the source's own flush-and-commit, so
+    // a refused fork still left a "Fork point for X" commit on the source
+    // forever — two failed attempts, two junk commit points. And it tested for a
+    // `segments*` file in `branches/<name>`, which cannot see MAIN: main's
+    // overlay IS basePath, so forking onto "main" was allowed and left a stale
+    // shadow overlay that later reads resolved through, reporting 1 document
+    // where the index had 5.
+    //
+    // Asking `discoverBranches` plus the main name answers by IDENTITY rather
+    // than by a directory listing, so an emptied or lock-only directory does not
+    // false-positive and main is included.
+    if (MAIN_BRANCH_NAME.equals(newBranchName)
+        || newBranchName.equals(branchName)
+        || discoverBranches(basePath).contains(newBranchName)) {
+      throw new IOException(
+          "scriptum: branch "
+              + newBranchName
+              + " already exists; forking onto it would replace its history with this branch's");
+    }
+
     // 1. Flush and commit current state
     writer.flush();
     String forkUuid = setCommitData("Fork point for " + newBranchName);
@@ -531,24 +553,6 @@ public class BranchIndexWriter implements Closeable {
     // 3. Create new overlay directory
     Path newOverlayPath = basePath.resolve("branches").resolve(newBranchName);
 
-    // REFUSE AN EXISTING TARGET BEFORE WRITING ANYTHING. This wrote the cloned
-    // SegmentInfos into the target overlay first and only discovered a live
-    // writer afterwards, when constructing IndexWriter threw
-    // LockObtainFailedException — by which time this branch's commit was already
-    // the newest durable one in the target. The target's own writer kept serving
-    // its old NRT view, and everything it had committed vanished on the next
-    // reopen. Reproduced: a feature-only document, gone after a fork that threw.
-    if (Files.isDirectory(newOverlayPath)) {
-      try (java.util.stream.Stream<Path> existing = Files.list(newOverlayPath)) {
-        if (existing.anyMatch(p -> p.getFileName().toString().startsWith("segments"))) {
-          throw new IOException(
-              "scriptum: branch "
-                  + newBranchName
-                  + " already exists; forking onto it would replace its history with this"
-                  + " branch's");
-        }
-      }
-    }
     Files.createDirectories(newOverlayPath);
 
     Directory baseDir = MMapDirectory.open(basePath);
@@ -1051,7 +1055,12 @@ public class BranchIndexWriter implements Closeable {
       if (uuid != null && uuid.equals(head)) {
         continue;
       }
-      if (commitIds != null ? commitIds.contains(uuid) : isOlderThan(c, before)) {
+      // Mirror the policy exactly: OR, so the precheck and the deletion agree
+      // about what is selected. Diverging meant this said "something will go",
+      // issued a commit, and the policy then dropped nothing.
+      boolean byId = commitIds != null && commitIds.contains(uuid);
+      boolean byAge = before != null && isOlderThan(c, before);
+      if (byId || byAge) {
         wouldDrop++;
       }
     }
@@ -1215,7 +1224,22 @@ public class BranchIndexWriter implements Closeable {
    * @param source the source branch to merge from
    */
   public void mergeFrom(BranchIndexWriter source) throws IOException {
-    source.commit("Pre-merge snapshot");
+    mergeFrom(source, true);
+  }
+
+  /**
+   * Merge with control over whether the source is committed here.
+   *
+   * <p>{@code commitSource=false} is for a caller that has already committed the source and needs
+   * its post-commit identity — a store-backed merge records the merged lineage as a parent, and
+   * the address it records must be the one the merge actually reads. Committing the source here
+   * would supersede it: {@link #commit(String)} always writes fresh commit data, so it is never a
+   * no-op and always produces a new snapshot.
+   */
+  public void mergeFrom(BranchIndexWriter source, boolean commitSource) throws IOException {
+    if (commitSource) {
+      source.commit("Pre-merge snapshot");
+    }
     commit("Pre-merge snapshot");
     try (DirectoryReader reader = DirectoryReader.open(source.directory)) {
       List<CodecReader> codecReaders = new ArrayList<>();
@@ -1749,8 +1773,16 @@ public class BranchIndexWriter implements Closeable {
 
   @Override
   public void close() throws IOException {
-    writer.close();
-    directory.close();
+    // try/finally: the Directory must be released even when the writer's
+    // commit-on-close fails. Without it, a failing close left the Directory open
+    // AND — for a store-backed one — the gc-guard's in-flight sequence never
+    // closed, pinning every later collection at that instant for the life of the
+    // process. That is exactly what the guard exists to prevent.
+    try {
+      writer.close();
+    } finally {
+      directory.close();
+    }
   }
 
   @Override

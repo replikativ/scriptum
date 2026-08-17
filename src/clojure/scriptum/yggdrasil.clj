@@ -7,7 +7,8 @@
   (which writers exist, which is current) is immutable.
 
   Snapshot IDs are UUIDs stored in commit user-data."
-  (:require [konserve.utils :as ku]
+  (:require [clojure.java.io :as io]
+            [konserve.utils :as ku]
             [scriptum.core :as pl]
             [scriptum.konserve :as sk]
             [yggdrasil.protocols :as p]
@@ -152,13 +153,21 @@
           writer (get writers branch-str)]
       (when writer (pl/close! writer))
       ;; DELETE THE BRANCH, not just the handle. Dropping it from `writers` made
-      ;; `branches` stop listing it while the store still did, so its manifest
-      ;; stayed a permanent GC root and its blobs were never collectable — the
-      ;; branch outlived every reference to it. Only the store-backed model can
-      ;; do this; the path model leaves its overlay directory, which a later
-      ;; `branch!` of the same name would silently reuse.
-      (when (and writer (pl/store-backed? writer))
-        (sk/delete-branch! (:store (:backing writer)) branch-str))
+      ;; `branches` stop listing it while the storage still had it, so a
+      ;; store-backed branch's manifest stayed a permanent GC root and its blobs
+      ;; were never collectable — the branch outlived every reference to it.
+      (if (and writer (pl/store-backed? writer))
+        (sk/delete-branch! (:store (:backing writer)) branch-str)
+        ;; The path model has to remove the overlay directory, and now MUST:
+        ;; `fork` refuses a name `discover-branches` still reports, so leaving
+        ;; the directory made a deleted branch impossible to recreate — `branches`
+        ;; said it was gone and `branch!` said it already existed. Previously it
+        ;; merely got silently reused, dirty.
+        (when-let [base (some-> writer pl/base-path not-empty)]
+          (let [dir (io/file base "branches" branch-str)]
+            (when (.isDirectory dir)
+              (run! #(.delete ^java.io.File %) (.listFiles dir))
+              (.delete dir)))))
       (assoc this :writers (dissoc writers branch-str))))
 
   (checkout [this name] (p/checkout this name nil))
