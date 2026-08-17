@@ -106,6 +106,50 @@
 (defn manifest-key [branch] [:scriptum :manifest branch])
 (defn blob-key [address] [:scriptum :blob address])
 
+(def format-key
+  "Where the store records which manifest layout it is in."
+  [:scriptum :format])
+
+(def format-version
+  "The manifest layout this code writes and understands.
+
+  1 — `[:scriptum :manifest <branch>]` is `{lucene-filename -> content-address}`,
+      every address naming a whole blob, addressed by `ContentHash`."
+  1)
+
+(defn ensure-format!
+  "Stamp `store` with this layout version, or refuse a store we cannot read.
+
+  THE REFUSAL IS THE POINT. Without it, a store written by a later scriptum is
+  read as though it were this one, and fails as corruption somewhere far from
+  the cause. That has already happened once in miniature: the blob address
+  function changed from `hasch/uuid` to `ContentHash` during development, and
+  nothing could distinguish a store written before from one written after —
+  both produce valid-looking UUIDs for the same bytes, so the only symptom was
+  a manifest naming blobs that were not there.
+
+  A store with no version IS version 1, because no other has ever existed —
+  this namespace is unreleased. Stamping on first open is therefore the entire
+  migration, and it only works while that stays true, which is the reason to do
+  it now rather than when it is needed.
+
+  Costs one key read per Directory open, next to the one `register-branch!`
+  already does — nothing on the `listAll` path, which reads a manifest on every
+  call. Returns the store's version."
+  [store]
+  (let [v (:version (k/get store format-key nil {:sync? true}))]
+    (cond
+      (nil? v)
+      (do (k/assoc store format-key {:version format-version} {:sync? true})
+          format-version)
+
+      (> v format-version)
+      (throw (ex-info (str "scriptum: store was written by a newer scriptum "
+                           "(manifest layout " v ", this understands " format-version ")")
+                      {:store-version v :supported format-version}))
+
+      :else v)))
+
 (defn read-manifest
   "The branch's `{lucene-filename -> address}` map, or `{}` when it has none."
   [store branch]
@@ -352,10 +396,12 @@
   (^Directory [store cache branch] (konserve-directory store cache branch nil))
   (^Directory [store ^String cache ^String branch store-id]
    (.mkdirs (io/file cache branch))
-   ;; Register before anything can write a manifest through this Directory. One
-   ;; key read for a branch already known, one read plus one write the first
-   ;; time — not per commit. See `register-branch!` for why the ordering is the
+   ;; Refuse a layout we cannot read before touching anything, then register the
+   ;; branch before anything can write a manifest through this Directory. One key
+   ;; read each for a store and branch already known, plus a write the first time
+   ;; — not per commit. See `register-branch!` for why the ordering there is the
    ;; inverse of the values-then-pointer rule.
+   (ensure-format! store)
    (register-branch! store branch)
    (let [live (MMapDirectory/open (->path (str cache "/" branch)))
          manifest (atom (read-manifest store branch))
@@ -690,9 +736,14 @@
    ;; however the walk turned out.
    (let [cutoff (if store-id (guard/cutoff store-id ts) ts)
          keep (into #{} (map blob-key) (reachable-addresses store))
-         ;; The registry is itself a root. `sweep!` is allow-list — it deletes
-         ;; every key not named — so leaving it out swept the very thing the
-         ;; mark walks from, and the next collection saw no branches at all and
-         ;; would have taken everything with it.
-         manifests (into #{branches-key} (map manifest-key) (branches store))]
+         ;; The registry and the format stamp are themselves roots. `sweep!` is
+         ;; allow-list — it deletes every key not named — so leaving the registry
+         ;; out swept the very thing the mark walks from, and the next collection
+         ;; saw no branches at all and would have taken everything with it. The
+         ;; stamp fails more quietly and much later: sweeping it makes the store
+         ;; look unversioned, `ensure-format!` re-stamps it with whatever version
+         ;; is current, and a store that was actually written by a later scriptum
+         ;; is then read as this one — exactly the misreading the stamp exists to
+         ;; prevent, reintroduced by the collector.
+         manifests (into #{branches-key format-key} (map manifest-key) (branches store))]
      (kgc/sweep! store (into keep manifests) cutoff 1000 {:sync? true}))))

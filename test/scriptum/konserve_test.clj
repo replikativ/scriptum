@@ -526,6 +526,51 @@
           "the scan finds the manifest the registry forgot")
       (is (= #{"main" "lost"} (sk/branches s))))))
 
+(deftest a-store-records-its-manifest-layout
+  (testing "an unversioned store IS version 1, because no other version has ever
+            existed — this namespace is unreleased, so stamping on first open is
+            the whole migration. It only works while that stays true, which is
+            why the stamp goes in now rather than when it is first needed."
+    (let [s (store)]
+      (is (nil? (k/get s sk/format-key nil {:sync? true})) "precondition: unstamped")
+      (with-open [_ (sk/konserve-directory s (cache) "main")]
+        (is (= {:version sk/format-version} (k/get s sk/format-key nil {:sync? true}))
+            "opening a Directory stamps the store")))))
+
+(deftest a-store-from-a-newer-scriptum-is-refused
+  (testing "THE REFUSAL IS THE POINT of versioning at all. Reading a later
+            layout as though it were this one fails as corruption somewhere far
+            from the cause — which already happened in miniature when the blob
+            address function changed from `hasch/uuid` to `ContentHash` and
+            nothing could tell the two apart, both being plausible UUIDs."
+    (let [s (store)]
+      (k/assoc s sk/format-key {:version (inc sk/format-version)} {:sync? true})
+      (let [e (try (sk/konserve-directory s (cache) "main") nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (some? e) "opening must refuse, not proceed")
+        (is (re-find #"newer scriptum" (ex-message e)))
+        (is (= {:store-version (inc sk/format-version) :supported sk/format-version}
+               (ex-data e))
+            "and says which layouts are involved, not merely that it failed"))
+      (is (= {:version (inc sk/format-version)} (k/get s sk/format-key nil {:sync? true}))
+          "refusing must not overwrite the stamp it refused"))))
+
+(deftest collection-cannot-erase-the-format-stamp
+  (testing "`sweep!` is allow-list, so an unnamed key is deleted — the bug that
+            already emptied the registry once. The stamp fails more quietly and
+            much later: sweep it and the store looks unversioned, gets restamped
+            with whatever version is current, and a store written by a later
+            scriptum is then read as this one. The collector would reintroduce
+            precisely the misreading the stamp exists to prevent."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "keep me"))
+      (let-the-millisecond-turn-over!)
+      (sk/gc! s sid)
+      (is (= {:version sk/format-version} (k/get s sk/format-key nil {:sync? true}))
+          "the format stamp is a GC root"))))
+
 (deftest concurrent-readers-may-materialize-the-same-file
   (testing "REGRESSION: `link-into-view!` checked `.exists` then linked, so two
             readers materializing one file both saw it absent and both linked —
