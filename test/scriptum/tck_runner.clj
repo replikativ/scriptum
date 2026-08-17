@@ -9,9 +9,9 @@
 
       clj -T:build compile-tck && clj -M:local:tck -m scriptum.tck-runner
 
-  `:local` IS REQUIRED, not decoration: `scriptum.konserve` needs
-  `konserve.gc-guard`, which no released konserve carries, so without it the
-  run dies at load with `Could not locate konserve/gc_guard`.
+  `:local` selects the konserve working tree. It is no longer strictly required
+  — 0.9.375 carries `konserve.gc-guard` — but it is what the rest of this
+  branch's tooling uses, so keeping it makes the runs comparable.
 
   A seed can be pinned to reproduce a failure — as a JVM option, since `-D`
   after `-M` is passed to `clojure.main` as an argument and never reaches the

@@ -44,11 +44,13 @@
 (defn- sk
   "Resolve a `scriptum.konserve` var on first use.
 
-  Required lazily, not with `:require`, so the DIRECTORY-backed API keeps
-  loading against a released konserve. `scriptum.konserve` needs
-  `konserve.gc-guard`, which is unreleased; a static require would make every
-  existing user of this namespace need it too, for a backing they may never
-  touch."
+  Required lazily, not with `:require`, so the DIRECTORY-backed API does not
+  drag in the store-backed one — `scriptum.konserve` is a large namespace that
+  an existing directory-backed user may never touch.
+
+  It was originally lazy because `konserve.gc-guard` was unreleased. That is no
+  longer true: 0.9.375 carries it, and `deps.edn` says so. The indirection stays
+  for load cost, not availability."
   [sym]
   (or (requiring-resolve (symbol "scriptum.konserve" (name sym)))
       (throw (ex-info "scriptum: scriptum.konserve is unavailable"
@@ -215,8 +217,12 @@
                 remote store start from `scriptum.konserve/remote-tuning`.
 
   Returns a ScriptumWriter. Document operations, search, commit and readers
-  behave exactly as for a directory-backed index; `fork`, `branches` and `gc!`
-  answer from the manifests instead of the filesystem."
+  behave exactly as for a directory-backed index, and `fork` and `branches`
+  answer from the manifests instead of the filesystem. COLLECTION IS DIFFERENT:
+  `scriptum.core/gc!` throws here and `scriptum.konserve/gc!` is the one to
+  call, because a store-backed index collects by reachability and has to read
+  the gc-guard's cutoff before walking, which the directory-backed collector
+  does not do."
   ([store cache branch] (open-store-index store cache branch {}))
   ([store ^String cache ^String branch
     {:keys [analyzer metadata-index store-id max-merged-segment-mb ram-buffer-mb]}]

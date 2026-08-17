@@ -273,38 +273,41 @@
          set))
 
   (gc-sweep! [this snapshot-ids] (p/gc-sweep! this snapshot-ids nil))
-  (gc-sweep! [_ snapshot-ids opts]
-    ;; RETURNS A REPORT, NOT THE SYSTEM, and no longer ignores its argument.
+  (gc-sweep! [this snapshot-ids opts]
+    ;; RETURNS THE SYSTEM, because that is what the yggdrasil this depends on
+    ;; asks for: 0.2.14's `gc-sweep!` says "Returns new system with snapshots
+    ;; removed". An earlier version of this returned a reclamation report, which
+    ;; is the contract in yggdrasil's development tree but not in the release
+    ;; scriptum pins — so `(-> sys (gc-sweep! roots) (checkout :main))` failed
+    ;; with a protocol dispatch error. Follow the dependency that ships.
     ;;
-    ;; It used to discard `snapshot-ids` and collect from the current branch's
-    ;; head unconditionally, so `(gc-sweep! sys #{})` — asking to delete NOTHING
-    ;; — took history from four commits to one, including the id `gc-roots` had
-    ;; just named as live. It also threw outright on a non-main current branch,
-    ;; because the path-model collector refuses those.
+    ;; It no longer ignores its argument, which was the actual bug: it used to
+    ;; discard `snapshot-ids` and collect from the current branch unconditionally,
+    ;; so `(gc-sweep! sys #{})` — asking to delete NOTHING — took history from
+    ;; four commits to one, including the id `gc-roots` had just named as live.
     ;;
-    ;; Scriptum computes its own reachability, which the protocol explicitly
-    ;; allows ("adapters that compute their own reachability IGNORE it"), so the
+    ;; Scriptum computes its own reachability, which the protocol allows, so the
     ;; candidate list is not a delete list — but the ROOTS matter, and those are
     ;; the branch heads plus whatever a caller still holds.
     (let [writer (get writers current-branch-name)]
-      (if-not (and writer (pl/store-backed? writer))
-        ;; Path model: age out commit points on main, which is all it can do.
-        {:system-id (str "scriptum:" current-branch-name)
-         :reclaimed (if (and writer (pl/main-branch? writer))
-                      (pl/gc! writer (or (:remove-before opts) (Instant/now)))
-                      0)
-         :skipped (when-not (and writer (pl/main-branch? writer)) :not-main-branch)}
-        (let [store (:store (:backing writer))
-              store-id (:store-id (:backing writer))
-              held (into #{} (filter uuid?) snapshot-ids)]
-          (if (:dry-run? opts)
-            {:system-id (str "scriptum:" current-branch-name)
-             :reclaimed 0
-             :would-keep (count ((requiring-resolve 'scriptum.konserve/mark) store held))}
-            (let [collected ((requiring-resolve 'scriptum.konserve/gc!)
-                             store store-id (ku/now) held)]
-              {:system-id (str "scriptum:" current-branch-name)
-               :reclaimed (count collected)})))))))
+      (cond
+        (nil? writer) this
+
+        (pl/store-backed? writer)
+        (do (when-not (:dry-run? opts)
+              ((requiring-resolve 'scriptum.konserve/gc!)
+               (:store (:backing writer)) (:store-id (:backing writer))
+               (ku/now) (into #{} (filter uuid?) snapshot-ids)))
+            this)
+
+        ;; Path model: age out commit points, which is all it can do, and only on
+        ;; main — the collector refuses other branches, so do not ask it to.
+        (pl/main-branch? writer)
+        (do (when-not (:dry-run? opts)
+              (pl/gc! writer (or (:remove-before opts) (Instant/now))))
+            this)
+
+        :else this))))
 
 (defn create
   "Create a ScriptumSystem at the given path.

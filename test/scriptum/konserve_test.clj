@@ -927,21 +927,35 @@
       (is (not (.exists (io/file (cache) "doomed")))
           "including the lock file, which is only ours to remove while we hold it"))))
 
-(deftest reserved-branch-names-are-refused
-  (testing "a branch view is `cache/<branch>`, and `pool`/`snapshots` are
-            siblings of it. `pool` is the dangerous one: opening that branch runs
-            the reconcile, which deletes everything its manifest does not name —
-            the entire content pool, for every branch."
+(deftest branch-names-are-whitelisted
+  "REGRESSION: only `pool` and `snapshots` were rejected, and everything else
+   went straight into `(io/file cache branch)` — while the open-time reconcile
+   is a DELETE LOOP over that path. An empty name made the branch view the cache
+   ROOT, so the reconcile deleted from there; `..` and `../escape` opened outside
+   the cache entirely; and `a/b` registered a branch whose view `gc-cache!` could
+   never match by name, so it reclaimed a LIVE branch's view."
+  (testing "names that would escape or collide with the cache layout are refused"
     (let [s (store)]
-      (doseq [n sk/reserved-branch-names]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved"
+      (doseq [n ["" ".." "." "a/b" "../escape" "/abs" ".hidden" "a b" "x\u0000y"
+                 "pool" "snapshots"]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not a usable branch name"
                               (sk/konserve-directory s (cache) n))
-            (str n " must be refused at open")))
+            (str (pr-str n) " must be refused at open")))
+      (is (thrown? clojure.lang.ExceptionInfo (sk/konserve-directory s (cache) nil))
+          "and a non-string too")))
+  (testing "ordinary names still work, including the ones people actually use"
+    (let [s (store)]
+      (doseq [n ["main" "feature-1" "release_2.0" "v1.2.3" "a"]]
+        (with-open [d (sk/konserve-directory s (cache) n)]
+          (is (some? d) (str (pr-str n) " must be allowed"))))))
+  (testing "and the guard covers every entry point that names a branch"
+    (let [s (store)]
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (add-doc! d "x"))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved"
-                            (sk/fork! s "main" "pool"))
-          "and forking to one must be refused too"))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not a usable branch name"
+                            (sk/fork! s "main" "../escape")))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not a usable branch name"
+                            (sk/point-branch-at! s "" (sk/branch-snapshot s "main")))))))
 
 (deftest a-failed-fork-does-not-deregister-a-branch-it-found
   (testing "REGRESSION in a fix: the rollback added to stop `fork!` leaving a
@@ -1486,8 +1500,11 @@
                           sys (range 4))
               before (count (p/history sys))
               report (p/gc-sweep! sys #{})]
-          (is (map? report) "a report, not the system")
-          (is (contains? report :reclaimed))
+          (is (satisfies? p/Branchable report)
+              "the system, which is what yggdrasil 0.2.14 asks for — an earlier
+               version returned a report, the contract in yggdrasil's dev tree
+               but not in the release scriptum pins, so chaining threw")
+          (is (= :main (p/current-branch report)) "and it is chainable")
           (is (= before (count (p/history sys)))
               "sweeping with no candidates must not destroy history")
           (is (= 4 (count (sc/search (get (:writers sys) "main") :all)))
@@ -1612,3 +1629,43 @@
                       "and its address is computed over both"))))
             (finally (sc/close! feature))))
         (finally (sc/close! main))))))
+
+(deftest cache-collection-leaves-foreign-directories-alone
+  (testing "REGRESSION: `gc-cache!` deleted EVERY directory under `cache` that
+            was not `pool`, `snapshots` or a registered branch — so an unrelated
+            directory a caller had put there was destroyed. Its docstring says
+            'views of branches that are gone', and a view is named like a branch
+            and holds Lucene files; anything else is somebody's."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "x"))
+      (let [precious (io/file (cache) "my-important-data")]
+        (.mkdirs precious)
+        (spit (io/file precious "notes.txt") "do not delete")
+        ;; and a genuine dead view, to prove collection still works
+        (with-open [d (sk/konserve-directory s (cache) "doomed")]
+          (add-doc! d "y"))
+        (sk/delete-branch! s "doomed")
+        (let [r (sk/gc-cache! s (cache))]
+          (is (pos? (:views r)) "the dead view is still reclaimed")
+          (is (not (.exists (io/file (cache) "doomed"))))
+          (is (.exists (io/file precious "notes.txt"))
+              "but a foreign directory must survive"))))))
+
+(deftest collection-can-be-given-extra-keys-to-keep
+  (testing "`mark` is exported telling embedders to union
+            `scriptum.metadata/mark`, and until `gc!` took a whitelist there was
+            nowhere to put the answer — it swept from scriptum's own keys alone,
+            which on a store carrying a metadata index deleted it outright."
+    (let [s (store)
+          sid (sk/store-id-for s)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "x"))
+      ;; a foreign key on the same store, as an embedder would have
+      (k/assoc s :metadata/roots {:index (random-uuid)} {:sync? true})
+      (let-the-millisecond-turn-over!)
+      (sk/gc! s sid (ku/now) nil #{:metadata/roots})
+      (is (some? (k/get s :metadata/roots nil {:sync? true}))
+          "a key named in extra-keys survives the sweep")
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (is (= #{"x"} (bodies d)) "and the index is untouched")))))

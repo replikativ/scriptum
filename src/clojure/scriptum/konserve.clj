@@ -12,10 +12,13 @@
   branches with `newDirectoryStream`, which makes the filesystem the branch
   registry — the role konserve is supposed to hold. Here a branch is
 
-      [:scriptum :manifest <branch>]  ->  {lucene-filename -> content-address}
+      [:scriptum :manifest <branch>]  ->  <commit address>
 
-  and each referenced blob is
+  which is the ONE mutable cell. Everything it reaches is immutable and
+  content-addressed:
 
+      [:scriptum :snapshot <address>] ->  {:files {lucene-filename -> address}
+                                           :parents [<address> ...]}
       [:scriptum :blob <address>]     ->  the bytes
 
   Three consequences, each verified by the tests in this namespace:
@@ -591,19 +594,36 @@
   A branch's view is `cache/<branch>`, and `pool` and `snapshots` are siblings
   of it, so a branch with either name SHARES a directory with them. The damage
   is not symmetric and `pool` is the bad one: opening that branch runs the
-  open-time reconcile, which deletes every file the branch's manifest does not
-  name — i.e. the entire content-addressed pool, for every branch. `snapshots`
-  costs a reader its view and leaks the branch's own.
-
-  Rejected at open rather than escaped, because a name is a user-facing
-  identifier and silently rewriting it is worse than refusing two words."
+  open-time reconcile, which deletes everything its manifest does not name —
+  the entire content-addressed pool, for every branch."
   #{"pool" "snapshots"})
 
+(def ^:private branch-name-pattern
+  "What a branch may be called: an alphanumeric, then any of `A-Za-z0-9._-`.
+
+  A WHITELIST, because the name is interpolated into a filesystem path and the
+  open-time reconcile is a DELETE LOOP over that path. Rejecting two reserved
+  words was half a guard. Measured against the previous check: an empty name
+  made the branch view the cache ROOT, so the reconcile deleted from there;
+  `..` and `../escape` opened outside the cache entirely; and `a/b` registered
+  a branch whose view `gc-cache!` could never match by name, so it reclaimed a
+  LIVE branch's view on the next pass.
+
+  A leading `.` is excluded too — that is how the store's own sidecars are
+  named, and a branch called `.store-id` has no business existing."
+  #"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 (defn- check-branch-name [branch]
-  (when (contains? reserved-branch-names branch)
-    (throw (ex-info (str "scriptum: '" branch "' is reserved — it would share a cache "
-                         "directory with the content pool or the snapshot views")
-                    {:branch branch :reserved reserved-branch-names}))))
+  (when-not (and (string? branch)
+                 (re-matches branch-name-pattern branch)
+                 (not (contains? reserved-branch-names branch)))
+    (throw (ex-info (str "scriptum: " (pr-str branch) " is not a usable branch name — "
+                         "it must match " branch-name-pattern " and not be one of "
+                         reserved-branch-names ". The name becomes a directory under "
+                         "the cache, and the open-time reconcile deletes from it.")
+                    {:branch branch
+                     :pattern (str branch-name-pattern)
+                     :reserved reserved-branch-names}))))
 
 (defn konserve-directory
   "A Lucene `Directory` for `branch`, durable in `store`, read through an
@@ -1451,11 +1471,24 @@
                                              (rm-dir! d)))
                                       (.listFiles snap-dir)))
                       0)
+         ;; ONLY THINGS THAT LOOK LIKE VIEWS. This deleted every directory under
+         ;; `cache` that was not `pool`, `snapshots` or a registered branch — so
+         ;; an unrelated directory a caller had placed there was destroyed, which
+         ;; is not what "views of branches that are gone" says. A view is named
+         ;; like a branch and holds Lucene files; anything else is somebody's.
+         view-like? (fn [^java.io.File d]
+                      (and (re-matches branch-name-pattern (.getName d))
+                           (let [fs (or (.list d) (make-array String 0))]
+                             (or (zero? (alength fs))
+                                 (some #(or (= IndexWriter/WRITE_LOCK_NAME %)
+                                            (re-find #"^(_|segments|pending_segments)" %))
+                                       fs)))))
          views (count (filterv (fn [^java.io.File d]
                                  (and (.isDirectory d)
                                       (not= "pool" (.getName d))
                                       (not= snapshot-view-dir (.getName d))
                                       (not (contains? known (.getName d)))
+                                      (view-like? d)
                                       (rm-dir! d)))
                                (or (.listFiles (io/file cache)) [])))]
      {:blobs blobs :views views :snapshot-views snap-views})))
@@ -1494,9 +1527,10 @@
   NOTE for shared stores: this collects blobs no reachable snapshot names. A
   reader on another machine pinned to an older snapshot can still be holding
   one — and now has an address it can pass as `extra-snapshots` to say so."
-  ([store store-id] (gc! store store-id (ku/now) nil))
-  ([store store-id ts] (gc! store store-id ts nil))
-  ([store store-id ts extra-snapshots]
+  ([store store-id] (gc! store store-id (ku/now) nil nil))
+  ([store store-id ts] (gc! store store-id ts nil nil))
+  ([store store-id ts extra-snapshots] (gc! store store-id ts extra-snapshots nil))
+  ([store store-id ts extra-snapshots extra-keys]
    ;; REFUSE A LAYOUT WE CANNOT READ BEFORE DELETING ANYTHING. `gc!` is reachable
    ;; without ever opening a Directory, so it cannot rely on the check there, and
    ;; it is the one operation where misreading a manifest destroys data rather
@@ -1536,4 +1570,10 @@
      ;; ONE root set, shared with any embedding collector — see `mark`. Inlining
      ;; it here is what let the registry and the format stamp each be forgotten
      ;; once; `sweep!` is allow-list, so a root omitted is a key deleted.
-     (kgc/sweep! store (mark store extra-snapshots) cutoff 1000 {:sync? true}))))
+     ;; `extra-keys` is what makes the exported `mark` usable. It says a shared
+     ;; store must union `scriptum.metadata/mark`, and until this arity existed
+     ;; there was nowhere to put the answer — `gc!` swept from scriptum's own
+     ;; whitelist alone, which on a store carrying a metadata index deleted it
+     ;; outright: roots, freed map and every PSS node.
+     (kgc/sweep! store (into (mark store extra-snapshots) extra-keys)
+                 cutoff 1000 {:sync? true}))))
