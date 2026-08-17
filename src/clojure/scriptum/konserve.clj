@@ -103,8 +103,44 @@
 (defn- ->path ^java.nio.file.Path [^String s]
   (Paths/get s (make-array String 0)))
 
-(defn manifest-key [branch] [:scriptum :manifest branch])
+(defn manifest-key
+  "The branch pointer. Holds a SNAPSHOT ADDRESS, not the file map — see
+  `snapshot-key`. Kept under this name because it is what a branch resolves
+  through, and renaming it would be a third layout."
+  [branch]
+  [:scriptum :manifest branch])
+
 (defn blob-key [address] [:scriptum :blob address])
+
+(defn snapshot-key
+  "An immutable `{lucene-filename -> blob-address}` map, addressed by content."
+  [address]
+  [:scriptum :snapshot address])
+
+(defn snapshot-address
+  "The content address of a file map: a merkle root over the blobs it names.
+
+  `ContentHash/hashMap` sorts keys before serializing, so this is deterministic
+  and — being the same hash family the leaf addresses use — makes the snapshot a
+  genuine interior node rather than a checksum that happens to sit above one."
+  [files]
+  (ContentHash/hashMap files))
+
+(defn read-snapshot
+  "The file map at `address`, or `{}` when there is none."
+  [store address]
+  (or (k/get store (snapshot-key address) nil {:sync? true}) {}))
+
+(defn branch-snapshot
+  "The snapshot address `branch` points at, or nil for a branch with no commit.
+
+  THE ONE MUTABLE CELL. Every other key in the store is immutable and content-
+  addressed, which is what makes a snapshot address something a caller can hold:
+  it names an index state that cannot change under them, where a branch name
+  cannot. datahike's secondary-index key-map wants this rather than the branch,
+  for the same reason proximum's carries a `:commit-id`."
+  [store branch]
+  (k/get store (manifest-key branch) nil {:sync? true}))
 
 (def format-key
   "Where the store records which manifest layout it is in."
@@ -113,12 +149,39 @@
 (def format-version
   "The manifest layout this code writes and understands.
 
-  1 — `[:scriptum :manifest <branch>]` is `{lucene-filename -> content-address}`,
-      every address naming a whole blob, addressed by `ContentHash`."
-  1)
+  1 — `[:scriptum :manifest <branch>]` held the file map itself: a mutable cell
+      containing the whole tree.
+  2 — that cell holds a SNAPSHOT ADDRESS, and the tree lives at
+      `[:scriptum :snapshot <address>]` as an immutable, content-addressed
+      value. One mutable pointer per branch, everything below it a value."
+  2)
+
+(declare branches)
+
+(defn migrate-v1->v2!
+  "Move each branch's file map out of its pointer and into a snapshot.
+
+  NO BYTES MOVE — every blob keeps its address, and the map that named them
+  becomes a value under its own. Per branch: write the snapshot, then repoint.
+  Values before pointer, so an interrupted migration leaves an unreferenced
+  snapshot (garbage, collectable) and never a pointer into nothing.
+
+  IDEMPOTENT, by shape: a pointer already holding an address is not a map and
+  is skipped, so a half-finished run resumes correctly. Returns the branches it
+  converted."
+  [store]
+  (into #{}
+        (keep (fn [branch]
+                (let [v (k/get store (manifest-key branch) nil {:sync? true})]
+                  (when (map? v)
+                    (let [address (snapshot-address v)]
+                      (k/assoc store (snapshot-key address) v {:sync? true})
+                      (k/assoc store (manifest-key branch) address {:sync? true})
+                      branch)))))
+        (branches store)))
 
 (defn ensure-format!
-  "Stamp `store` with this layout version, or refuse a store we cannot read.
+  "Bring `store` up to this layout, or refuse one we cannot read.
 
   THE REFUSAL IS THE POINT. Without it, a store written by a later scriptum is
   read as though it were this one, and fails as corruption somewhere far from
@@ -128,32 +191,40 @@
   both produce valid-looking UUIDs for the same bytes, so the only symptom was
   a manifest naming blobs that were not there.
 
-  A store with no version IS version 1, because no other has ever existed —
-  this namespace is unreleased. Stamping on first open is therefore the entire
-  migration, and it only works while that stays true, which is the reason to do
-  it now rather than when it is needed.
+  An unstamped store is either empty or version 1 — no other has existed, since
+  this namespace is unreleased — and `migrate-v1->v2!` handles both, converting
+  nothing in the empty case. Upgrading on open is cheap enough to be automatic
+  because it moves no bytes.
 
   Costs one key read per Directory open, next to the one `register-branch!`
-  already does — nothing on the `listAll` path, which reads a manifest on every
-  call. Returns the store's version."
+  already does — nothing on the `listAll` path. Returns the store's version."
   [store]
   (let [v (:version (k/get store format-key nil {:sync? true}))]
     (cond
-      (nil? v)
-      (do (k/assoc store format-key {:version format-version} {:sync? true})
-          format-version)
-
-      (> v format-version)
+      (> (long (or v 0)) format-version)
       (throw (ex-info (str "scriptum: store was written by a newer scriptum "
                            "(manifest layout " v ", this understands " format-version ")")
                       {:store-version v :supported format-version}))
 
-      :else v)))
+      (= v format-version) v
+
+      ;; nil (empty or pre-stamp v1) or an older stamped version
+      :else
+      (do (migrate-v1->v2! store)
+          (k/assoc store format-key {:version format-version} {:sync? true})
+          format-version))))
 
 (defn read-manifest
-  "The branch's `{lucene-filename -> address}` map, or `{}` when it has none."
+  "The branch's `{lucene-filename -> address}` map, or `{}` when it has none.
+
+  Two reads, not one: the pointer, then the snapshot it names. Against a remote
+  store that is the cheaper shape rather than the more expensive one — the
+  pointer is a few bytes and the snapshot is immutable, so a poller re-reads
+  only the pointer and a cache keyed by address never needs invalidating."
   [store branch]
-  (or (k/get store (manifest-key branch) nil {:sync? true}) {}))
+  (if-let [address (branch-snapshot store branch)]
+    (read-snapshot store address)
+    {}))
 
 (def branches-key
   "Where the branch registry lives: a set of branch names."
@@ -404,7 +475,34 @@
    (ensure-format! store)
    (register-branch! store branch)
    (let [live (MMapDirectory/open (->path (str cache "/" branch)))
-         manifest (atom (read-manifest store branch))
+         pointer (atom (branch-snapshot store branch))
+         manifest (atom (if-let [a @pointer] (read-snapshot store a) {}))
+         ;; Has the in-memory map moved off `pointer`? Set by every edit,
+         ;; cleared by the flip in `syncMetaData`. A flag rather than comparing
+         ;; `snapshot-address` against `pointer`, because `listAll` asks on every
+         ;; call and that comparison is a SHA-512 over the serialized map.
+         dirty (atom false)
+         ;; Has a `sync` landed blobs since the last flip? Distinct from `dirty`,
+         ;; and the distinction is worth two store writes per commit.
+         ;;
+         ;; Lucene deletes a superseded `segments_N` AFTER the commit that
+         ;; supersedes it, so every commit ends with an edit that arrives too
+         ;; late for its own flip. Flipping on `dirty` alone therefore fires
+         ;; twice per commit: once at the NEXT commit's `prepareCommit` to
+         ;; publish that trailing delete, and again at its `finishCommit`.
+         ;; Measured at 8 store writes per commit against 6.
+         ;;
+         ;; Gating on content instead lets the trailing delete ride the next
+         ;; commit's flip, which publishes the whole map anyway. `dirty` still
+         ;; guards `listAll` in the meantime, so the delete is never undone —
+         ;; only deferred.
+         synced-since-flip (atom false)
+         ;; The open unreferenced-write sequence, if any. Blobs land in `sync`
+         ;; and the pointer flips in `syncMetaData`, so the window the guard has
+         ;; to cover spans two Directory calls and cannot be a scoped macro —
+         ;; hence `writing!`/`done!` directly. A process that dies mid-sequence
+         ;; drops its entry, which is correct: what it wrote is unreachable.
+         guard-token (atom nil)
          ;; Files created through this Directory but not yet synced. Tracked
          ;; explicitly because the local cache is NOT authoritative — it can
          ;; hold debris from an interrupted earlier session, and Lucene must
@@ -433,7 +531,39 @@
          ensure-open! (fn []
                         (when @closed?
                           (throw (AlreadyClosedException.
-                                  (str "scriptum: directory for branch " branch " is closed")))))]
+                                  (str "scriptum: directory for branch " branch " is closed")))))
+         open-guard! (fn []
+                       (when (and store-id (nil? @guard-token))
+                         (reset! guard-token (guard/writing! store-id))))
+         close-guard! (fn []
+                        (when-let [t @guard-token]
+                          (guard/done! store-id t)
+                          (reset! guard-token nil)))
+         ;; THE COMMIT POINT. Everything else edits memory; this is the only
+         ;; thing that moves the branch, and Lucene calls it exactly where a
+         ;; commit becomes durable — `SegmentInfos.finishCommit` renames
+         ;; `pending_segments_N` and then calls this, deleting the renamed file
+         ;; if it throws. So a failure here un-commits, which is precisely the
+         ;; behaviour a pointer flip wants, CAS conflicts included.
+         ;;
+         ;; `prepareCommit` also calls it, before anything has been synced —
+         ;; nothing is dirty then, so that call costs nothing.
+         flip! (fn []
+                 (locking lock
+                   (when @synced-since-flip
+                     (let [m @manifest
+                           address (snapshot-address m)]
+                       ;; Values then pointer: the snapshot must exist before
+                       ;; anything names it. Being content-addressed, rewriting
+                       ;; an identical snapshot is harmless.
+                       (k/assoc store (snapshot-key address) m {:sync? true})
+                       (k/assoc store (manifest-key branch) address {:sync? true})
+                       (reset! pointer address)
+                       (reset! dirty false)
+                       (reset! synced-since-flip false))))
+                 ;; After the pointer lands, everything this sequence wrote is
+                 ;; reachable — or garbage, if a later pointer superseded it.
+                 (close-guard!))]
      ;; NOT materialized eagerly. `openInput` and `fileLength` link a file into
      ;; the view on first touch, so fetching the whole manifest here only moved
      ;; that cost to open time and paid it for files no query ever reads. On a
@@ -467,18 +597,32 @@
          ;; for remote stores too — the manifest is a small mutable pointer, so
          ;; a reader polls the pointer and never re-reads immutable segment data.
          ;;
+         ;; SKIPPED WHILE DIRTY. This Directory holds edits the store has not
+         ;; seen — an unflushed rename or delete — and adopting the store's
+         ;; snapshot would silently undo them, resurrecting a deleted name or
+         ;; un-renaming `segments_N`. A reader is never dirty, so it still sees
+         ;; every commit; a writer mid-commit is the only thing this skips, and
+         ;; its own memory is the newest state there is.
+         ;;
+         ;; The POINTER is what gets polled, not the map: it is a few bytes, and
+         ;; when it has not moved there is nothing to re-read at all. The
+         ;; snapshot behind it is immutable, so this is also the only read that
+         ;; can ever return something new.
+         ;;
          ;; `compare-and-set!`, never `reset!`: this runs on READER threads,
          ;; which are unconstrained, and a blind overwrite can install a
-         ;; manifest OLDER than one `sync` just committed. `rename` then fails
-         ;; to find `pending_segments_N`, never writes `segments_N`, and the
-         ;; store is left naming a file no commit points at — reopening the
-         ;; index throws IndexNotFoundException. If anything advanced the
-         ;; manifest while we were reading the store, that value is the newer
-         ;; one and has to win.
-         (let [before @manifest
-               m (read-manifest store branch)]
-           (compare-and-set! manifest before m)
-           (into-array String (sort (into (set (keys @manifest)) @session)))))
+         ;; manifest OLDER than one a commit just installed. Claiming the
+         ;; pointer first means a racing poll loses the CAS and installs
+         ;; nothing, rather than winning with a stale map.
+         (when-not @dirty
+           (let [p @pointer
+                 a (branch-snapshot store branch)]
+             (when (not= a p)
+               (let [before @manifest
+                     m (if a (read-snapshot store a) {})]
+                 (when (compare-and-set! pointer p a)
+                   (compare-and-set! manifest before m))))))
+         (into-array String (sort (into (set (keys @manifest)) @session))))
 
        (fileLength [name]
          (ensure-open!)
@@ -511,13 +655,16 @@
            out))
 
        (sync [names]
-         ;; The durability hook: Lucene syncs before it commits, so this is where
-         ;; write-once files become durable and shareable.
+         ;; Where write-once files become durable and shareable — but NOT where
+         ;; they become reachable. This writes blobs and edits the in-memory map;
+         ;; the pointer moves in `syncMetaData`, which is where Lucene's commit
+         ;; actually lands. Measured against the previous shape, where `sync`,
+         ;; `rename` and `deleteFile` each wrote the manifest, a commit costs
+         ;; 6 store writes rather than 8.
          ;;
-         ;; Guarded, because it is precisely a values-then-pointer sequence — the
-         ;; blobs go in first and only the manifest write makes them reachable.
-         ;; A collection landing in between would sweep blobs the manifest is
-         ;; about to reference. See konserve.gc-guard.
+         ;; The guard opens here and closes at the flip, because that whole span
+         ;; is one values-then-pointer sequence: a collection landing inside it
+         ;; would sweep blobs the snapshot is about to name. See konserve.gc-guard.
          ;; MATERIALIZE BEFORE FSYNC. `.sync` opens each name for WRITE, so a
          ;; name the manifest holds but this view has not touched is absent and
          ;; throws NoSuchFileException. IndexWriter.startCommit syncs every file
@@ -528,6 +675,7 @@
            (when-let [a (get @manifest n)]
              (link-into-view! store cache branch n a)))
          (.sync live names)
+         (open-guard!)
          (let [write! (fn []
                         (locking lock
                           (let [m (reduce (fn [m ^String n]
@@ -546,17 +694,20 @@
                                                 (pool! cache branch n address)
                                                 (assoc m n address))))
                                           @manifest names)]
-                            (k/assoc store (manifest-key branch) m {:sync? true})
-                            (reset! manifest m)
+                            (when (not= m @manifest)
+                              (reset! manifest m)
+                              (reset! dirty true)
+                              (reset! synced-since-flip true))
                           ;; Synced names are the manifest's now. Handing them
                           ;; over keeps a name from living in both sets, so
                           ;; `rename` and `deleteFile` have one place to edit.
                             (swap! session #(reduce disj % names)))))]
-           (if store-id
-             (guard/with-unreferenced-writes store-id (write!))
-             (write!))))
+           (write!)))
 
-       (syncMetaData [] (ensure-open!) nil)
+       (syncMetaData []
+         (ensure-open!)
+         (flip!)
+         nil)
 
        (rename [source dest]
          ;; Materialize first: nothing else guarantees `source` is local now
@@ -578,10 +729,14 @@
            ;; invisible: the suite and Lucene's own testRename never assert
            ;; `listAll` after a rename.
            (swap! session #(if (contains? % source) (-> % (disj source) (conj dest)) %))
-           (when-let [a (get @manifest source)]
-             (let [m (-> @manifest (dissoc source) (assoc dest a))]
-               (k/assoc store (manifest-key branch) m {:sync? true})
-               (reset! manifest m)))))
+           (when (contains? @manifest source)
+             ;; Memory only. The rename Lucene cares about — pending_segments_N
+             ;; to segments_N — is immediately followed by `syncMetaData`, which
+             ;; publishes it; and a rename that never reaches a flip belongs to a
+             ;; commit that never happened.
+             (swap! manifest #(let [a (get % source)]
+                                (-> % (dissoc source) (assoc dest a))))
+             (reset! dirty true))))
 
        (deleteFile [name]
          (ensure-open!)
@@ -592,13 +747,17 @@
          (when (.exists (view-file cache branch name)) (.deleteFile live name))
          (swap! session disj name)
          ;; Drop the reference only. The blob stays until a GC finds it
-         ;; unreachable from EVERY manifest, so a branch or a reader still
-         ;; holding an older manifest keeps working.
+         ;; unreachable from EVERY snapshot, so a branch or a reader still
+         ;; holding an older one keeps working.
+         ;;
+         ;; Memory only, published by the next flip. Lucene deletes a superseded
+         ;; `segments_N` AFTER the commit that supersedes it, so the drop rides
+         ;; along with the following commit — one flip later than before. That
+         ;; lag only ever keeps a blob alive longer, which is the safe direction.
          (locking lock
            (when (contains? @manifest name)
-             (let [m (dissoc @manifest name)]
-               (k/assoc store (manifest-key branch) m {:sync? true})
-               (reset! manifest m)))))
+             (swap! manifest dissoc name)
+             (reset! dirty true))))
 
        (openInput [name context]
          (when-let [a (get @manifest name)] (link-into-view! store cache branch name a))
@@ -610,12 +769,65 @@
        (obtainLock [name] (.obtainLock live name))
        (close []
          (reset! closed? true)
+         ;; Release the guard WITHOUT flipping. Unflushed edits belong to a
+         ;; commit that never completed, so the blobs behind them are garbage —
+         ;; and holding the sequence open past close would stall every
+         ;; collection on this store id for the life of the process.
+         (close-guard!)
          (.close live))
        (getPendingDeletions [] (.getPendingDeletions live))))))
 
 ;; =============================================================================
 ;; Branch operations
 ;; =============================================================================
+
+(def snapshot-view-dir
+  "Where read-only snapshot views live under the cache.
+
+  A sibling of `pool` rather than of the branch views, so `gc-cache!` can tell
+  them apart: it deletes a directory whose name is not a live branch, and a
+  snapshot view is by definition not one."
+  "snapshots")
+
+(defn snapshot-directory
+  "A READ-ONLY Directory over the index state at `address`.
+
+  This is what makes a snapshot address worth handing out. A caller who stored
+  one — datahike's key-map, a reader pinned to a point in history — can open
+  exactly the state it named, on any machine with the store, whatever the branch
+  has done since.
+
+  Writes throw. The state is immutable by construction, and a Directory that
+  accepted writes would have nowhere to put the result: there is no pointer to
+  advance, only an address that already describes its own contents.
+
+  Materialization is lazy and shares the pool with every branch view, so opening
+  a snapshot fetches only the files actually read and shares inodes with any
+  branch holding the same blobs."
+  ^Directory [store ^String cache address]
+  (let [files (read-snapshot store address)
+        view (str cache "/" snapshot-view-dir "/" address)
+        _ (.mkdirs (io/file view))
+        live (MMapDirectory/open (->path view))
+        materialize! (fn [^String name]
+                       (when-let [a (get files name)]
+                         (link-into-view! store cache
+                                          (str snapshot-view-dir "/" address) name a)))
+        read-only (fn [& _]
+                    (throw (UnsupportedOperationException.
+                            (str "scriptum: snapshot " address " is immutable"))))]
+    (proxy [FilterDirectory] [live]
+      (listAll [] (into-array String (sort (keys files))))
+      (fileLength [name] (materialize! name) (.fileLength live name))
+      (openInput [name context] (materialize! name) (.openInput live name context))
+      (createOutput [name context] (read-only))
+      (createTempOutput [prefix suffix context] (read-only))
+      (deleteFile [name] (read-only))
+      (rename [source dest] (read-only))
+      (obtainLock [name] (read-only))
+      (sync [names] nil)
+      (syncMetaData [] nil)
+      (close [] (.close live)))))
 
 (defn fork!
   "Branch `from` as `to`: copy the manifest. O(1) — no segment bytes move, and
@@ -625,10 +837,15 @@
   ;; of its manifest, so this needs a lookup rather than an enumeration.
   (when (k/exists? store (manifest-key to) {:sync? true})
     (throw (ex-info "scriptum: branch already exists" {:branch to})))
-  (let [m (read-manifest store from)]
+  ;; Copy the POINTER, not the map: both branches now name the same immutable
+  ;; snapshot, so a fork writes one small value and the two histories share a
+  ;; tree until either commits. Under the previous layout this rewrote the whole
+  ;; file map into a second key.
+  (let [address (branch-snapshot store from)]
     (register-branch! store to)          ; registry first — see register-branch!
-    (k/assoc store (manifest-key to) m {:sync? true})
-    m))
+    (when address
+      (k/assoc store (manifest-key to) address {:sync? true}))
+    (if address (read-snapshot store address) {})))
 
 (defn delete-branch!
   "Forget `branch`. Blobs it referenced survive until `gc!` finds them
@@ -641,10 +858,26 @@
   (k/update store branches-key #(disj (or % #{}) branch) {:sync? true})
   nil)
 
+(defn reachable-snapshots
+  "Snapshot addresses reachable from the branch pointers, plus `extra`.
+
+  `extra` is how an EXTERNAL HOLDER keeps an index state alive. A snapshot
+  address is immutable and safe to hand out, so a caller can store one and give
+  it back at collection time — which is exactly datahike's `mark-from-key-map`
+  contract. Without it, an index embedded in someone else's store is reachable
+  only from branch pointers, and a state they still reference but no branch
+  names is collected out from under them."
+  ([store] (reachable-snapshots store nil))
+  ([store extra]
+   (into (set extra) (keep #(branch-snapshot store %)) (branches store))))
+
 (defn reachable-addresses
-  "Every blob address referenced by any branch — the GC root set."
-  [store]
-  (into #{} (mapcat #(vals (read-manifest store %))) (branches store)))
+  "Every blob address named by a reachable snapshot — the GC root set."
+  ([store] (reachable-addresses store nil))
+  ([store extra-snapshots]
+   (into #{}
+         (mapcat #(vals (read-snapshot store %)))
+         (reachable-snapshots store extra-snapshots))))
 
 (defn gc-cache!
   "Delete pooled blobs no branch's manifest names, and views of branches that
@@ -682,6 +915,11 @@
         views (count (filterv (fn [^java.io.File d]
                                 (and (.isDirectory d)
                                      (not= "pool" (.getName d))
+                                     ;; Snapshot views are not branches and must
+                                     ;; not be mistaken for dead ones — a reader
+                                     ;; pinned to a snapshot is exactly the case
+                                     ;; where no branch names its state.
+                                     (not= snapshot-view-dir (.getName d))
                                      (not (contains? known (.getName d)))
                                      (do (run! #(.delete ^java.io.File %) (.listFiles d))
                                          (.delete d))))
@@ -715,12 +953,16 @@
   call stack sync all the way up through `scriptum.core/gc!` to datahike's
   secondary-index adapter, which has no async seam to thread this through.
 
-  NOTE for shared stores: this collects blobs that no CURRENT manifest names.
-  A reader on another machine pinned to an older manifest can still be holding
-  one. Readers on a shared store therefore need a root of their own before this
-  is safe to run there."
-  ([store store-id] (gc! store store-id (ku/now)))
-  ([store store-id ts]
+  `extra-snapshots` protects index states an EXTERNAL holder still references —
+  see `reachable-snapshots`. Anything embedding scriptum in a store it does not
+  own must pass them, or a state no branch names is collected out from under it.
+
+  NOTE for shared stores: this collects blobs no reachable snapshot names. A
+  reader on another machine pinned to an older snapshot can still be holding
+  one — and now has an address it can pass as `extra-snapshots` to say so."
+  ([store store-id] (gc! store store-id (ku/now) nil))
+  ([store store-id ts] (gc! store store-id ts nil))
+  ([store store-id ts extra-snapshots]
    ;; REFUSE A LAYOUT WE CANNOT READ BEFORE DELETING ANYTHING. `gc!` is reachable
    ;; without ever opening a Directory, so it cannot rely on the check there, and
    ;; it is the one operation where misreading a manifest destroys data rather
@@ -744,15 +986,23 @@
    ;; whatever a concurrent sync writes is younger than the cutoff and survives
    ;; however the walk turned out.
    (let [cutoff (if store-id (guard/cutoff store-id ts) ts)
-         keep (into #{} (map blob-key) (reachable-addresses store))
-         ;; The registry and the format stamp are themselves roots. `sweep!` is
-         ;; allow-list — it deletes every key not named — so leaving the registry
-         ;; out swept the very thing the mark walks from, and the next collection
-         ;; saw no branches at all and would have taken everything with it. The
-         ;; stamp fails more quietly and much later: sweeping it makes the store
-         ;; look unversioned, `ensure-format!` re-stamps it with whatever version
-         ;; is current, and a store that was actually written by a later scriptum
-         ;; is then read as this one — exactly the misreading the stamp exists to
-         ;; prevent, reintroduced by the collector.
-         manifests (into #{branches-key format-key} (map manifest-key) (branches store))]
-     (kgc/sweep! store (into keep manifests) cutoff 1000 {:sync? true}))))
+         snapshots (reachable-snapshots store extra-snapshots)
+         keep (into #{} (map blob-key) (reachable-addresses store extra-snapshots))
+         ;; The registry, the format stamp and every reachable SNAPSHOT are
+         ;; themselves roots. `sweep!` is allow-list — it deletes every key not
+         ;; named — so leaving the registry out swept the very thing the mark
+         ;; walks from, and the next collection saw no branches at all and would
+         ;; have taken everything with it. The stamp fails more quietly and much
+         ;; later: sweeping it makes the store look unversioned, `ensure-format!`
+         ;; re-stamps it, and a store written by a later scriptum is then read as
+         ;; this one — the misreading the stamp exists to prevent, reintroduced
+         ;; by the collector. A swept snapshot is the loudest of the three: the
+         ;; branch pointer survives, naming a tree that is gone.
+         ;;
+         ;; Snapshots NOT named here are the superseded ones, and collecting them
+         ;; is the point — they are what a branch moved off. The blobs they named
+         ;; survive as long as any live snapshot still names them.
+         roots (-> #{branches-key format-key}
+                   (into (map manifest-key) (branches store))
+                   (into (map snapshot-key) snapshots))]
+     (kgc/sweep! store (into keep roots) cutoff 1000 {:sync? true}))))

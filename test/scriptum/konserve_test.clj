@@ -57,6 +57,31 @@
     (let [sf (.storedFields (IndexSearcher. r))]
       (into #{} (map #(.get (.document sf %) "body")) (range (.numDocs r))))))
 
+(defn- bodies-at
+  "Every stored :body in the index state at `address`, as a set."
+  [s cache address]
+  (with-open [d (sk/snapshot-directory s cache address)
+              r (DirectoryReader/open d)]
+    (let [sf (.storedFields (IndexSearcher. r))]
+      (into #{} (map #(.get (.document sf %) "body")) (range (.numDocs r))))))
+
+(defn- latest-segments
+  "The newest `segments_N` a manifest names.
+
+  A manifest can name SEVERAL. Lucene deletes a superseded commit point after
+  the commit that supersedes it, and that delete rides along with the next flip
+  rather than the current one — so the durable snapshot legitimately carries the
+  previous generation for a while. Picking `first` off an unordered map made
+  this a coin toss.
+
+  Generations are base-36 and unpadded, so longer wins and equal lengths compare
+  lexicographically."
+  [m]
+  (->> (keys m)
+       (filter #(clojure.string/starts-with? % "segments_"))
+       (sort-by (juxt count identity))
+       last))
+
 (defn- let-the-millisecond-turn-over!
   "Let real time pass the stamps of the writes just made.
 
@@ -445,8 +470,7 @@
     (let [s (store)]
       (with-open [d (sk/konserve-directory s (cache) "main")]
         (add-doc! d "first"))
-      (let [seg1 (first (filter #(clojure.string/starts-with? % "segments_")
-                                (keys (sk/read-manifest s "main"))))
+      (let [seg1 (latest-segments (sk/read-manifest s "main"))
             ;; keep the OLD blob reachable by a hard link, so copying it later
             ;; cannot write through to the pool
             stash (io/file *root* "stash")]
@@ -455,7 +479,7 @@
         (with-open [d (sk/konserve-directory s (cache) "main")]
           (add-doc! d "second"))
         (let [m (sk/read-manifest s "main")
-              seg2 (first (filter #(clojure.string/starts-with? % "segments_") (keys m)))
+              seg2 (latest-segments m)
               pooled (str (cache) "/pool/" (get m seg2))]
           ;; the view names the current file but links to the previous blob
           (.delete (io/file (cache) "main" seg2))
@@ -590,6 +614,142 @@
         (let-the-millisecond-turn-over!)
         (is (thrown? clojure.lang.ExceptionInfo (sk/gc! s sid)))
         (is (= before (blobs)) "and refusing must delete nothing")))))
+
+;; =============================================================================
+;; The manifest as a value
+;; =============================================================================
+
+(deftest a-branch-points-at-an-immutable-snapshot
+  (testing "the branch key holds an ADDRESS, not the tree. That is what makes an
+            index state something a caller can hold: a snapshot address cannot
+            change under them, where a branch name can. It is also why the
+            address is `ContentHash/hashMap` — the same hash family as the blob
+            addresses it names, so it is a merkle root and not a checksum."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "first"))
+      (let [a1 (sk/branch-snapshot s "main")]
+        (is (uuid? a1) "the branch cell holds an address")
+        (is (= (sk/read-snapshot s a1) (sk/read-manifest s "main")))
+        (is (= a1 (sk/snapshot-address (sk/read-snapshot s a1)))
+            "and the address is the content of what it names")
+        (with-open [d (sk/konserve-directory s (cache) "main")]
+          (add-doc! d "second"))
+        (let [a2 (sk/branch-snapshot s "main")]
+          (is (not= a1 a2) "committing moves the pointer")
+          (is (= #{"first"} (bodies-at s (cache) a1))
+              "and the OLD snapshot still resolves to the old index state"))))))
+
+(deftest a-commit-that-never-finished-does-not-move-the-branch
+  (testing "THE LOAD-BEARING ASSUMPTION of putting the flip in `syncMetaData`.
+
+            Lucene calls it as the commit's durability barrier —
+            `SegmentInfos.finishCommit` renames `pending_segments_N`, calls it,
+            and deletes the renamed file if it throws. So blobs written by
+            `sync` must NOT be reachable until it runs, or a half-finished
+            commit becomes visible.
+
+            Dropping the Directory without a clean close is the only way to
+            check that; a normal close would be indistinguishable."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "committed"))
+      (let [before (sk/branch-snapshot s "main")
+            d (sk/konserve-directory s (cache) "main")
+            iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
+        (let [doc (Document.)]
+          (.add doc (TextField. "body" "never committed" Field$Store/YES))
+          (.addDocument iw doc))
+        ;; Force the segment out: blobs land in the store, but no commit follows.
+        (.flush iw)
+        (is (= before (sk/branch-snapshot s "main"))
+            "flushing writes blobs; it must not move the branch")
+        ;; Abandon both without committing or closing cleanly.
+        (.rollback iw)
+        (.close d)
+        (is (= before (sk/branch-snapshot s "main"))
+            "and abandoning the writer must leave the branch where it was")
+        (with-open [d2 (sk/konserve-directory s (cache) "main")]
+          (is (= #{"committed"} (bodies d2))
+              "reopening from the store alone sees only the commit that finished"))))))
+
+(deftest a-fork-copies-a-pointer-not-a-tree
+  (testing "both branches name the SAME snapshot until either commits, so a fork
+            writes one small value rather than duplicating the file map. The
+            shared tree is what makes the two histories structurally shared at
+            the manifest level, not only at the blob level."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "shared"))
+      (sk/fork! s "main" "feature")
+      (is (= (sk/branch-snapshot s "main") (sk/branch-snapshot s "feature"))
+          "a fresh fork shares its parent's snapshot outright")
+      (with-open [d (sk/konserve-directory s (cache) "feature")]
+        (add-doc! d "only-feature"))
+      (is (not= (sk/branch-snapshot s "main") (sk/branch-snapshot s "feature"))
+          "and diverges on the first commit")
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (is (= #{"shared"} (bodies d)) "without disturbing the parent")))))
+
+(deftest an-externally-held-snapshot-survives-collection
+  (testing "a snapshot address is safe to hand out, which is the whole point of
+            making it a value — but a holder is invisible to a mark that walks
+            only branch pointers. `extra-snapshots` is how they say so, and it
+            is what datahike's `mark-from-key-map` needs in order to stop
+            returning `#{}` once scriptum's blobs live in datahike's store."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "held"))
+      (let [held (sk/branch-snapshot s "main")]
+        ;; the branch moves on; nothing points at `held` any more
+        (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+          (add-doc! d "newer"))
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s sid (ku/now) #{held})
+        (is (seq (sk/read-snapshot s held)) "the held snapshot survives")
+        (is (= #{"held"} (bodies-at s (cache) held))
+            "and still resolves to the index state it named")))))
+
+(deftest a-superseded-snapshot-is-collected
+  (testing "the flip side: a snapshot no branch names and no holder claims is
+            garbage, and collecting it is what keeps a long history from
+            accumulating one tree per commit."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "first"))
+      (let [superseded (sk/branch-snapshot s "main")]
+        (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+          (add-doc! d "second"))
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s sid)
+        (is (empty? (sk/read-snapshot s superseded))
+            "the superseded snapshot is gone")
+        (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+          (is (= #{"first" "second"} (bodies d))
+              "and the live branch is untouched"))))))
+
+(deftest a-v1-store-migrates-on-open
+  (testing "v1 held the file map in the branch cell. Migration writes it as a
+            snapshot and repoints — no bytes move, since every blob keeps its
+            address. Values before pointer, so an interrupted run leaves an
+            unreferenced snapshot rather than a pointer into nothing."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "written-as-v2"))
+      (let [files (sk/read-manifest s "main")]
+        ;; rewrite the store into the v1 shape
+        (k/assoc s (sk/manifest-key "main") files {:sync? true})
+        (k/assoc s sk/format-key {:version 1} {:sync? true})
+        (is (map? (k/get s (sk/manifest-key "main") nil {:sync? true}))
+            "precondition: the branch cell holds the tree")
+        (is (= #{"main"} (sk/migrate-v1->v2! s)))
+        (is (uuid? (sk/branch-snapshot s "main")) "the cell now holds an address")
+        (is (= files (sk/read-manifest s "main")) "naming the same tree")
+        (is (empty? (sk/migrate-v1->v2! s)) "and re-running converts nothing")
+        (with-open [d (sk/konserve-directory s (cache) "main")]
+          (is (= #{"written-as-v2"} (bodies d)) "the index still reads"))))))
 
 (deftest concurrent-readers-may-materialize-the-same-file
   (testing "REGRESSION: `link-into-view!` checked `.exists` then linked, so two
