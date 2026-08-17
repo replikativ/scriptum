@@ -22,8 +22,8 @@
             [scriptum.core :as sc])
   (:import [org.replikativ.scriptum ContentHash]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
-           [org.apache.lucene.document Document TextField Field$Store]
-           [org.apache.lucene.index IndexWriter IndexWriterConfig DirectoryReader]
+           [org.apache.lucene.document Document TextField StringField Field$Store]
+           [org.apache.lucene.index IndexWriter IndexWriterConfig DirectoryReader Term]
            [org.apache.lucene.search IndexSearcher]
            [org.apache.lucene.store IOContext LockObtainFailedException]
            [java.nio.file Files LinkOption Paths FileAlreadyExistsException]))
@@ -386,3 +386,41 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scriptum.konserve/gc!"
                               (sc/gc! w (java.time.Instant/now))))
         (finally (sc/close! w))))))
+
+(deftest deletes-do-not-rewrite-the-segment
+  (testing "content addressing rests on Lucene files being WRITE-ONCE, and
+            deletes are the case where that could plausibly fail: a live-docs
+            bitmap changes as documents are removed.
+
+            It holds, because Lucene puts the generation in the NAME —
+            `_0_5.liv`, not `_0.liv` — so a delete publishes a new small file
+            instead of rewriting anything. The large `.cfs` keeps its address
+            however many deletes land on it, which is what keeps a delete-heavy
+            workload from re-uploading segments to a remote store."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (with-open [iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
+          (dotimes [i 200]
+            (let [doc (Document.)]
+              (.add doc (StringField. "id" (str i) Field$Store/YES))
+              (.add doc (TextField. "body" (str "document number " i) Field$Store/YES))
+              (.addDocument iw doc)))
+          (.commit iw))
+        (let [before (sk/read-manifest s "main")
+              cfs (first (filter #(clojure.string/ends-with? % ".cfs") (keys before)))]
+          (is (some? cfs) "the compound file is what we care about not churning")
+          (dotimes [n 5]
+            (with-open [iw (IndexWriter. d (IndexWriterConfig. (StandardAnalyzer.)))]
+              (.deleteDocuments iw (into-array Term [(Term. "id" (str n))]))
+              (.commit iw)))
+          (let [after (sk/read-manifest s "main")
+                changed (set (for [[f a] after :when (not= a (get before f))] f))]
+            (is (= (get before cfs) (get after cfs))
+                "the segment itself must keep its address across deletes")
+            (is (not (contains? changed cfs)))
+            (is (some #(clojure.string/ends-with? % ".liv") (keys after))
+                "deletes publish a live-docs file")
+            (is (every? #(or (clojure.string/ends-with? % ".liv")
+                             (clojure.string/starts-with? % "segments_"))
+                        changed)
+                "and nothing else may change address")))))))
