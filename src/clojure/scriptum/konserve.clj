@@ -404,12 +404,25 @@
   Compared by INODE rather than by re-hashing, because the pool's filename IS
   the content address. Two stats, no read."
   [store cache branch name address]
-  (let [pf (ensure-pooled! store cache address)
-        vf (view-file cache branch name)]
+  (let [vf (view-file cache branch name)]
     (io/make-parents vf)
-    (loop [attempt 0]
+    (loop [attempt 0
+           ;; Re-fetched each round, not hoisted: the repair for a pool entry a
+           ;; concurrent `gc-cache!` removed IS re-materializing it, and a `pf`
+           ;; bound once outside the loop can only keep pointing at the gap.
+           pf (ensure-pooled! store cache address)]
       (cond
-        (and (.exists vf) (same-inode? vf pf))
+        ;; The postcondition check is itself racy and must not escape: a
+        ;; concurrent `gc-cache!` can unlink the pool entry between
+        ;; `ensure-pooled!` returning it and this stat, and `Files/getAttribute`
+        ;; then throws NoSuchFileException straight out of `openInput` — which
+        ;; Lucene reads as a missing index file rather than a stale cache. That
+        ;; broke a live writer's commit once per ~150 under concurrent cache
+        ;; collection. Treating it as "not linked yet" sends us round the loop,
+        ;; where `ensure-pooled!` re-fetches, which is the correct repair.
+        (and (.exists vf)
+             (try (same-inode? vf pf)
+                  (catch NoSuchFileException _ false)))
         vf
 
         (> attempt 8)
@@ -436,7 +449,7 @@
               (Files/createLink (->path (.getPath vf)) (->path (.getPath pf))))
             (catch FileAlreadyExistsException _ nil)
             (catch NoSuchFileException _ nil))
-          (recur (inc attempt)))))))
+          (recur (inc attempt) (ensure-pooled! store cache address)))))))
 
 (defn- pool!
   "Fold a freshly written view file into the pool under `address`, so a later
@@ -480,6 +493,29 @@
   {:max-merged-segment-mb 256
    :ram-buffer-mb 32})
 
+(defn store-id-for
+  "A guard id for `store`, or nil when none can be derived.
+
+  THE GUARD DEFAULTED TO OFF, AND THAT BRICKED BRANCHES ON THE ORDINARY PATH.
+  `konserve.protocols/store-id` reads `(:id (-store-config store))`, which only
+  `konserve.store/connect-store` populates — a store from `connect-fs-store`,
+  which is what every caller here actually uses, answers nil. A nil id makes
+  `open-guard!`/`close-guard!` no-ops and makes `gc!` take `ts` instead of
+  `guard/cutoff`, so a collection landing between the blob writes and the
+  pointer flip sweeps blobs the branch is about to name. The writer sees no
+  error; the branch head then names a blob that is gone and the branch cannot
+  be opened at all. Reproduced without instrumentation, bricking at commit 2.
+
+  The requirement is that every writer and collector on the SAME BYTES pass the
+  SAME id — so falling back to the filestore's base path is exactly right: it
+  is stable across opens and across processes, and two stores on one path get
+  one id. Deriving it beats defaulting to nil, and beats a per-open
+  `random-uuid`, which is the other half of the same bug (two ids on one store
+  is the case `konserve.gc-guard` calls out as deleting live data)."
+  [store]
+  (or ((requiring-resolve 'konserve.protocols/store-id) store)
+      (some-> store :backing :base str not-empty)))
+
 (def reserved-branch-names
   "Branch names that would collide with the cache's own layout.
 
@@ -522,7 +558,10 @@
 
   So the id may be coarser than the physical store, never finer. Omitting it
   disables the guard, which is only safe on a store that is never collected."
-  (^Directory [store cache branch] (konserve-directory store cache branch nil))
+  ;; RESOLVES THE GUARD ID rather than defaulting it to nil. Passing an explicit
+  ;; nil to the 4-arity still opts out, which is only safe on a store that is
+  ;; never collected — see `store-id-for` for what defaulting to nil cost.
+  (^Directory [store cache branch] (konserve-directory store cache branch (store-id-for store)))
   (^Directory [store ^String cache ^String branch store-id]
    (check-branch-name branch)
    (.mkdirs (io/file cache branch))
@@ -683,7 +722,7 @@
            (when-not (or (contains? (files-now) n) (= n IndexWriter/WRITE_LOCK_NAME))
              (.delete (view-file cache branch n)))))
        (catch org.apache.lucene.store.LockObtainFailedException _
-         nil))
+         (some-> store :backing :base str not-empty)))
      ;; FilterDirectory over the live MMapDirectory, not a bare Directory: this
      ;; IS an mmap'd directory with a store-backed materialization layer in
      ;; front, and `FilterDirectory.unwrap` is how Lucene detects that. A bare
@@ -1268,6 +1307,19 @@
    ;; marker exists to make possible — every val misses every blob key, and
    ;; `sweep!` being allow-list then deletes THE ENTIRE STORE.
    (ensure-format! store)
+   ;; AND REFUSE TO COLLECT UNGUARDED. Without a store id the cutoff falls back
+   ;; to `ts`, so a commit in flight — blobs written, pointer not yet flipped —
+   ;; has its blobs swept, and the branch head then names something that is not
+   ;; there. The writer sees no error and the branch cannot be opened again.
+   ;; Reproduced on the default path, bricking a branch by commit 2; with a
+   ;; shared id, 243 collections against a live writer lost nothing. Collecting
+   ;; is the destructive half, so it is the half that must not be opt-out.
+   (when (nil? store-id)
+     (throw (ex-info (str "scriptum: refusing to collect without a store id — the "
+                          "gc-guard would be inert and a commit in flight would "
+                          "lose its blobs. Pass the same id every writer on these "
+                          "bytes passes; `store-id-for` derives one.")
+                     {:store-id nil})))
    ;; THE GUARD IS READ BEFORE THE MANIFESTS ARE WALKED, and that order is the
    ;; whole point — `sweep!` cannot do it for us, because by the time it has a
    ;; whitelist the walk has already happened.

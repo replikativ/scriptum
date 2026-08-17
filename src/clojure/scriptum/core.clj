@@ -209,7 +209,13 @@
          ;; Default the guard id off the store rather than making the caller
          ;; track it, so two components on one store cannot disagree about its
          ;; name — see konserve.gc-guard on why only that direction is unsafe.
-         store-id (or store-id ((requiring-resolve 'konserve.protocols/store-id) store))
+         ;;
+         ;; `konserve.protocols/store-id` alone was NOT enough: it answers nil
+         ;; for a `connect-fs-store` store, which is what callers actually use,
+         ;; and a nil id silently disables the guard — a collection then sweeps
+         ;; an in-flight commit's blobs and bricks the branch. `store-id-for`
+         ;; falls back to something stable for the same bytes.
+         store-id (or store-id ((sk 'store-id-for) store))
          dir ((sk 'konserve-directory) store cache branch store-id)
          writer (BranchIndexWriter/createOver dir branch analyzer)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)

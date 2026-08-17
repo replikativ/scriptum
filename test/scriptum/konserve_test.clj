@@ -1164,3 +1164,39 @@
             "and the two paths agree on what is reachable"))
       (with-open [d (sk/konserve-directory s (cache) "main" sid)]
         (is (= #{"live"} (bodies d)))))))
+
+(deftest the-guard-is-engaged-by-default
+  (testing "THE GUARD DEFAULTED TO OFF AND BRICKED BRANCHES ON THE ORDINARY PATH.
+            `konserve.protocols/store-id` answers nil for a `connect-fs-store`
+            store — which is what callers actually use — and a nil id makes the
+            guard a no-op and `gc!` take `ts` instead of `guard/cutoff`. A
+            collection landing between the blob writes and the pointer flip then
+            swept blobs the branch was about to name; the writer saw no error and
+            the branch could not be opened again. Reproduced without
+            instrumentation, bricking by commit 2.
+
+            Every writer and collector on the same bytes must pass the SAME id,
+            so the fallback is the store's own base path: stable across opens and
+            processes, one id per store."
+    (let [s (store)]
+      (is (nil? ((requiring-resolve 'konserve.protocols/store-id) s))
+          "precondition: konserve has no id for this store")
+      (is (some? (sk/store-id-for s)) "but one is derivable")
+      (is (= (sk/store-id-for s) (sk/store-id-for (store)))
+          "and it is the same for a second connection to the same bytes")
+      ;; the default Directory must be guarded
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "seeded"))
+      (is (seq (sk/branches s))))))
+
+(deftest collecting-without-a-guard-is-refused
+  (testing "collecting is the destructive half, so it is the half that must not
+            be opt-out. Unguarded, a commit in flight loses its blobs and the
+            branch head names something that is not there."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "precious"))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"without a store id"
+                            (sk/gc! s nil)))
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (is (= #{"precious"} (bodies d)) "and nothing was collected")))))
