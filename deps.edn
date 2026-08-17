@@ -21,12 +21,11 @@
         ;; would land under a second address and stop sharing. The manifest
         ;; carries no format version to detect that; the namespace is
         ;; unreleased, so no migration is provided.
-        org.replikativ/konserve {:mvn/version "0.9.350"}}
+        org.replikativ/konserve {:mvn/version "0.9.375"}}
 
  :aliases
  {;; Sibling checkouts, for co-development across the replikativ stack.
-  ;; scriptum.konserve needs konserve.gc-guard, which is unreleased — use this
-  ;; alias until a konserve carrying it is on Maven.
+  ;; Not required to build — konserve 0.9.375 carries everything this needs.
   :local
   {:override-deps {org.replikativ/konserve {:local/root "../konserve"}}}
 
@@ -46,9 +45,7 @@
   ;; MMapDirectory is held to; running scriptum's Directories against it is how
   ;; we know they are Directories and not merely enough of one for the code path
   ;; Lucene happens to take. Compile with `clj -T:build compile-tck`, then:
-  ;;   clj -M:local:tck -m scriptum.tck-runner
-  ;; `:local` is required until a konserve carrying gc-guard is released — see
-  ;; the alias above and scriptum.tck-runner's docstring.
+  ;;   clj -M:tck -m scriptum.tck-runner
   :tck
   {:extra-paths ["test" "target/test-classes"]
    :extra-deps {org.apache.lucene/lucene-test-framework {:mvn/version "10.3.2"}}
