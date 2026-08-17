@@ -468,3 +468,60 @@
                 "the index must read correctly despite the stale view")
             (is (= (inode (str (cache) "/main/" seg2)) (inode pooled))
                 "and the view entry must now be the blob the manifest names")))))))
+
+;; =============================================================================
+;; The branch registry
+;; =============================================================================
+
+(deftest the-registry-survives-collection
+  (testing "REGRESSION, caught on the first run: `sweep!` is allow-list, so a
+            key nothing names is deleted — and the registry was not in the
+            whitelist. One collection emptied it, after which the mark had no
+            branches to walk from and the next would have taken the whole index.
+
+            The registry is a GC root, alongside the manifests it names."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "keep me"))
+      (sk/fork! s "main" "other")
+      (let-the-millisecond-turn-over!)
+      (sk/gc! s sid)
+      (is (= #{"main" "other"} (sk/branches s))
+          "collection must not sweep the registry")
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (is (= #{"keep me"} (bodies d)))))))
+
+(deftest a-branch-is-registered-before-its-manifest
+  (testing "the registry is a GC ROOT, so it must never under-report: a branch
+            whose manifest exists but which the registry has forgotten has that
+            manifest and every blob it names swept. Registering first means a
+            crash leaves a registered branch with no manifest, which is
+            harmless — `read-manifest` returns `{}`."
+    (let [s (store)]
+      (with-open [_ (sk/konserve-directory s (cache) "main")]
+        ;; registered at open, before anything could have written a manifest
+        (is (contains? (sk/branches s) "main"))
+        (is (empty? (sk/read-manifest s "main"))
+            "and with no manifest yet, which must be harmless"))
+      (is (= #{"main"} (sk/branches s)))
+      ;; a fork registers before copying too
+      (sk/fork! s "main" "feature")
+      (is (= #{"main" "feature"} (sk/branches s)))
+      (sk/delete-branch! s "feature")
+      (is (= #{"main"} (sk/branches s))))))
+
+(deftest the-registry-can-be-rebuilt
+  (testing "nothing consults the keyspace on the read path, so drift cannot
+            repair itself. `repair-branches!` is the way back — the expensive
+            scan `branches` used to do on every call, now explicit and rare."
+    (let [s (store)]
+      (with-open [_ (sk/konserve-directory s (cache) "main")]
+        (add-doc! (sk/konserve-directory s (cache) "main") "x"))
+      (sk/fork! s "main" "lost")
+      ;; simulate drift: the registry forgets a branch that still has a manifest
+      (k/assoc s sk/branches-key #{"main"} {:sync? true})
+      (is (= #{"main"} (sk/branches s)) "precondition: drifted")
+      (is (= #{"main" "lost"} (sk/repair-branches! s))
+          "the scan finds the manifest the registry forgot")
+      (is (= #{"main" "lost"} (sk/branches s))))))

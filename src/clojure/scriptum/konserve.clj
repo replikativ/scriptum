@@ -45,12 +45,30 @@
     each, and blobs whose keys are content hashes, so a segment both happen to
     write is the same key holding the same bytes. Nothing needs coordinating
     because nothing is shared.
-  - The SAME branch is NOT yet protected. `write.lock` lives in the local
-    cache, which is per-machine, so two processes both open a writer, both
-    commit, and the manifest write is last-writer-wins: the loser's segments
-    are silently orphaned. Exclusion has to move into the store — a lease on
-    the branch, or a compare-and-set on the manifest — before this is safe on
-    a shared store. Until then, one writer per branch is the caller's job.
+  - The SAME branch is NOT protected. `write.lock` lives in the local cache,
+    which is per-machine, so two processes both open a writer, both commit, and
+    the manifest write is last-writer-wins: the loser's segments are silently
+    orphaned. The manifest is written unconditionally, which is the same shape
+    as datahike's branch head (datahike#878) and carries the same verdict.
+
+    RESERVED CONCURRENCY 1 IS NOT A FIX. It narrows the window; it does not
+    close it, because a deploy or container replacement still runs two
+    environments at once. Nor does a single serialized stream suffice on its
+    own: Lambda FREEZES an environment rather than terminating it, so a thawed
+    one holds a manifest atom, a Lucene writer and a `/tmp` cache from before
+    another environment advanced the branch. Open and close a writer per
+    invocation rather than caching one, or that stale writer derives its next
+    manifest from a superseded one. (The view cache is safe either way — a
+    stale entry is repaired by inode on first touch; see `link-into-view!`.)
+
+    The fix is a compare-and-set on the manifest. `konserve-s3` already
+    implements `put-object-conditional`, so on S3 the primitive exists and is
+    opt-in via `:config {:optimistic-locking-retries n}` — but taking it needs
+    `sync` restructured to RETRY from a re-read manifest rather than write one
+    it computed from a cached value, and the GC guard is in-process regardless,
+    so a collection on one machine still cannot see another's in-flight blobs.
+    Until both land, treat multi-writer as unsupported: one writer per branch,
+    in one JVM.
 
   THE LUCENE CONTRACT is checked against Lucene's own conformance suite rather
   than asserted here — `BaseDirectoryTestCase`, via `scriptum.tck-runner`. It
@@ -82,14 +100,62 @@
   [store branch]
   (or (k/get store (manifest-key branch) nil {:sync? true}) {}))
 
+(def branches-key
+  "Where the branch registry lives: a set of branch names."
+  [:scriptum :branches])
+
 (defn branches
-  "Every branch that has a manifest in `store`."
+  "Every branch of this index, from the registry.
+
+  A REGISTRY rather than a scan of the keyspace. The manifest key encodes its
+  branch name, so branches could be derived by filtering `k/keys` — and were —
+  but `k/keys` is not a listing: konserve OPENS AND READS EVERY BLOB to recover
+  its key. That made enumerating two branches cost one read per segment in the
+  store. Measured on a 155-key index it was 20.4 ms against 0.23 ms for a single
+  lookup, ~90x, and on an object store it is one GET per object.
+
+  proximum (`:branches`) and stratum (`[:datasets :branches]`) both keep the
+  same registry; this was the outlier."
   [store]
-  (into #{}
-        (comp (map :key)
-              (filter #(and (vector? %) (= [:scriptum :manifest] (subvec % 0 2))))
-              (map #(nth % 2)))
-        (k/keys store {:sync? true})))
+  (or (k/get store branches-key nil {:sync? true}) #{}))
+
+(defn register-branch!
+  "Record `branch` in the registry, if it is not already there.
+
+  MUST HAPPEN BEFORE THE BRANCH'S FIRST MANIFEST WRITE, and that ordering is
+  the opposite of the values-then-pointer rule everywhere else here. Elsewhere
+  the pointer is written last because it makes values REACHABLE. The registry
+  is a GC ROOT: `gc!` whitelists a manifest only for a branch the registry
+  names, so a branch with a manifest the registry has forgotten has its
+  manifest and every blob it names swept. Registering first means a crash
+  leaves a registered branch with no manifest — harmless, `read-manifest`
+  returns `{}` — never the reverse.
+
+  Returns true when it wrote."
+  [store branch]
+  (when-not (contains? (branches store) branch)
+    (k/update store branches-key #(conj (or % #{}) branch) {:sync? true})
+    true))
+
+(defn repair-branches!
+  "Rebuild the registry by scanning the keyspace for manifests.
+
+  The registry is authoritative, so nothing consults the keyspace on the read
+  path — which means drift, from a crash between registering and writing or
+  from a store assembled by other means, cannot repair itself. This is the way
+  back, and the expensive scan `branches` used to do on every call.
+
+  Returns the repaired set."
+  [store]
+  (let [found (into #{}
+                    (comp (map :key)
+                          (filter #(and (vector? %) (= 3 (count %))
+                                        (= [:scriptum :manifest] (subvec % 0 2))))
+                          (map #(nth % 2)))
+                    (k/keys store {:sync? true}))
+        merged (into (branches store) found)]
+    (k/assoc store branches-key merged {:sync? true})
+    merged))
 
 ;; =============================================================================
 ;; Local cache: a content-addressed pool + per-branch hard-link views
@@ -240,6 +306,11 @@
   (^Directory [store cache branch] (konserve-directory store cache branch nil))
   (^Directory [store ^String cache ^String branch store-id]
    (.mkdirs (io/file cache branch))
+   ;; Register before anything can write a manifest through this Directory. One
+   ;; key read for a branch already known, one read plus one write the first
+   ;; time — not per commit. See `register-branch!` for why the ordering is the
+   ;; inverse of the values-then-pointer rule.
+   (register-branch! store branch)
    (let [live (MMapDirectory/open (->path (str cache "/" branch)))
          manifest (atom (read-manifest store branch))
          ;; Files created through this Directory but not yet synced. Tracked
@@ -430,9 +501,12 @@
   "Branch `from` as `to`: copy the manifest. O(1) — no segment bytes move, and
   the two branches share every blob they have in common."
   [store from to]
-  (when (contains? (branches store) to)
+  ;; `k/exists?` on the one key, not a scan: existence of a branch IS existence
+  ;; of its manifest, so this needs a lookup rather than an enumeration.
+  (when (k/exists? store (manifest-key to) {:sync? true})
     (throw (ex-info "scriptum: branch already exists" {:branch to})))
   (let [m (read-manifest store from)]
+    (register-branch! store to)          ; registry first — see register-branch!
     (k/assoc store (manifest-key to) m {:sync? true})
     m))
 
@@ -440,7 +514,11 @@
   "Forget `branch`. Blobs it referenced survive until `gc!` finds them
   unreachable from every remaining manifest."
   [store branch]
+  ;; Manifest first, then the registry: the reverse order would leave a moment
+  ;; where the manifest exists and no root names it, which is exactly when a
+  ;; concurrent `gc!` would sweep the blobs it still names.
   (k/dissoc store (manifest-key branch) {:sync? true})
+  (k/update store branches-key #(disj (or % #{}) branch) {:sync? true})
   nil)
 
 (defn reachable-addresses
@@ -496,5 +574,9 @@
    ;; however the walk turned out.
    (let [cutoff (if store-id (guard/cutoff store-id ts) ts)
          keep (into #{} (map blob-key) (reachable-addresses store))
-         manifests (into #{} (map manifest-key) (branches store))]
+         ;; The registry is itself a root. `sweep!` is allow-list — it deletes
+         ;; every key not named — so leaving it out swept the very thing the
+         ;; mark walks from, and the next collection saw no branches at all and
+         ;; would have taken everything with it.
+         manifests (into #{branches-key} (map manifest-key) (branches store))]
      (kgc/sweep! store (into keep manifests) cutoff 1000 {:sync? true}))))
