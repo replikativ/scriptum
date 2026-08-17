@@ -33,7 +33,31 @@
 
 ;; --- ScriptumWriter wrapper ---
 
-(defrecord ScriptumWriter [writer metadata-index])
+(defrecord ScriptumWriter [writer metadata-index backing]
+  ;; `backing` is nil for a directory-backed index and
+  ;; `{:store s :cache c :directory d}` for a store-backed one. Everything a
+  ;; writer does to DOCUMENTS is pure Lucene and identical either way; only
+  ;; branch TOPOLOGY — fork, branch discovery, collection — differs, because a
+  ;; branch is a directory in one model and a manifest in the other.
+  )
+
+(defn- sk
+  "Resolve a `scriptum.konserve` var on first use.
+
+  Required lazily, not with `:require`, so the DIRECTORY-backed API keeps
+  loading against a released konserve. `scriptum.konserve` needs
+  `konserve.gc-guard`, which is unreleased; a static require would make every
+  existing user of this namespace need it too, for a backing they may never
+  touch."
+  [sym]
+  (or (requiring-resolve (symbol "scriptum.konserve" (name sym)))
+      (throw (ex-info "scriptum: scriptum.konserve is unavailable"
+                      {:var sym}))))
+
+(defn store-backed?
+  "Is this writer backed by a konserve store rather than a directory tree?"
+  [sw]
+  (boolean (and (instance? ScriptumWriter sw) (:backing sw))))
 
 (defn ->writer
   "Extract the BranchIndexWriter from a ScriptumWriter or pass through a raw writer."
@@ -96,7 +120,7 @@
          writer (BranchIndexWriter/create base-path branch-name analyzer crypto-hash)
          mi (metadata/create-metadata-index path)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
-     (->ScriptumWriter writer mi))))
+     (->ScriptumWriter writer mi nil))))
 
 (defn open-branch
   "Open an existing branch writer (for out-of-process branch access).
@@ -129,7 +153,9 @@
          writer (BranchIndexWriter/open base-path branch-name analyzer)
          mi (or metadata-index (metadata/create-metadata-index path))]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
-     (->ScriptumWriter writer mi))))
+     (->ScriptumWriter writer mi nil))))
+
+(declare open-store-index)
 
 (defn fork
   "Fork the index into a new branch. Returns the new branch writer.
@@ -137,10 +163,57 @@
   The new branch shares all existing segments with the parent.
   Cost: ~3-5ms (flush buffer + copy manifest)."
   [sw ^String new-branch-name]
-  (let [w (->writer sw)
-        mi (->metadata-index sw)
-        new-writer (.fork w new-branch-name)]
-    (->ScriptumWriter new-writer mi)))
+  (if (store-backed? sw)
+    ;; Forking a store-backed index copies a manifest — no bytes move and no
+    ;; directory is created. The parent must land its buffered writes first, or
+    ;; the copy names a manifest that does not yet describe them.
+    (let [{:keys [store cache]} (:backing sw)]
+      (.commit (->writer sw))
+      ((sk 'fork!) store (.getBranchName (->writer sw)) new-branch-name)
+      (open-store-index store cache new-branch-name
+                        {:metadata-index (->metadata-index sw)}))
+    (let [w (->writer sw)
+          mi (->metadata-index sw)
+          new-writer (.fork w new-branch-name)]
+      (->ScriptumWriter new-writer mi nil))))
+
+(defn open-store-index
+  "Open `branch` of a konserve-backed index, materializing through `cache`.
+
+  The store is the source of truth; `cache` is a derived local directory that
+  may be deleted at any time — see `scriptum.konserve`. Lucene still mmaps
+  local files, so a cache is required even when the store is remote; what the
+  store buys is that it is the only thing that must be durable.
+
+  Options:
+    :analyzer - the Lucene Analyzer (default: StandardAnalyzer)
+    :metadata-index - shared metadata index (default: none)
+    :store-id - id for konserve.gc-guard, so a collection cannot sweep this
+                index's in-flight segment writes. Should come off the store
+                itself; see `scriptum.konserve/konserve-directory`.
+    :max-merged-segment-mb / :ram-buffer-mb - see `create-index`. Against a
+                remote store start from `scriptum.konserve/remote-tuning`.
+
+  Returns a ScriptumWriter. Document operations, search, commit and readers
+  behave exactly as for a directory-backed index; `fork`, `branches` and `gc!`
+  answer from the manifests instead of the filesystem."
+  ([store cache branch] (open-store-index store cache branch {}))
+  ([store ^String cache ^String branch
+    {:keys [analyzer metadata-index store-id max-merged-segment-mb ram-buffer-mb]}]
+   (let [analyzer (or analyzer (StandardAnalyzer.))
+         dir ((sk 'konserve-directory) store cache branch store-id)
+         writer (BranchIndexWriter/createOver dir branch analyzer)]
+     (tune! writer max-merged-segment-mb ram-buffer-mb)
+     (->ScriptumWriter writer metadata-index
+                       {:store store :cache cache :directory dir}))))
+
+(defn branches
+  "Every branch of a store-backed index, from its manifests."
+  [sw]
+  (if (store-backed? sw)
+    ((sk 'branches) (:store (:backing sw)))
+    (throw (ex-info "scriptum: branches is for store-backed indices; use discover-branches for a path"
+                    {:writer sw}))))
 
 (defn discover-branches
   "Discover all branch names at the given path.
@@ -611,6 +684,13 @@
   before: java.time.Instant — delete commits older than this
   Returns the number of commit points removed."
   [sw ^Instant before]
+  (when (store-backed? sw)
+    ;; A store-backed index collects by reachability from the live manifests,
+    ;; not by ageing commit points out of a directory — and its cutoff has to
+    ;; be derived from konserve.gc-guard BEFORE the manifests are walked, which
+    ;; `scriptum.konserve/gc!` does and this cannot.
+    (throw (ex-info "scriptum: use scriptum.konserve/gc! for a store-backed index"
+                    {:branch (.getBranchName (->writer sw))})))
   (let [^BranchIndexWriter writer (->writer sw)
         mi (->metadata-index sw)
         removed (.gc writer before)]
@@ -692,4 +772,9 @@
         mi (->metadata-index sw)]
     (when mi
       (metadata/close-index! mi))
-    (.close writer)))
+    (.close writer)
+    ;; A store-backed writer holds a Directory the caller did not construct, so
+    ;; closing the writer is not enough — `createOver` takes the Directory as
+    ;; given and leaves its lifetime to whoever supplied it, which here is us.
+    (when-let [^java.io.Closeable dir (:directory (:backing sw))]
+      (.close dir))))

@@ -18,7 +18,8 @@
             [konserve.core :as k]
             [konserve.gc-guard :as guard]
             [konserve.utils :as ku]
-            [scriptum.konserve :as sk])
+            [scriptum.konserve :as sk]
+            [scriptum.core :as sc])
   (:import [org.replikativ.scriptum ContentHash]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
            [org.apache.lucene.document Document TextField Field$Store]
@@ -322,3 +323,66 @@
         (sk/gc! s sid)
         (is (not (k/exists? s (sk/blob-key orphan) {:sync? true}))
             "once the sequence closes, a genuinely unreachable blob is collected")))))
+
+;; =============================================================================
+;; The store-backed writer, through scriptum.core's ordinary API
+;; =============================================================================
+
+(deftest a-store-backed-index-behaves-like-a-directory-backed-one
+  (testing "everything a writer does to DOCUMENTS is pure Lucene, so the core
+            API works unchanged over a konserve store — only branch topology
+            differs, because a branch is a manifest rather than a directory"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main" {:store-id (random-uuid)})]
+      (try
+        (is (sc/store-backed? w))
+        (sc/add-doc w {:title {:type :text :value "the quick brown fox"}
+                       :id {:type :string :value "a"}})
+        (sc/add-doc w {:title {:type :text :value "a slow green turtle"}
+                       :id {:type :string :value "b"}})
+        (sc/commit! w "two documents")
+        (is (= 2 (sc/num-docs w)))
+        (is (= 1 (count (sc/search w {:term [:id "a"]}))))
+        (is (= 1 (count (sc/search w (sc/text-query :title "quick")))))
+        (finally (sc/close! w)))
+      ;; durable in the store, not in the cache: wipe the cache and reopen
+      (rm-rf (io/file (cache)))
+      (let [w2 (sc/open-store-index s (cache) "main")]
+        (try
+          (is (= 2 (sc/num-docs w2))
+              "the store is the source of truth; the cache is derived")
+          (finally (sc/close! w2)))))))
+
+(deftest forking-a-store-backed-index-copies-a-manifest
+  (testing "fork goes through the manifests rather than the filesystem, and the
+            branches then diverge independently"
+    (let [s (store)
+          main (sc/open-store-index s (cache) "main")]
+      (try
+        (sc/add-doc main {:title {:type :text :value "shared base"}})
+        (sc/commit! main "seed")
+        (let [feature (sc/fork main "feature")]
+          (try
+            (is (= #{"main" "feature"} (sc/branches main)))
+            (sc/add-doc feature {:title {:type :text :value "only feature"}})
+            (sc/commit! feature "feature work")
+            (sc/add-doc main {:title {:type :text :value "only main"}})
+            (sc/commit! main "main work")
+            (is (= 2 (sc/num-docs feature)))
+            (is (= 2 (sc/num-docs main)))
+            (is (= 1 (count (sc/search feature (sc/text-query :title "feature")))))
+            (is (zero? (count (sc/search main (sc/text-query :title "feature"))))
+                "the branches must not see each other's work")
+            (finally (sc/close! feature))))
+        (finally (sc/close! main))))))
+
+(deftest gc-is-refused-on-a-store-backed-index
+  (testing "collection for a store-backed index is reachability from the live
+            manifests with a guard-derived cutoff, which core's path-based gc!
+            cannot express — it says so rather than dereferencing a null path"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scriptum.konserve/gc!"
+                              (sc/gc! w (java.time.Instant/now))))
+        (finally (sc/close! w))))))

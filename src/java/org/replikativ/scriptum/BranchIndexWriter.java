@@ -187,6 +187,49 @@ public class BranchIndexWriter implements Closeable {
    * @param cryptoHash if true, use merkle hashing for commits
    * @return a new BranchIndexWriter
    */
+  /**
+   * Open a writer over a Directory supplied by the caller, with no base path.
+   *
+   * <p>For a store-backed index, where a branch is a manifest in konserve rather than a directory
+   * under {@code branches/}. Everything a writer does to DOCUMENTS — add, update, delete, commit,
+   * search, open a reader — is pure Lucene and works unchanged over any Directory. What does not
+   * carry over is branch TOPOLOGY: {@code fork}, {@code discoverBranches} and {@code gc} all
+   * resolve paths beneath {@code basePath}, and a store-backed index answers those from its
+   * manifests instead ({@code scriptum.konserve}). Calling them here throws rather than
+   * dereferencing a null path.
+   *
+   * <p>The deletion and merge policies are still installed. Neither is needed by the manifest
+   * model — merges are branch-local there, and reachability from the live manifests replaces
+   * ref-counting — but they are harmless, and leaving them in keeps one writer implementation
+   * instead of two.
+   *
+   * @param directory the Directory to write through; the caller owns closing it
+   * @param branchName the branch this writer is on
+   * @param analyzer the analyzer to use for text processing
+   * @return a new BranchIndexWriter with no base path
+   */
+  public static BranchIndexWriter createOver(Directory directory, String branchName, Analyzer analyzer)
+      throws IOException {
+    BranchDeletionPolicy deletionPolicy = new BranchDeletionPolicy();
+    BranchAwareMergePolicy mergePolicy =
+        new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
+
+    IndexWriterConfig config = new IndexWriterConfig(analyzer);
+    config.setIndexDeletionPolicy(deletionPolicy);
+    config.setMergePolicy(mergePolicy);
+    config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+
+    IndexWriter writer = new IndexWriter(directory, config);
+
+    return new BranchIndexWriter(
+        writer, directory, deletionPolicy, mergePolicy, branchName, null, analyzer, true, false);
+  }
+
+  /** Whether this writer has a base path, i.e. is the directory-backed kind. */
+  public boolean hasBasePath() {
+    return basePath != null;
+  }
+
   public static BranchIndexWriter create(
       Path basePath, String branchName, Analyzer analyzer, boolean cryptoHash) throws IOException {
     Files.createDirectories(basePath);
