@@ -1750,8 +1750,10 @@
                              (catch java.util.concurrent.ExecutionException e
                                {:refused (ex-message (.getCause e))}))]
             (when-let [msg (:refused outcome)]
-              (is (re-find #"not in the store" msg)
-                  "a refused restore must say why, not corrupt"))))
+              (is (re-find #"not in the store|was collected while" msg)
+                  "a refused restore must say why, not corrupt — either the
+                   precondition or the post-write rollback, depending on where
+                   in the collection it landed"))))
         ;; whatever order they took, the branch must be readable and collection alive
         (with-open [d (sk/konserve-directory s (cache) "main" sid)]
           (is (seq (bodies d)) "the branch must still open"))

@@ -9,7 +9,8 @@
   - Snapshot: immutable DirectoryReader at a specific commit point
   - Branch: COW overlay sharing base segments with the trunk
   - GC: explicit cleanup of old snapshots respecting branch references"
-  (:require [scriptum.metadata :as metadata])
+  (:require [scriptum.konserve :as sk]
+            [scriptum.metadata :as metadata])
   (:import [java.nio.file Path Paths]
            [java.time Instant Duration]
            [org.apache.lucene.analysis Analyzer]
@@ -40,21 +41,6 @@
   ;; branch TOPOLOGY — fork, branch discovery, collection — differs, because a
   ;; branch is a directory in one model and a manifest in the other.
   )
-
-(defn- sk
-  "Resolve a `scriptum.konserve` var on first use.
-
-  Required lazily, not with `:require`, so the DIRECTORY-backed API does not
-  drag in the store-backed one — `scriptum.konserve` is a large namespace that
-  an existing directory-backed user may never touch.
-
-  It was originally lazy because `konserve.gc-guard` was unreleased. That is no
-  longer true: 0.9.375 carries it, and `deps.edn` says so. The indirection stays
-  for load cost, not availability."
-  [sym]
-  (or (requiring-resolve (symbol "scriptum.konserve" (name sym)))
-      (throw (ex-info "scriptum: scriptum.konserve is unavailable"
-                      {:var sym}))))
 
 (defn store-backed?
   "Is this writer backed by a konserve store rather than a directory tree?"
@@ -172,7 +158,7 @@
     (let [{:keys [store cache store-id analyzer
                   max-merged-segment-mb ram-buffer-mb]} (:backing sw)]
       (.commit (->writer sw))
-      ((sk 'fork!) store (.getBranchName (->writer sw)) new-branch-name)
+      (sk/fork! store (.getBranchName (->writer sw)) new-branch-name)
       ;; CARRY THE PARENT'S GUARD ID. Dropping it left a caller who passed
       ;; `:store-id` explicitly with a parent guarded under their id and a fork
       ;; guarded under the derived one — two ids for one store, which is the
@@ -236,12 +222,12 @@
          ;; with `konserve.store/connect-store`, which requires a UUID `:id` and
          ;; attaches it. `konserve.filestore/connect-fs-store` carries no config
          ;; and answers nil; see `scriptum.konserve/store-id-for`.
-         store-id (or store-id ((sk 'store-id-for) store))
+         store-id (or store-id (sk/store-id-for store))
          ;; Where `merge-from!` records the lineage it brought in, so the next
          ;; commit can name it as a parent. It has to be created out here
          ;; because the Directory is a proxy with no way to reach into it.
          pending-parents (atom #{})
-         dir ((sk 'konserve-directory) store cache branch store-id pending-parents)
+         dir (sk/konserve-directory store cache branch store-id pending-parents)
          writer (BranchIndexWriter/createOver dir branch analyzer)]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer metadata-index
@@ -272,7 +258,7 @@
   buffered writes are not in it. Store-backed indices only; nil otherwise."
   [sw]
   (when (store-backed? sw)
-    ((sk 'branch-snapshot) (:store (:backing sw)) (.getBranchName (->writer sw)))))
+    (sk/branch-snapshot (:store (:backing sw)) (.getBranchName (->writer sw)))))
 
 (defn open-store-index-at
   "Open `branch` as a WRITABLE index at the state named by `address`.
@@ -291,14 +277,14 @@
   Takes the same options as `open-store-index`."
   ([store cache branch address] (open-store-index-at store cache branch address {}))
   ([store ^String cache ^String branch address opts]
-   ((sk 'point-branch-at!) store branch address)
+   (sk/point-branch-at! store branch address)
    (open-store-index store cache branch opts)))
 
 (defn branches
   "Every branch of a store-backed index, from its manifests."
   [sw]
   (if (store-backed? sw)
-    ((sk 'branches) (:store (:backing sw)))
+    (sk/branches (:store (:backing sw)))
     (throw (ex-info "scriptum: branches is for store-backed indices; use discover-branches for a path"
                     {:writer sw}))))
 

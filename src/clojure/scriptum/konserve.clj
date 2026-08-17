@@ -1239,11 +1239,15 @@
   [store branch address]
   (ensure-format! store)
   (check-branch-name branch)
-  (when-not (k/exists? store (snapshot-key address) {:sync? true})
-    (throw (ex-info (str "scriptum: snapshot " address " is not in the store, so "
-                         branch " cannot be pointed at it")
-                    {:branch branch :address address})))
   (with-store-lock store
+    ;; INSIDE the lock. Checked outside it, the precondition passed against a
+    ;; snapshot a collection was already about to sweep — the call then blocked,
+    ;; acquired, wrote the pointer and had to roll it back. Same outcome, but it
+    ;; reported the rollback rather than the reason, and wrote for nothing.
+    (when-not (k/exists? store (snapshot-key address) {:sync? true})
+      (throw (ex-info (str "scriptum: snapshot " address " is not in the store, so "
+                           branch " cannot be pointed at it")
+                      {:branch branch :address address})))
     (let [previous (k/get store (manifest-key branch) nil {:sync? true})
           registered-here? (register-branch! store branch)]
       (k/assoc store (manifest-key branch) address {:sync? true})

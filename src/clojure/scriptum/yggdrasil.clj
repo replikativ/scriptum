@@ -9,6 +9,7 @@
   Snapshot IDs are UUIDs stored in commit user-data."
   (:require [konserve.utils :as ku]
             [scriptum.core :as pl]
+            [scriptum.konserve :as sk]
             [yggdrasil.protocols :as p]
             [yggdrasil.types :as t]
             [clojure.string :as str])
@@ -153,8 +154,7 @@
       ;; do this; the path model leaves its overlay directory, which a later
       ;; `branch!` of the same name would silently reuse.
       (when (and writer (pl/store-backed? writer))
-        ((requiring-resolve 'scriptum.konserve/delete-branch!)
-         (:store (:backing writer)) branch-str))
+        (sk/delete-branch! (:store (:backing writer)) branch-str))
       (assoc this :writers (dissoc writers branch-str))))
 
   (checkout [this name] (p/checkout this name nil))
@@ -295,9 +295,8 @@
 
         (pl/store-backed? writer)
         (do (when-not (:dry-run? opts)
-              ((requiring-resolve 'scriptum.konserve/gc!)
-               (:store (:backing writer)) (:store-id (:backing writer))
-               (ku/now) (into #{} (filter uuid?) snapshot-ids)))
+              (sk/gc! (:store (:backing writer)) (:store-id (:backing writer))
+                      (ku/now) (into #{} (filter uuid?) snapshot-ids)))
             this)
 
         ;; Path model: age out commit points, which is all it can do, and only on
