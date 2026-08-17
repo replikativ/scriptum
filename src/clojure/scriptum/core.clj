@@ -817,18 +817,30 @@
             snapshots-by-branch
             (reduce
              (fn [acc bname]
-               (try
-                 (let [bw (BranchIndexWriter/open (->path base-path) bname (StandardAnalyzer.))
-                       snaps (mapv (fn [m]
-                                     (let [base {:generation (.get m "generation")
-                                                 :custom-metadata
-                                                 (when-let [cm (.get m "customMetadata")]
-                                                   (into {} cm))}]
-                                       base))
-                                   (.listSnapshots bw))]
-                   (.close bw)
-                   (assoc acc bname snaps))
-                 (catch Exception _ acc)))
+               ;; A branch we cannot read is OMITTED, and omission now means
+               ;; "leave its entries alone" rather than "it has none" — see
+               ;; `metadata/rebuild-from-snapshots!`. The common reason to land
+               ;; here is LockObtainFailedException from a branch whose writer is
+               ;; open, i.e. the documented main+feature workflow, and erasing
+               ;; that branch's metadata on every collection of main is not a
+               ;; defensible reading of a lock being held.
+               (let [bw (try (BranchIndexWriter/open (->path base-path) bname
+                                                     (StandardAnalyzer.))
+                             (catch Exception _ nil))]
+                 (if-not bw
+                   acc
+                   (try
+                     (assoc acc bname
+                            (mapv (fn [m]
+                                    {:generation (.get m "generation")
+                                     :custom-metadata
+                                     (when-let [cm (.get m "customMetadata")]
+                                       (into {} cm))})
+                                  (.listSnapshots bw)))
+                     (catch Exception _ acc)
+                     ;; `.close` in a finally: it was after `.listSnapshots`, so a
+                     ;; throw there leaked the writer AND left its lock held.
+                     (finally (.close bw))))))
              {(.getBranchName writer) (mapv (fn [s] {:generation (:generation s)
                                                      :custom-metadata (:custom-metadata s)})
                                             main-snaps)}

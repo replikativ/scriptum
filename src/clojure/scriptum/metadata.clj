@@ -247,15 +247,28 @@
          :indexed-value (:value entry)}))))
 
 (defn rebuild-from-snapshots!
-  "Rebuild the metadata index from surviving snapshots after GC.
+  "Rebuild the metadata index for the branches named in `snapshots-by-branch`.
+
   snapshots-by-branch: map of branch-name -> seq of snapshot maps
-  (each with :custom-metadata and :generation)."
+  (each with :custom-metadata and :generation).
+
+  AUTHORITATIVE ONLY FOR THE BRANCHES IT IS GIVEN. Entries for any other branch
+  are carried across untouched. It used to rebuild from the map alone and
+  `reset!` the result, so a branch missing from it lost every entry — and the
+  caller drops exactly the branches it could not read, which for `scriptum.core/gc!`
+  means any branch with a live writer, i.e. the ordinary main+feature workflow.
+  A collection on main silently erased the feature branch's metadata.
+
+  Absence is not evidence here: a branch that could not be re-derived is a
+  branch we know nothing about, not one we know to be empty."
   [^MetadataIndex mi snapshots-by-branch]
   (let [storage (:storage mi)
+        rebuilt (set (keys snapshots-by-branch))
         fresh-idx (into (pss/sorted-set* {:comparator metadata-comparator
                                           :storage storage
                                           :branching-factor 64})
-                        [])]
+                        ;; everything we are NOT rebuilding, preserved
+                        (remove #(contains? rebuilt (:branch %)) @(:index-atom mi)))]
     (reset! (:index-atom mi)
             (reduce
              (fn [idx [branch-name snapshots]]

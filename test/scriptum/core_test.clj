@@ -806,3 +806,34 @@
               (is (= (inc i) (.numDocs rdr))
                   "and opening at it must show exactly the commits so far"))))
         (finally (sc/close! w) (delete-dir-recursive path))))))
+
+(deftest gc-preserves-metadata-of-a-branch-it-cannot-read
+  (testing "REGRESSION: `gc!` reopens each branch to re-derive its metadata and
+            swallowed failures with `(catch Exception _ acc)`, omitting the
+            branch — and `rebuild-from-snapshots!` then built a fresh index from
+            what it was given, erasing it. The usual reason to fail is
+            LockObtainFailedException from a branch whose writer is open, i.e.
+            the documented main+feature workflow, so collecting on main silently
+            erased the feature branch's metadata.
+
+            Absence is not evidence: a branch that could not be re-derived is one
+            we know nothing about, not one we know to be empty."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "seed" {"tx" "100"})
+        (let [feature (sc/fork main "feature")]
+          (try
+            (sc/add-doc feature {:body "f"})
+            (sc/commit! feature "on feature" {"tx" "200"})
+            (is (some? (sc/find-generation feature "tx" "200"))
+                "precondition: the feature branch's metadata is indexed")
+            ;; feature's writer stays OPEN across the collection
+            (sc/gc! main (Instant/now))
+            (is (some? (sc/find-generation feature "tx" "200"))
+                "a collection on main must not erase an open branch's metadata")
+            (is (some? (sc/find-generation main "tx" "100"))
+                "and main's own survives, as before")
+            (finally (sc/close! feature))))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
