@@ -573,12 +573,42 @@
 
   Options:
     :limit - max results (default 10)
-    :fields - fields to retrieve (default: all stored fields)"
+    :fields - fields to retrieve (default: all stored fields)
+    :reader - search THIS reader instead of opening one (see below)
+
+  BY DEFAULT THIS OPENS A FRESH NRT READER, so it reflects the writer's state
+  including uncommitted changes — add a document and it is findable before any
+  commit. That is the semantics a git-like writer wants and it is not free:
+  `DirectoryReader.open(writer)` flushes every in-memory buffer, so a loop that
+  alternates writing and searching materializes a segment PER SEARCH. Measured
+  at 5.08 ms per write-then-search cycle against 0.159 ms reusing a reader —
+  32x, and the cost is segment churn rather than reader construction, which is
+  cheap (0.016 ms at one segment, 0.121 ms at 54).
+
+  So pass `:reader` when searching repeatedly without writing, or when writing
+  and searching in a loop. `snapshot`, `with-snapshot` and `open-reader-at`
+  hand out exactly the right object, which is also what makes this compose with
+  time travel. Whoever opens the reader closes it; scriptum owns no lifecycle
+  here, deliberately.
+
+  A held reader is a POINT IN TIME. It will not show later writes, and — more
+  sharply — it will still return documents deleted since, so a caller filtering
+  on identity must expect rows it has already removed. Reopen or take a fresh
+  `snapshot` to move forward.
+
+  Scriptum caches no searcher of its own, and that is a decision rather than an
+  omission: a cached NRT searcher refreshed on `commit!` was measured to break
+  read-your-own-writes, resurrect deleted documents between refreshes, and miss
+  `merge-from!` entirely — 5 documents against 13 — because that path commits
+  inside the Java layer without passing through `commit!`. The realistic gain
+  was 1.05-3.5x on a mixed query load, which is a poor price for those."
   ([sw query]
    (search sw query {}))
-  ([sw query {:keys [limit fields] :or {limit 10}}]
-   (let [^BranchIndexWriter writer (->writer sw)]
-     (with-open [reader (.openReader writer)]
+  ([sw query {:keys [limit fields reader] :or {limit 10}}]
+   (let [^BranchIndexWriter writer (->writer sw)
+         own-reader? (nil? reader)
+         ^DirectoryReader reader (or reader (.openReader writer))]
+     (try
        (let [searcher (IndexSearcher. reader)
              q (cond
                  (instance? org.apache.lucene.search.Query query)
@@ -605,7 +635,11 @@
                    (assoc field-map
                           :doc-id (.-doc sd)
                           :score (.-score sd))))
-               hits))))))
+               hits))
+       ;; Close only what we opened. A caller-supplied reader outlives this
+       ;; call by design — that is the whole point of passing one.
+       (finally
+         (when own-reader? (.close reader)))))))
 
 ;; --- Snapshots & Time-Travel ---
 

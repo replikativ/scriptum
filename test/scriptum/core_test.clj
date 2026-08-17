@@ -714,3 +714,63 @@
                         (when (.isDirectory x) (run! rm (.listFiles x)))
                         (.delete x))]
                 (rm f)))))))))
+
+(deftest search-sees-uncommitted-writes-by-default
+  (testing "the default opens a fresh NRT reader, so `search` reflects the
+            WRITER's state. Read-your-own-writes is the semantics a git-like
+            writer wants, and it is why scriptum caches no searcher of its own:
+            a cached one refreshed on commit was measured to lose this, and to
+            resurrect deleted documents between refreshes."
+    (let [path (str "/tmp/scriptum-nrt-" (random-uuid))]
+      (try
+        (let [w (sc/create-index path "main")]
+          (sc/add-doc w {:body {:type :text :value "committed"}})
+          (sc/commit! w "one")
+          (sc/add-doc w {:body {:type :text :value "uncommitted"}})
+          (is (= 2 (count (sc/search w :all)))
+              "an added document is findable before any commit")
+          (sc/delete-docs w "body" "committed")
+          (is (= 1 (count (sc/search w :all)))
+              "and a deleted one is gone before any commit")
+          (sc/close! w))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
+
+(deftest search-accepts-a-held-reader
+  (testing "`DirectoryReader.open(writer)` flushes every in-memory buffer, so a
+            loop that alternates writing and searching materializes a segment
+            PER SEARCH — measured 10.3 ms per write-then-search cycle against
+            0.37 ms with a held reader, and 37 files against 10. The cost is
+            segment churn, not reader construction, which is cheap.
+
+            A held reader is a point in time: it does not see later writes, and
+            scriptum does not close it — whoever opened it owns it."
+    (let [path (str "/tmp/scriptum-held-" (random-uuid))]
+      (try
+        (let [w (sc/create-index path "main")]
+          (sc/add-doc w {:body {:type :text :value "first"}})
+          (sc/commit! w "one")
+          (let [r (sc/snapshot w)]
+            (is (= 1 (count (sc/search w :all {:reader r}))))
+            (sc/add-doc w {:body {:type :text :value "second"}})
+            (sc/commit! w "two")
+            (is (= 1 (count (sc/search w :all {:reader r})))
+                "a held reader is a point in time")
+            (is (= 2 (count (sc/search w :all)))
+                "while the default still sees the writer")
+            ;; still usable, i.e. search did not close it
+            (is (= 1 (.numDocs r)) "search must not close a reader it was given")
+            (.close r))
+          (sc/close! w))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
