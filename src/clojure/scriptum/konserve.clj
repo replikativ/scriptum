@@ -1006,6 +1006,50 @@
   (k/update store branches-key #(disj (or % #{}) branch) {:sync? true})
   nil)
 
+(defn reachable
+  "One walk of the branch pointers: `{:known :snapshots :addresses}`.
+
+  THE SINGLE PLACE THE ROOT SET IS DERIVED, so every collector agrees on it.
+  `mark` treats `extra-snapshots` as hints and `gc-cache!` did not, because
+  `gc-cache!` reached the pointers through `reachable-addresses` instead —
+  which still resolved a vanished extra through `read-snapshot` and threw. The
+  documented usage was the failing one: an embedder whose held list lags by a
+  single entry got a `gc!` that worked and a `gc-cache!` that threw every time,
+  so the local pool was never reclaimed — exactly the unbounded-cache failure
+  `gc-cache!` exists to prevent, reported as a branch-pointer error.
+
+  Reading the pointers ONCE also matters: two walks let a commit land between
+  them, leaving a snapshot whitelisted whose blobs had already been swept."
+  ([store] (reachable store nil))
+  ([store extra-snapshots]
+   (let [known (branches store)
+         pointers (into {} (keep (fn [b] (when-let [a (branch-snapshot store b)] [b a])))
+                        known)
+         ;; Branch pointers are scriptum's own: a dangling one is corruption,
+         ;; and it names the branch so an operator can act on it.
+         branch-files (into {}
+                            (map (fn [[b a]]
+                                   [a (try (read-snapshot store a)
+                                           (catch clojure.lang.ExceptionInfo e
+                                             (throw (ex-info
+                                                     (str "scriptum: branch " b " points at "
+                                                          "snapshot " a ", which is not in the "
+                                                          "store. Delete the branch to restore "
+                                                          "collection.")
+                                                     {:branch b :address a} e))))]))
+                            pointers)
+         ;; Extras are hints from a holder that is not scriptum; one that has
+         ;; gone is skipped.
+         extra-files (into {} (keep (fn [a]
+                                      (when-let [m (k/get store (snapshot-key a) nil
+                                                          {:sync? true})]
+                                        [a m])))
+                           extra-snapshots)
+         files (merge branch-files extra-files)]
+     {:known known
+      :snapshots (set (keys files))
+      :addresses (into #{} (mapcat vals) (vals files))})))
+
 (defn reachable-snapshots
   "Snapshot addresses reachable from the branch pointers, plus `extra`.
 
@@ -1017,15 +1061,13 @@
   names is collected out from under them."
   ([store] (reachable-snapshots store nil))
   ([store extra]
-   (into (set extra) (keep #(branch-snapshot store %)) (branches store))))
+   (:snapshots (reachable store extra))))
 
 (defn reachable-addresses
   "Every blob address named by a reachable snapshot — the GC root set."
   ([store] (reachable-addresses store nil))
   ([store extra-snapshots]
-   (into #{}
-         (mapcat #(vals (read-snapshot store %)))
-         (reachable-snapshots store extra-snapshots))))
+   (:addresses (reachable store extra-snapshots))))
 
 (defn mark
   "Every store key scriptum needs kept — the mark half of a mark-and-sweep.
@@ -1059,15 +1101,7 @@
   stops a long history accumulating one tree per commit."
   ([store] (mark store nil))
   ([store extra-snapshots]
-   ;; ONE walk, feeding both halves. Reading the pointers twice — once for the
-   ;; snapshot roots and again for the blob roots — let a commit land in between,
-   ;; so the snapshot set came from the OLD pointers and the blob set from the
-   ;; NEW ones. The live branch was never the victim (the blob walk is second, so
-   ;; never the older of the two), but the superseded snapshot stayed whitelisted
-   ;; while the blobs it names were swept: a root that is re-protected every
-   ;; cycle, never reclaimed, and fails anything that resolves it from a cold
-   ;; cache. Reproduced, so this is not a tidiness argument.
-   (let [known (branches store)]
+   (let [{:keys [known snapshots addresses]} (reachable store extra-snapshots)]
      ;; AN EMPTY REGISTRY OVER A NON-EMPTY KEYSPACE IS DRIFT, NOT AN EMPTY INDEX,
      ;; and the difference is the whole store. `sweep!` is allow-list, so marking
      ;; from a registry that has lost its entries whitelists nothing and deletes
@@ -1080,34 +1114,10 @@
                               "from this would delete the whole index. Run "
                               "`repair-branches!` first.")
                          {:orphans (set orphans)}))))
-     (let [pointers (into {} (keep (fn [b] (when-let [a (branch-snapshot store b)] [b a])))
-                          known)
-           ;; Attribute a dangling pointer to its branch. `read-snapshot` alone
-           ;; reports only the address, which on a store with many branches
-           ;; leaves an operator no way to know which one to delete.
-           branch-files (into {}
-                              (map (fn [[b a]]
-                                     [b (try (read-snapshot store a)
-                                             (catch clojure.lang.ExceptionInfo e
-                                               (throw (ex-info
-                                                       (str "scriptum: branch " b " points at "
-                                                            "snapshot " a ", which is not in the "
-                                                            "store. Delete the branch to restore "
-                                                            "collection.")
-                                                       {:branch b :address a} e))))]))
-                              pointers)
-           ;; Hints, so a vanished one is skipped.
-           extra-files (into {} (keep (fn [a]
-                                        (when-let [m (k/get store (snapshot-key a) nil
-                                                            {:sync? true})]
-                                          [a m])))
-                             extra-snapshots)
-           snapshots (into (set (vals pointers)) (keys extra-files))]
-       (-> #{branches-key format-key}
-           (into (map manifest-key) known)
-           (into (map snapshot-key) snapshots)
-           (into (comp (mapcat vals) (map blob-key))
-                 (concat (vals branch-files) (vals extra-files))))))))
+     (-> #{branches-key format-key}
+         (into (map manifest-key) known)
+         (into (map snapshot-key) snapshots)
+         (into (map blob-key) addresses)))))
 
 (defn gc-cache!
   "Delete pooled blobs no branch's manifest names, and views of branches that
@@ -1150,9 +1160,9 @@
    ;; pool and every view — recoverable, since the cache is derived, but a full
    ;; re-download rather than a no-op.
    (ensure-format! store)
-   (let [live (into #{} (map str) (reachable-addresses store extra-snapshots))
-         live-snapshots (into #{} (map str) (reachable-snapshots store extra-snapshots))
-         known (branches store)
+   (let [{:keys [known snapshots addresses]} (reachable store extra-snapshots)
+         live (into #{} (map str) addresses)
+         live-snapshots (into #{} (map str) snapshots)
          ;; THE LOCK IS THE LIVENESS TEST, not the registry. Registry membership
          ;; cannot tell a dead branch from a live writer whose branch drifted out
          ;; of the registry, and the two want opposite treatment: the first

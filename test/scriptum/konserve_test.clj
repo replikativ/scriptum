@@ -1141,3 +1141,26 @@
             "every key the metadata index needs is named, PSS nodes included")
         (is (every? #(not (and (vector? %) (= :scriptum (first %)))) marked)
             "and none of them carry a prefix scriptum.konserve could match on")))))
+
+(deftest cache-collection-tolerates-a-stale-external-snapshot
+  (testing "REGRESSION in a fix: `mark` was relaxed to treat `extra-snapshots`
+            as hints, but `gc-cache!` reached the pointers through
+            `reachable-addresses` instead, which still resolved a vanished extra
+            and threw. The DOCUMENTED usage was the failing one — an embedder
+            whose held list lags by one entry got a `gc!` that worked and a
+            `gc-cache!` that threw every time, so the local pool was never
+            reclaimed. That is the unbounded-cache failure `gc-cache!` exists to
+            prevent, reported as a branch-pointer error."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "live"))
+      (let [gone (random-uuid)]
+        (is (map? (sk/gc-cache! s (cache) #{gone}))
+            "a vanished hint must not stop cache collection")
+        (is (set? (sk/mark s #{gone})) "as it does not stop marking")
+        (is (= (sk/reachable-snapshots s #{gone})
+               (sk/reachable-snapshots s))
+            "and the two paths agree on what is reachable"))
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (is (= #{"live"} (bodies d)))))))
