@@ -33,10 +33,20 @@
   from the set of live manifests removes `BranchDeletionPolicy`'s ref-counting.
 
   CONCURRENCY, WITHIN ONE RUNTIME, follows konserve's contract: one writer per
-  branch, readers unconstrained. Per-branch view directories give that for
-  free — Lucene's own `write.lock` lives in the view, so a second writer on the
-  same branch fails loudly with LockObtainFailedException while writers on
-  different branches proceed in parallel.
+  branch, readers unconstrained. Lucene's own `write.lock` lives in the
+  per-branch view, so a second writer fails loudly with
+  LockObtainFailedException while writers on different branches proceed in
+  parallel.
+
+  THAT LOCK'S SCOPE IS THE CACHE DIRECTORY, NOT THE MACHINE, and `cache` is a
+  caller-supplied string with no enforced relationship to branch identity. Two
+  writers on one branch with DIFFERENT cache paths — a per-process temp cache,
+  a container remount, a symlink — both succeed, on one machine, silently.
+  Within a single cache path it is solid: NativeFSLockFactory keeps a
+  process-wide held set (so a second writer in this JVM is refused by name) and
+  an OS advisory lock the kernel releases on abnormal exit (so another process
+  on the same machine is refused too). Nothing spans machines: the lock file is
+  in a local cache, so there is no shared file to contend on.
 
   ACROSS RUNTIMES that is only half true, and the halves differ:
 
@@ -82,8 +92,9 @@
             [konserve.utils :as ku])
   (:import [org.replikativ.scriptum ContentHash]
            [org.apache.lucene.index IndexWriter]
-           [org.apache.lucene.store Directory FilterDirectory MMapDirectory]
-           [java.nio.file Paths Files LinkOption FileAlreadyExistsException NoSuchFileException]))
+           [org.apache.lucene.store AlreadyClosedException Directory FilterDirectory MMapDirectory]
+           [java.nio.file Paths Files LinkOption StandardCopyOption
+            FileAlreadyExistsException NoSuchFileException]))
 
 ;; =============================================================================
 ;; Keys
@@ -232,11 +243,30 @@
   [store cache branch name address]
   (let [pf (ensure-pooled! store cache address)
         vf (view-file cache branch name)]
+    (io/make-parents vf)
     (when (and (.exists vf) (not (same-inode? vf pf)))
-      (.delete vf))
+      ;; Replace ATOMICALLY. Unlinking and re-linking leaves a window where the
+      ;; name does not exist, and `openInput` is an unconstrained-concurrency
+      ;; path — a reader landing in that window gets NoSuchFileException for a
+      ;; file the manifest names. A link under a private name, moved into place,
+      ;; is never absent.
+      (let [tmp (io/file (.getParentFile vf) (str "." name "." (random-uuid) ".link"))]
+        (Files/createLink (->path (.getPath tmp)) (->path (.getPath pf)))
+        (Files/move (->path (.getPath tmp)) (->path (.getPath vf))
+                    (into-array java.nio.file.CopyOption
+                                [StandardCopyOption/REPLACE_EXISTING
+                                 StandardCopyOption/ATOMIC_MOVE]))))
     (when-not (.exists vf)
-      (io/make-parents vf)
-      (Files/createLink (->path (.getPath vf)) (->path (.getPath pf))))
+      ;; Losing this race is SUCCESS, not failure. Two readers materializing the
+      ;; same file both see it absent and both link; the loser used to get
+      ;; FileAlreadyExistsException thrown straight out of `openInput`, which is
+      ;; the createOutput signal and a contract violation there — Directory
+      ;; permits only NoSuchFile/FileNotFound or a plain IOException. Measured at
+      ;; 38 failures over 24 threads opening a cold forked branch.
+      (try
+        (Files/createLink (->path (.getPath vf)) (->path (.getPath pf)))
+        (catch FileAlreadyExistsException _
+          nil)))
     vf))
 
 (defn- pool!
@@ -327,7 +357,21 @@
          ;; is not enough: `sync`, `rename` and `deleteFile` each read the
          ;; manifest, derive a new one, put it in the store and only then
          ;; install it — three steps that interleave and lose one of two edits.
-         lock (Object.)]
+         lock (Object.)
+         ;; Our own closed flag. `FilterDirectory` delegates `ensureOpen` to the
+         ;; live directory, which is right for anything that touches it — but
+         ;; `listAll`, `deleteFile`, `syncMetaData` and `fileLength` all reach
+         ;; the STORE first and can return, or write, without ever touching
+         ;; `live`. So nothing checked, and `deleteFile` on a closed Directory
+         ;; silently wrote a new manifest with the file's reference removed,
+         ;; leaving `segments_N` naming a blob no manifest reaches. The TCK's
+         ;; `testDetectClose` probes only `createOutput`, which does reach
+         ;; `live`, which is why 57/57 passed.
+         closed? (atom false)
+         ensure-open! (fn []
+                        (when @closed?
+                          (throw (AlreadyClosedException.
+                                  (str "scriptum: directory for branch " branch " is closed")))))]
      ;; NOT materialized eagerly. `openInput` and `fileLength` link a file into
      ;; the view on first touch, so fetching the whole manifest here only moved
      ;; that cost to open time and paid it for files no query ever reads. On a
@@ -354,6 +398,7 @@
      ;; (testIsLoaded), and which would also hide preload/madvise from Lucene.
      (proxy [FilterDirectory] [live]
        (listAll []
+         (ensure-open!)
          ;; Re-read rather than serving the cached manifest: this is what
          ;; DirectoryReader.openIfChanged consults, so a stale manifest leaves a
          ;; long-lived reader permanently blind to new commits. Cheap and right
@@ -374,6 +419,7 @@
            (into-array String (sort (into (set (keys @manifest)) @session)))))
 
        (fileLength [name]
+         (ensure-open!)
          (when-let [a (get @manifest name)] (link-into-view! store cache branch name a))
          (.fileLength live name))
 
@@ -410,6 +456,15 @@
          ;; blobs go in first and only the manifest write makes them reachable.
          ;; A collection landing in between would sweep blobs the manifest is
          ;; about to reference. See konserve.gc-guard.
+         ;; MATERIALIZE BEFORE FSYNC. `.sync` opens each name for WRITE, so a
+         ;; name the manifest holds but this view has not touched is absent and
+         ;; throws NoSuchFileException. IndexWriter.startCommit syncs every file
+         ;; of the commit, inherited ones included, and today they happen to be
+         ;; materialized by the writer's constructor — an accidental invariant
+         ;; Lucene does not promise. `rename` already orders it this way.
+         (doseq [^String n names]
+           (when-let [a (get @manifest n)]
+             (link-into-view! store cache branch n a)))
          (.sync live names)
          (let [write! (fn []
                         (locking lock
@@ -439,7 +494,7 @@
              (guard/with-unreferenced-writes store-id (write!))
              (write!))))
 
-       (syncMetaData [] nil)
+       (syncMetaData [] (ensure-open!) nil)
 
        (rename [source dest]
          ;; Materialize first: nothing else guarantees `source` is local now
@@ -467,6 +522,7 @@
                (reset! manifest m)))))
 
        (deleteFile [name]
+         (ensure-open!)
          ;; Deleting what is not there is an error, not a no-op: Lucene relies
          ;; on it to notice that its bookkeeping and the directory disagree.
          (when-not (has? name)
@@ -490,7 +546,9 @@
        ;; writers on different branches do not see each other. Exactly scriptum's
        ;; contract, with no lock of our own.
        (obtainLock [name] (.obtainLock live name))
-       (close [] (.close live))
+       (close []
+         (reset! closed? true)
+         (.close live))
        (getPendingDeletions [] (.getPendingDeletions live))))))
 
 ;; =============================================================================

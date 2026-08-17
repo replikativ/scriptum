@@ -25,7 +25,7 @@
            [org.apache.lucene.document Document TextField StringField Field$Store]
            [org.apache.lucene.index IndexWriter IndexWriterConfig DirectoryReader Term]
            [org.apache.lucene.search IndexSearcher]
-           [org.apache.lucene.store IOContext LockObtainFailedException]
+           [org.apache.lucene.store AlreadyClosedException IOContext LockObtainFailedException]
            [java.nio.file Files LinkOption Paths FileAlreadyExistsException]))
 
 (def ^:dynamic *root* nil)
@@ -525,3 +525,59 @@
       (is (= #{"main" "lost"} (sk/repair-branches! s))
           "the scan finds the manifest the registry forgot")
       (is (= #{"main" "lost"} (sk/branches s))))))
+
+(deftest concurrent-readers-may-materialize-the-same-file
+  (testing "REGRESSION: `link-into-view!` checked `.exists` then linked, so two
+            readers materializing one file both saw it absent and both linked —
+            and the loser got FileAlreadyExistsException thrown straight out of
+            `openInput`. That is the createOutput signal; Directory permits only
+            NoSuchFile/FileNotFound or a plain IOException there.
+
+            Measured at 38 failures over 24 threads opening a cold forked
+            branch. Losing the race is SUCCESS: the file is there either way.
+
+            The TCK cannot see this — it creates every file through
+            `createOutput`, so names live in `session` and never take the
+            materialization path at all."
+    (let [s (store)]
+      (with-open [d (sk/konserve-directory s (cache) "main")]
+        (add-doc! d "shared"))
+      (sk/fork! s "main" "b")
+      (let [errs (atom [])
+            cold (str *root* "/cold")]
+        (run! deref
+              (doall (for [_ (range 16)]
+                       (future
+                         (try
+                           (with-open [d (sk/konserve-directory s cold "b")]
+                             (doseq [^String n (vec (.listAll d))]
+                               (.close (.openInput d n IOContext/DEFAULT))))
+                           (catch Throwable t (swap! errs conj t)))))))
+        (is (empty? @errs)
+            (str "concurrent materialization must not fail: "
+                 (pr-str (map #(.getSimpleName (class %)) @errs))))))))
+
+(deftest a-closed-directory-cannot-rewrite-the-manifest
+  (testing "REGRESSION: `listAll`, `deleteFile`, `syncMetaData` and `fileLength`
+            all reach the STORE before touching the live directory, so
+            FilterDirectory's delegated `ensureOpen` never fired for them. A
+            `deleteFile` after `close` therefore wrote a NEW manifest with the
+            file's reference removed, leaving `segments_N` naming a blob no
+            manifest reaches — the branch unopenable and the blob collectable.
+
+            `testDetectClose` probes only `createOutput`, which does reach the
+            live directory, which is why the suite passed."
+    (let [s (store)
+          d (sk/konserve-directory s (cache) "main")]
+      (add-doc! d "content")
+      (let [before (sk/read-manifest s "main")
+            cfs (first (filter #(clojure.string/ends-with? % ".cfs") (keys before)))]
+        (.close d)
+        (doseq [[label f] [["listAll" #(.listAll d)]
+                           ["deleteFile" #(.deleteFile d cfs)]
+                           ["syncMetaData" #(.syncMetaData d)]
+                           ["fileLength" #(.fileLength d cfs)]]]
+          (is (thrown? AlreadyClosedException (f))
+              (str label " must refuse once the directory is closed")))
+        (is (= before (sk/read-manifest s "main"))
+            "and nothing may have reached the durable manifest")))))
