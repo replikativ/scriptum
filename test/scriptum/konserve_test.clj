@@ -883,6 +883,101 @@
                             (sk/fork! s "main" "pool"))
           "and forking to one must be refused too"))))
 
+(deftest a-failed-fork-does-not-deregister-a-branch-it-found
+  (testing "REGRESSION in a fix: the rollback added to stop `fork!` leaving a
+            dangling pointer deregistered `to` unconditionally. A branch can
+            already be registered and merely uncommitted — `konserve-directory`
+            registers at open — and the `k/exists?` guard cannot see that,
+            because such a branch has no manifest key. Dropping it from the
+            registry hands the next `gc!` a branch nothing roots, and it sweeps
+            the manifest and every blob: the exact failure `register-branch!`
+            warns about, caused by a rollback meant to prevent a smaller one."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "src" sid)]
+        (add-doc! d "source"))
+      ;; `victim` exists in the registry but has not committed yet
+      (sk/register-branch! s "victim")
+      (is (contains? (sk/branches s) "victim") "precondition: registered")
+      ;; force the fork to fail every attempt by removing the source's snapshot
+      (let [a (sk/branch-snapshot s "src")]
+        (k/dissoc s (sk/snapshot-key a) {:sync? true})
+        (is (thrown? clojure.lang.ExceptionInfo (sk/fork! s "src" "victim"))))
+      (is (contains? (sk/branches s) "victim")
+          "a failed fork must not deregister a branch it did not register"))))
+
+(deftest a-pre-registry-store-is-refused-not-wiped
+  (testing "REGRESSION in a fix: freshness was probed via the branch registry,
+            but the registry was introduced AFTER the v1 manifest layout. A v1
+            store older than the registry has manifests and no registry, so it
+            read as fresh, got stamped v2, and the next `gc!` swept it to
+            nothing — and self-sealingly, since the stamp makes it undetectable
+            afterwards. Freshness means NO MANIFESTS."
+    (let [s (store)]
+      ;; a v1 store from before the registry existed: a manifest, no registry
+      (k/assoc s (sk/manifest-key "main") {"segments_1" (random-uuid)} {:sync? true})
+      (is (nil? (k/get s sk/branches-key nil {:sync? true})) "precondition: no registry")
+      (is (nil? (k/get s sk/format-key nil {:sync? true})) "precondition: no stamp")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"predates"
+                            (sk/konserve-directory s (cache) "main")))
+      (is (nil? (k/get s sk/format-key nil {:sync? true}))
+          "and refusing must not stamp it, or the evidence is destroyed"))))
+
+(deftest marking-refuses-an-empty-registry-over-a-live-keyspace
+  (testing "`sweep!` is allow-list, so marking from a registry that has lost its
+            entries whitelists nothing and deletes every branch — which is how
+            the registry became a GC root in the first place. An empty registry
+            over a non-empty keyspace is drift, not an empty index."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "precious"))
+      (k/assoc s sk/branches-key #{} {:sync? true})
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"registry is empty"
+                            (sk/gc! s sid))
+          "collection refuses rather than wiping")
+      (sk/repair-branches! s)
+      (sk/gc! s sid)
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (is (= #{"precious"} (bodies d)) "and repair restores it")))))
+
+(deftest a-stale-external-snapshot-is-ignored-not-fatal
+  (testing "`extra-snapshots` are HINTS from a holder that is not scriptum, and
+            datahike's key-map is exactly where superseded addresses collect.
+            One stale entry must not stop collection for the whole store — that
+            would punish the caller `mark` was exported for. A dangling BRANCH
+            pointer is the opposite case: scriptum owns it, and it is corruption."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "live"))
+      (let [gone (random-uuid)]
+        (is (set? (sk/mark s #{gone})) "a vanished hint is skipped")
+        (let-the-millisecond-turn-over!)
+        (is (sk/gc! s sid (ku/now) #{gone}) "and collection still runs"))
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (is (= #{"live"} (bodies d)))))))
+
+(deftest a-dangling-branch-pointer-names-its-branch
+  (testing "the operator has to know WHICH branch to delete. `read-snapshot`
+            alone reports only the address, which on a store with many branches
+            is not actionable."
+    (let [s (store)
+          sid (random-uuid)]
+      (with-open [d (sk/konserve-directory s (cache) "main" sid)]
+        (add-doc! d "healthy"))
+      (sk/fork! s "main" "broken")
+      (with-open [d (sk/konserve-directory s (cache) "broken" sid)]
+        (add-doc! d "doomed"))
+      (k/dissoc s (sk/snapshot-key (sk/branch-snapshot s "broken")) {:sync? true})
+      (let [e (try (sk/mark s) nil (catch clojure.lang.ExceptionInfo e e))]
+        (is (some? e))
+        (is (= "broken" (:branch (ex-data e))) "the failure names the branch")
+        (is (re-find #"Delete the branch" (ex-message e)) "and says what to do"))
+      ;; and that is the recovery
+      (sk/delete-branch! s "broken")
+      (is (set? (sk/mark s)) "collection works again once it is gone"))))
+
 (deftest concurrent-readers-may-materialize-the-same-file
   (testing "REGRESSION: `link-into-view!` checked `.exists` then linked, so two
             readers materializing one file both saw it absent and both linked —

@@ -237,16 +237,28 @@
                              " — layout 1 was never released, so there is no migration"))
                       {:store-version v :supported format-version}))
 
-      ;; Unstamped: fresh, or written before the stamp existed.
-      (k/exists? store branches-key {:sync? true})
-      (throw (ex-info (str "scriptum: this store predates manifest layout " format-version
-                           " and cannot be read — layout 1 was never released, so there is "
-                           "no migration from it")
-                      {:store-version :pre-stamp :supported format-version}))
-
+      ;; Unstamped: fresh, or written before the stamp existed. FRESH MEANS NO
+      ;; MANIFESTS, and it has to be asked that way rather than by probing the
+      ;; branch registry: the registry was introduced AFTER the v1 manifest
+      ;; layout, so a v1 store written before it has manifests and no registry
+      ;; and would read as fresh — get stamped v2, and be swept to nothing by
+      ;; the next `gc!`, since a v1 map is not a snapshot address and resolves
+      ;; to no blobs. Self-sealing, too: the stamp it writes makes the store
+      ;; undetectable afterwards.
+      ;;
+      ;; A full `k/keys` scan, and affordable precisely where it runs — an
+      ;; unstamped store is either genuinely empty (the scan sees nothing) or
+      ;; one this version refuses to touch anyway.
       :else
-      (do (k/assoc store format-key {:version format-version} {:sync? true})
-          format-version))))
+      (if-let [existing (seq (manifest-branches store))]
+        (throw (ex-info (str "scriptum: this store predates manifest layout " format-version
+                             " and cannot be read — layout 1 was never released, so there is "
+                             "no migration from it")
+                        {:store-version :pre-stamp
+                         :supported format-version
+                         :branches (set existing)}))
+        (do (k/assoc store format-key {:version format-version} {:sync? true})
+            format-version)))))
 
 (defn read-manifest
   "The branch's `{lucene-filename -> address}` map, or `{}` when it has none.
@@ -521,7 +533,13 @@
    ;; inverse of the values-then-pointer rule.
    (ensure-format! store)
    (register-branch! store branch)
-   (let [live (MMapDirectory/open (->path (str cache "/" branch)))
+   ;; READ THE BRANCH BEFORE OPENING ANYTHING. `read-snapshot` throws on a branch
+   ;; whose snapshot is gone, and doing that after `MMapDirectory/open` leaked the
+   ;; directory — nothing closes it on the way out, and its mapped arena outlives
+   ;; the failed call.
+   (let [initial (let [a (branch-snapshot store branch)]
+                   {:pointer a :files (if a (read-snapshot store a) {})})
+         live (MMapDirectory/open (->path (str cache "/" branch)))
          ;; ONE atom holding BOTH halves, and that is a correctness requirement
          ;; rather than tidiness. As two atoms, `listAll` claimed the pointer with
          ;; one `compare-and-set!` and installed the map with a second, and a
@@ -531,8 +549,7 @@
          ;; one it holds, re-reads nothing, and the Directory is blind to every
          ;; subsequent commit. That is precisely the failure the CAS was added to
          ;; prevent, reintroduced one level up. One atom, one CAS, no window.
-         state (atom (let [a (branch-snapshot store branch)]
-                       {:pointer a :files (if a (read-snapshot store a) {})}))
+         state (atom initial)
          files-now (fn [] (:files @state))
          ;; Has the in-memory map moved off `pointer`? Set by every edit,
          ;; cleared by the flip in `syncMetaData`. A flag rather than comparing
@@ -920,30 +937,41 @@
   ;; afterwards catches exactly that: if the source still names the address and
   ;; the snapshot is still there, the pointer we wrote is a root and no
   ;; subsequent sweep can take it.
-  (loop [attempt 0]
-    (let [address (branch-snapshot store from)]
-      (register-branch! store to)        ; registry first — see register-branch!
-      (if-not address
-        {}
-        (do
-          (k/assoc store (manifest-key to) address {:sync? true})
-          (if (and (= address (branch-snapshot store from))
-                   (k/exists? store (snapshot-key address) {:sync? true}))
-            (read-snapshot store address)
-            (if (< attempt 3)
-              (recur (inc attempt))
-              ;; LEAVE NO DANGLING POINTER BEHIND. `mark` resolves every branch
-              ;; pointer, and a branch naming a snapshot that is gone makes it
-              ;; throw — so one abandoned fork would disable collection for the
-              ;; whole store until someone found and deleted the branch. Undo
-              ;; before failing: pointer first, then the registry, the same
-              ;; order `delete-branch!` uses and for the same reason.
-              (do (k/dissoc store (manifest-key to) {:sync? true})
-                  (k/update store branches-key #(disj (or % #{}) to) {:sync? true})
-                  (throw (ex-info (str "scriptum: could not fork " from " to " to
-                                       " — its snapshot was collected mid-fork "
-                                       (inc attempt) " times")
-                                  {:from from :to to :address address}))))))))))
+  ;; ROLL BACK ONLY WHAT THIS CALL CREATED. `register-branch!` returns true only
+  ;; when it actually wrote, and that answer has to be taken ONCE, outside the
+  ;; retry loop. Deregistering unconditionally destroys a branch this fork did
+  ;; not create: `to` may already be registered and merely uncommitted — which is
+  ;; exactly what `konserve-directory` leaves behind, since it registers at open
+  ;; — and the `k/exists?` guard above cannot see that, because a registered
+  ;; branch with no commit has no manifest key. Dropping it from the registry
+  ;; then hands the next `gc!` a branch nothing roots, and it sweeps the manifest
+  ;; and every blob: the precise failure `register-branch!`'s docstring exists to
+  ;; warn about, reintroduced by a rollback meant to prevent a smaller one.
+  (let [registered-here? (register-branch! store to)] ; registry first — see there
+    (loop [attempt 0]
+      (let [address (branch-snapshot store from)]
+        (if-not address
+          {}
+          (do
+            (k/assoc store (manifest-key to) address {:sync? true})
+            (if (and (= address (branch-snapshot store from))
+                     (k/exists? store (snapshot-key address) {:sync? true}))
+              (read-snapshot store address)
+              (if (< attempt 3)
+                (recur (inc attempt))
+                ;; LEAVE NO DANGLING POINTER BEHIND. `mark` resolves every branch
+                ;; pointer, and a branch naming a snapshot that is gone makes it
+                ;; throw — so one abandoned fork would disable collection for the
+                ;; whole store until someone found and deleted the branch. Undo
+                ;; before failing: pointer first, then the registry, the same
+                ;; order `delete-branch!` uses and for the same reason.
+                (do (k/dissoc store (manifest-key to) {:sync? true})
+                    (when registered-here?
+                      (k/update store branches-key #(disj (or % #{}) to) {:sync? true}))
+                    (throw (ex-info (str "scriptum: could not fork " from " to " to
+                                         " — its snapshot was collected mid-fork "
+                                         (inc attempt) " times")
+                                    {:from from :to to :address address})))))))))))
 
 (defn delete-branch!
   "Forget `branch`. Blobs it referenced survive until `gc!` finds them
@@ -995,8 +1023,15 @@
   other.
 
   `extra-snapshots` names index states an external holder still references; see
-  `reachable-snapshots`. Superseded snapshots are deliberately NOT included —
-  collecting them is what stops a long history accumulating one tree per commit."
+  `reachable-snapshots`. They are treated as HINTS: one that no longer exists is
+  ignored rather than fatal, because the holder is not scriptum and its list is
+  expected to lag. datahike's key-map is exactly where superseded addresses
+  collect, and making one stale entry stop collection for the whole store would
+  punish the caller `mark` was exported for. A dangling BRANCH pointer is the
+  opposite case — scriptum owns that, and it is corruption.
+
+  Superseded snapshots are deliberately NOT included; collecting them is what
+  stops a long history accumulating one tree per commit."
   ([store] (mark store nil))
   ([store extra-snapshots]
    ;; ONE walk, feeding both halves. Reading the pointers twice — once for the
@@ -1007,13 +1042,47 @@
    ;; while the blobs it names were swept: a root that is re-protected every
    ;; cycle, never reclaimed, and fails anything that resolves it from a cold
    ;; cache. Reproduced, so this is not a tidiness argument.
-   (let [known (branches store)
-         snapshots (into (set extra-snapshots) (keep #(branch-snapshot store %)) known)
-         files (map #(read-snapshot store %) snapshots)]
-     (-> #{branches-key format-key}
-         (into (map manifest-key) known)
-         (into (map snapshot-key) snapshots)
-         (into (comp (mapcat vals) (map blob-key)) files)))))
+   (let [known (branches store)]
+     ;; AN EMPTY REGISTRY OVER A NON-EMPTY KEYSPACE IS DRIFT, NOT AN EMPTY INDEX,
+     ;; and the difference is the whole store. `sweep!` is allow-list, so marking
+     ;; from a registry that has lost its entries whitelists nothing and deletes
+     ;; every branch — which is how the registry came to be a GC root in the
+     ;; first place. Cheap because it only scans when the registry is empty.
+     (when (empty? known)
+       (when-let [orphans (seq (manifest-branches store))]
+         (throw (ex-info (str "scriptum: the branch registry is empty but " (count orphans)
+                              " manifest(s) exist — refusing to mark, because sweeping "
+                              "from this would delete the whole index. Run "
+                              "`repair-branches!` first.")
+                         {:orphans (set orphans)}))))
+     (let [pointers (into {} (keep (fn [b] (when-let [a (branch-snapshot store b)] [b a])))
+                          known)
+           ;; Attribute a dangling pointer to its branch. `read-snapshot` alone
+           ;; reports only the address, which on a store with many branches
+           ;; leaves an operator no way to know which one to delete.
+           branch-files (into {}
+                              (map (fn [[b a]]
+                                     [b (try (read-snapshot store a)
+                                             (catch clojure.lang.ExceptionInfo e
+                                               (throw (ex-info
+                                                       (str "scriptum: branch " b " points at "
+                                                            "snapshot " a ", which is not in the "
+                                                            "store. Delete the branch to restore "
+                                                            "collection.")
+                                                       {:branch b :address a} e))))]))
+                              pointers)
+           ;; Hints, so a vanished one is skipped.
+           extra-files (into {} (keep (fn [a]
+                                        (when-let [m (k/get store (snapshot-key a) nil
+                                                            {:sync? true})]
+                                          [a m])))
+                             extra-snapshots)
+           snapshots (into (set (vals pointers)) (keys extra-files))]
+       (-> #{branches-key format-key}
+           (into (map manifest-key) known)
+           (into (map snapshot-key) snapshots)
+           (into (comp (mapcat vals) (map blob-key))
+                 (concat (vals branch-files) (vals extra-files))))))))
 
 (defn gc-cache!
   "Delete pooled blobs no branch's manifest names, and views of branches that
@@ -1059,11 +1128,22 @@
    (let [live (into #{} (map str) (reachable-addresses store extra-snapshots))
          live-snapshots (into #{} (map str) (reachable-snapshots store extra-snapshots))
          known (branches store)
+         ;; Returns whether it DID WORK, not whether the directory vanished.
+         ;; `.delete` on a directory still holding `write.lock` is false, and
+         ;; using that as the predicate reported `:views 0` for a call that had
+         ;; just emptied a view and the entire pool — the number a caller reads
+         ;; to decide whether it reclaimed space.
          rm-dir! (fn [^java.io.File d]
-                   (run! #(.delete ^java.io.File %)
-                         (remove #(= IndexWriter/WRITE_LOCK_NAME (.getName ^java.io.File %))
-                                 (.listFiles d)))
-                   (.delete d))          ; fails while write.lock remains, by design
+                   (let [removable (remove #(= IndexWriter/WRITE_LOCK_NAME
+                                               (.getName ^java.io.File %))
+                                           (.listFiles d))]
+                     (run! #(.delete ^java.io.File %) removable)
+                     ;; `.delete` fails while write.lock remains, by design — so
+                     ;; "did work" is either: we removed files, or the directory
+                     ;; itself went. An empty view (materialization is lazy, so a
+                     ;; branch never read has one) is deleted and must still count.
+                     (let [gone (.delete d)]
+                       (boolean (or (seq removable) gone)))))
          pool-dir (io/file cache "pool")
          blobs (if (.isDirectory pool-dir)
                  (count (filterv (fn [^java.io.File f]
