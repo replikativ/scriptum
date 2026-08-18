@@ -897,7 +897,7 @@
   `scriptum.core/retain!` and `scriptum.konserve/gc!`.
 
   before: java.time.Instant — delete commits older than this
-  Returns the number of commit points removed.
+  Returns the number of commit points removed."
   [sw ^Instant before]
   (when (store-backed? sw)
     ;; A store-backed index collects by reachability from the live manifests,
