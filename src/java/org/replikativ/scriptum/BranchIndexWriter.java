@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -81,6 +82,71 @@ public class BranchIndexWriter implements Closeable {
 
   private static final ObjectMapper JSON = new ObjectMapper();
 
+  /** The branch that "self-overlays" the base path in the directory-backed model. */
+  private static final String MAIN_BRANCH_NAME = "main";
+
+  /**
+   * What a branch may be called. A whitelist, because the name becomes a directory under {@code
+   * branches/} and several operations delete from that path.
+   *
+   * <p>The store-backed model has validated this since a review found that an empty name made a
+   * branch view the cache root and {@code ".."} escaped it entirely; the path-backed model had
+   * nothing. Here {@code ""} and {@code "."} put a branch's segments directly in {@code branches/},
+   * where {@code discoverBranches} cannot see them — so they were invisible to the fork guard and
+   * unprotected from a collection on main.
+   */
+  private static final java.util.regex.Pattern BRANCH_NAME =
+      java.util.regex.Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]*");
+
+  /**
+   * Reject only names that would escape or collide with the branch layout.
+   *
+   * <p>The bar for a name that ALREADY EXISTS: it has to resolve to a directory under {@code
+   * branches/} and nowhere else. Everything short of that is a naming preference, and released
+   * versions of scriptum accepted it.
+   */
+  private static void checkBranchPathSafe(String branchName) throws IOException {
+    if (branchName == null
+        || branchName.isEmpty()
+        || ".".equals(branchName)
+        || "..".equals(branchName)
+        || branchName.indexOf('/') >= 0
+        || branchName.indexOf('\\') >= 0
+        || branchName.indexOf('\u0000') >= 0) {
+      throw new IOException(
+          "scriptum: " + branchName + " is not a usable branch name; it would not resolve to a"
+              + " directory under branches/");
+    }
+  }
+
+  /** The stricter bar for a name being INVENTED, by {@code create} or {@code fork}. */
+  private static void checkBranchName(String branchName) throws IOException {
+    checkBranchPathSafe(branchName);
+    if (!BRANCH_NAME.matcher(branchName).matches()) {
+      throw new IOException(
+          "scriptum: "
+              + branchName
+              + " is not a usable branch name; it must match "
+              + BRANCH_NAME.pattern());
+    }
+  }
+
+  /**
+   * One lock per index root, so forks of one index serialize.
+   *
+   * <p>{@code fork} refuses an existing target, but the check and the write of the cloned commit
+   * point are not atomic together and the target's own write lock is only taken afterwards, when
+   * the IndexWriter is constructed. Two concurrent forks to one new name therefore both passed and
+   * the loser wrote its clone into a directory the winner owned, leaving it unreadable. Serializing
+   * is the same answer the store-backed model uses.
+   */
+  private static final java.util.concurrent.ConcurrentMap<String, Object> FORK_LOCKS =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static Object forkLock(Path basePath) {
+    return FORK_LOCKS.computeIfAbsent(basePath.toAbsolutePath().normalize().toString(), k -> new Object());
+  }
+
   private static final String COMMIT_TIMESTAMP_KEY = "scriptum.timestamp";
   private static final String COMMIT_MESSAGE_KEY = "scriptum.message";
   private static final String COMMIT_BRANCH_KEY = "scriptum.branch";
@@ -135,6 +201,46 @@ public class BranchIndexWriter implements Closeable {
   }
 
   /** Initialize lastCommitId from the latest existing commit's UUID. */
+  /**
+   * The generation of the newest commit point, after a commit has landed.
+   *
+   * <p>NOT {@code IndexWriter.commit()}'s return value, which is a SEQUENCE NUMBER — Lucene's
+   * ordering token for concurrent operations — and bears no relation to the {@code segments_N}
+   * generation. It was returned as {@code :generation} anyway, stored under that name by the
+   * metadata index and handed back by {@code find-generation}, so {@code open-reader-at} on it
+   * always failed: four commits reported 3, 6, 9, 12 where the generations were 1, 2, 3, 4.
+   * {@code gc!} then rebuilt the same entries from {@code listSnapshots} with real generations,
+   * so one key answered differently before and after a collection.
+   *
+   * <p>Falls back to the sequence number only when there is no commit point to read, which cannot
+   * happen after a successful commit.
+   */
+  private long lastCommitGeneration(long fallback) {
+    IndexCommit last = deletionPolicy.getLastCommit();
+    return last != null ? last.getGeneration() : fallback;
+  }
+
+  /**
+   * Restore the merkle root of the branch head, alongside its commit id.
+   *
+   * <p>Only {@code lastCommitId} was restored, so after reopening a crypto-hash index {@code
+   * getLastContentHash} answered null — and `scriptum.audit`'s `-merkle-root` with it — until the
+   * process happened to commit again.
+   */
+  private void initLastContentHash() {
+    if (!cryptoHash || lastCommitId == null || basePath == null) {
+      return;
+    }
+    try {
+      Map<String, Object> metadata = loadSegmentHashMetadata(lastCommitId);
+      if (metadata != null) {
+        lastContentHash = (String) metadata.get("content-hash");
+      }
+    } catch (IOException e) {
+      // leave null; the next commit recomputes it
+    }
+  }
+
   private void initLastCommitId() {
     IndexCommit last = deletionPolicy.getLastCommit();
     if (last != null) {
@@ -187,11 +293,78 @@ public class BranchIndexWriter implements Closeable {
    * @param cryptoHash if true, use merkle hashing for commits
    * @return a new BranchIndexWriter
    */
+  /**
+   * Open a writer over a Directory supplied by the caller, with no base path.
+   *
+   * <p>For a store-backed index, where a branch is a manifest in konserve rather than a directory
+   * under {@code branches/}. Everything a writer does to DOCUMENTS — add, update, delete, commit,
+   * search, open a reader — is pure Lucene and works unchanged over any Directory. What does not
+   * carry over is branch TOPOLOGY: {@code fork}, {@code discoverBranches} and {@code gc} all
+   * resolve paths beneath {@code basePath}, and a store-backed index answers those from its
+   * manifests instead ({@code scriptum.konserve}). Calling them here throws rather than
+   * dereferencing a null path.
+   *
+   * <p>The deletion and merge policies are still installed. Neither is needed by the manifest
+   * model — merges are branch-local there, and reachability from the live manifests replaces
+   * ref-counting — but they are harmless, and leaving them in keeps one writer implementation
+   * instead of two.
+   *
+   * <p>OWNERSHIP: this writer closes the supplied Directory in {@link #close()}, like every other
+   * constructor here. The parameter was documented as caller-owned, and {@code
+   * scriptum.core/close!} closed it a second time on that basis — the second close threw
+   * AlreadyClosedException on a Directory that reports it.
+   *
+   * @param directory the Directory to write through; this writer closes it
+   * @param branchName the branch this writer is on
+   * @param analyzer the analyzer to use for text processing
+   * @return a new BranchIndexWriter with no base path
+   */
+  public static BranchIndexWriter createOver(Directory directory, String branchName, Analyzer analyzer)
+      throws IOException {
+    BranchDeletionPolicy deletionPolicy = new BranchDeletionPolicy();
+    BranchAwareMergePolicy mergePolicy =
+        new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
+
+    IndexWriterConfig config = new IndexWriterConfig(analyzer);
+    config.setIndexDeletionPolicy(deletionPolicy);
+    config.setMergePolicy(mergePolicy);
+    config.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+
+    IndexWriter writer = new IndexWriter(directory, config);
+
+    // isMainBranch from the NAME, not a constant. It was hardcoded true, so every
+    // store-backed branch — forks included — answered true to isMainBranch(), and
+    // scriptum.core/main-branch? with it. In the manifest model the flag only
+    // means "is this the branch called main"; the path-overlay sense it carries
+    // for directory-backed writers has no counterpart here.
+    BranchIndexWriter biw =
+        new BranchIndexWriter(
+            writer, directory, deletionPolicy, mergePolicy, branchName, null, analyzer,
+            MAIN_BRANCH_NAME.equals(branchName), false);
+
+    // Adopt the branch's existing head, exactly as create() and open() do.
+    // Skipping it left lastCommitId null on every reopen, so the next commit
+    // recorded NO parent — a spurious root per open, and a fork whose first
+    // commit had no parent at all, leaving the fork point nowhere in the graph.
+    // That breaks ancestors, common-ancestor and commit-graph for store-backed
+    // indices.
+    biw.initLastCommitId();
+    biw.initLastContentHash();
+
+    return biw;
+  }
+
+  /** Whether this writer has a base path, i.e. is the directory-backed kind. */
+  public boolean hasBasePath() {
+    return basePath != null;
+  }
+
   public static BranchIndexWriter create(
       Path basePath, String branchName, Analyzer analyzer, boolean cryptoHash) throws IOException {
+    checkBranchName(branchName);
     Files.createDirectories(basePath);
 
-    boolean isMain = "main".equals(branchName);
+    boolean isMain = MAIN_BRANCH_NAME.equals(branchName);
 
     // All branches — including main — go through BranchedDirectory so the
     // write lock is per-branch (branchName + "_write.lock") instead of the
@@ -246,6 +419,7 @@ public class BranchIndexWriter implements Closeable {
 
     // Initialize parent tracking from existing commits
     biw.initLastCommitId();
+    biw.initLastContentHash();
 
     // Discover existing branches and protect their shared segments
     biw.discoverAndProtectBranches();
@@ -265,12 +439,24 @@ public class BranchIndexWriter implements Closeable {
    */
   public static BranchIndexWriter open(Path basePath, String branchName, Analyzer analyzer)
       throws IOException {
+    // ONLY THE UNSAFE FORMS, not the whitelist. `create` and `fork` may be strict
+    // about names they are about to invent; `open` may not, because scriptum has
+    // released versions that accepted anything. Applying the whitelist here made
+    // existing branches — "my branch", "café", "feature#1", "_scratch" — throw on
+    // open with no way back, turning a naming preference into a compatibility
+    // break. Their data was never at risk (branch protection walks directories,
+    // not names), but the handles were dead.
+    checkBranchPathSafe(branchName);
     Path branchPath = basePath.resolve("branches").resolve(branchName);
     if (!Files.isDirectory(branchPath)) {
-      // The main branch writes directly to basePath (not branches/main/).
-      // Fall back to create() which handles the root directory layout and
-      // detects crypto-hash from existing commits.
-      if (Files.isDirectory(basePath) && indexExistsAt(basePath)) {
+      // The main branch writes directly to basePath (not branches/main/), so it
+      // legitimately has no directory here. ONLY main: the fallback used to
+      // apply to any name, so `open` on a typo silently CREATED that branch —
+      // a real overlay that `discoverBranches` then reported and that `fork`
+      // now refuses by name.
+      if (MAIN_BRANCH_NAME.equals(branchName)
+          && Files.isDirectory(basePath)
+          && indexExistsAt(basePath)) {
         // Detect crypto-hash from existing index metadata
         boolean cryptoHash = false;
         try (Directory dir = MMapDirectory.open(basePath)) {
@@ -282,7 +468,9 @@ public class BranchIndexWriter implements Closeable {
         }
         return create(basePath, branchName, analyzer, cryptoHash);
       }
-      throw new IOException("Branch directory not found: " + branchPath);
+      throw new IOException(
+          "scriptum: branch " + branchName + " does not exist at " + branchPath
+              + "; `open` opens an existing branch — use `fork` to create one");
     }
 
     Directory baseDir = MMapDirectory.open(basePath);
@@ -343,6 +531,7 @@ public class BranchIndexWriter implements Closeable {
                 writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer,
                 false, cryptoHash);
         biw.initLastCommitId();
+    biw.initLastContentHash();
         return biw;
       } catch (IOException e) {
         overlayDir.close();
@@ -430,6 +619,36 @@ public class BranchIndexWriter implements Closeable {
    * @return a new BranchIndexWriter for the forked branch
    */
   public synchronized BranchIndexWriter fork(String newBranchName) throws IOException {
+    requireBasePath("fork()");
+    checkBranchName(newBranchName);
+    synchronized (forkLock(basePath)) {
+      return forkLocked(newBranchName);
+    }
+  }
+
+  private BranchIndexWriter forkLocked(String newBranchName) throws IOException {
+
+    // REFUSE FIRST, BEFORE TOUCHING ANYTHING. Two things went wrong when this
+    // check sat lower down. It came after the source's own flush-and-commit, so
+    // a refused fork still left a "Fork point for X" commit on the source
+    // forever — two failed attempts, two junk commit points. And it tested for a
+    // `segments*` file in `branches/<name>`, which cannot see MAIN: main's
+    // overlay IS basePath, so forking onto "main" was allowed and left a stale
+    // shadow overlay that later reads resolved through, reporting 1 document
+    // where the index had 5.
+    //
+    // Asking `discoverBranches` plus the main name answers by IDENTITY rather
+    // than by a directory listing, so an emptied or lock-only directory does not
+    // false-positive and main is included.
+    if (MAIN_BRANCH_NAME.equals(newBranchName)
+        || newBranchName.equals(branchName)
+        || discoverBranches(basePath).contains(newBranchName)) {
+      throw new IOException(
+          "scriptum: branch "
+              + newBranchName
+              + " already exists; forking onto it would replace its history with this branch's");
+    }
+
     // 1. Flush and commit current state
     writer.flush();
     String forkUuid = setCommitData("Fork point for " + newBranchName);
@@ -441,6 +660,7 @@ public class BranchIndexWriter implements Closeable {
 
     // 3. Create new overlay directory
     Path newOverlayPath = basePath.resolve("branches").resolve(newBranchName);
+
     Files.createDirectories(newOverlayPath);
 
     Directory baseDir = MMapDirectory.open(basePath);
@@ -450,9 +670,9 @@ public class BranchIndexWriter implements Closeable {
         BranchedDirectory newBranchDir = new BranchedDirectory(baseDir, overlayDir, newBranchName);
         // newBranchDir now owns baseDir and overlayDir
 
-        // 4. Clone SegmentInfos and bump counter to avoid segment name collisions
+        // 4. Clone SegmentInfos and move the counter past every ordinal in use
         SegmentInfos cloned = currentInfos.clone();
-        cloned.counter = currentInfos.counter + 10000;
+        cloned.counter = Math.max(currentInfos.counter, nextFreeSegmentOrdinal(basePath));
 
         // 5. Write cloned SegmentInfos to new branch
         cloned.commit(newBranchDir);
@@ -643,9 +863,9 @@ public class BranchIndexWriter implements Closeable {
     } else {
       String uuid = setCommitData(message, customMetadata);
       pendingCommitMessage = null;
-      long gen = writer.commit();
+      long seqNo = writer.commit();
       lastCommitId = uuid;
-      return gen;
+      return lastCommitGeneration(seqNo);
     }
   }
 
@@ -664,7 +884,7 @@ public class BranchIndexWriter implements Closeable {
     // Phase 1: Commit with Lucene's random UUID
     String luceneUuid = setCommitData(message, customMetadata);
     pendingCommitMessage = null;
-    long gen = writer.commit();
+    long seqNo = writer.commit();
     lastCommitId = luceneUuid;
 
     // Phase 2: Compute complete merkle root
@@ -698,7 +918,7 @@ public class BranchIndexWriter implements Closeable {
       lastContentHash = null;
     }
 
-    return gen;
+    return lastCommitGeneration(seqNo);
   }
 
   /**
@@ -868,7 +1088,142 @@ public class BranchIndexWriter implements Closeable {
    * @param before delete commits with timestamps before this instant
    * @return number of commit points removed
    */
+  /**
+   * Refuse a path-only operation on a store-backed writer.
+   *
+   * <p>These reach through {@code basePath}, which is null for {@link #createOver}. They used to
+   * dereference it and throw NullPointerException on {@code "this.basePath" is null} — a message
+   * naming an implementation field rather than the mistake. {@link #hasBasePath()} existed for
+   * exactly this and was never called.
+   */
+  private void requireBasePath(String operation) throws IOException {
+    if (!hasBasePath()) {
+      throw new IOException(
+          operation
+              + " is only available on a directory-backed index; this writer is backed by a store,"
+              + " where branches are manifests rather than directories. Use the scriptum.konserve"
+              + " equivalent.");
+    }
+  }
+
+  /**
+   * Drop old commit points from a STORE-BACKED index, so its manifest stops naming them.
+   *
+   * <p>This is what bounds a store-backed index. Nothing else prunes it: {@link
+   * BranchDeletionPolicy} keeps every commit point, so the branch's file map is cumulative — 30
+   * commits of 30 documents were measured naming 130 files, of which 30 were commit points — and
+   * everything in it is legitimately reachable, so the store collector correctly reclaims nothing.
+   *
+   * <p>NO PROTECTED-FILE SCAN, and that is the whole reason this is simpler than {@link
+   * #gc(Instant)}. There, deleting a commit point deletes real files another branch may share, so
+   * it must first walk every branch directory. Here a deletion only removes a NAME from this
+   * branch's manifest; whether the blob dies is decided afterwards by reachability across every
+   * branch, which {@code scriptum.konserve/mark} already computes. So there is nothing to protect
+   * at this layer.
+   *
+   * <p>Requires a commit to take effect, because {@link IndexDeletionPolicy#onCommit} is where
+   * Lucene lets a policy delete — so one is issued here, but only when something will actually be
+   * dropped, since the commit itself becomes a commit point.
+   *
+   * <p>The shrunken file map reaches the store at the NEXT commit, not this one: Lucene runs the
+   * deletion policy during the checkpoint that follows {@code finishCommit}, by which time the
+   * manifest for this commit has already been written.
+   *
+   * <p>The newest commit point always survives. Reading a dropped one is no longer possible by
+   * generation; its state is reachable by snapshot address instead, which is what {@code
+   * scriptum.konserve/snapshot-directory} opens.
+   *
+   * @param before drop commit points older than this, or null to use {@code commitIds}
+   * @param commitIds drop exactly these {@code scriptum.uuid}s, or null to use {@code before}
+   * @return the number of commit points dropped
+   */
+  public int retain(Instant before, Set<String> commitIds) throws IOException {
+    if (hasBasePath()) {
+      throw new IOException(
+          "retain() is for store-backed indices; a directory-backed one shares files between"
+              + " branches and must use gc(), which protects them.");
+    }
+    if (before == null && commitIds == null) {
+      throw new IOException("retain() needs either a cutoff or a set of commit ids");
+    }
+
+    // DECIDE BEFORE COMMITTING, because committing is not free here: it creates
+    // a commit point of its own. Arming the policy and committing unconditionally
+    // meant a sweep that matched nothing still grew the index — and on the
+    // yggdrasil coordinator path, where candidates come from a registry that
+    // never contains scriptum's own bookkeeping commits, that growth was
+    // monotonic: every cycle added commit points no later cycle could nominate.
+    // The collector was making the index bigger.
+    List<IndexCommit> commits = deletionPolicy.getAllCommits();
+    String head = commits.isEmpty() ? null : lastUuid(commits.get(commits.size() - 1));
+    int wouldDrop = 0;
+    for (int i = 0; i < commits.size() - 1; i++) {
+      IndexCommit c = commits.get(i);
+      String uuid = lastUuid(c);
+      if (uuid != null && uuid.equals(head)) {
+        continue;
+      }
+      // Mirror the policy exactly: OR, so the precheck and the deletion agree
+      // about what is selected. Diverging meant this said "something will go",
+      // issued a commit, and the policy then dropped nothing.
+      boolean byId = commitIds != null && commitIds.contains(uuid);
+      boolean byAge = before != null && isOlderThan(c, before);
+      if (byId || byAge) {
+        wouldDrop++;
+      }
+    }
+    if (wouldDrop == 0) {
+      return 0;
+    }
+
+    Set<String> keep = head == null ? Collections.emptySet() : Collections.singleton(head);
+    deletionPolicy.setGc(before, commitIds, keep);
+
+    // onCommit is the only place Lucene lets a policy delete, so ask for one —
+    // and it has to be a REAL one. IndexWriter.commit() returns early when
+    // nothing changed, so a retain with no indexing in front of it armed the
+    // policy and never consulted it. Writing commit data marks the SegmentInfos
+    // changed, which is what makes the commit happen.
+    //
+    // NOTE FOR CALLERS: this commits whatever the writer has buffered, because
+    // IndexWriter.commit() cannot do otherwise. Collection should not be the
+    // thing that makes a caller's in-flight writes durable, so commit before
+    // retaining if that matters to you.
+    lastCommitId = setCommitData("scriptum-retain");
+    writer.commit();
+    int dropped = deletionPolicy.getLastGcDeleted();
+
+    // PUBLISH THE SHRINK. Lucene drops the selected commit points during the
+    // checkpoint that runs AFTER this commit's flip, so at this point the
+    // removals exist only in the Directory's memory. Closing the writer does not
+    // publish them either — IndexWriter.close skips a commit when nothing
+    // Lucene-level changed, and dropping commit points is not such a change — so
+    // retain-then-close published nothing and every dropped point came back on
+    // reopen, while a coordinator that read the successful return as deletion had
+    // already written those ids off.
+    //
+    // syncMetaData rather than a second commit: a commit would work but costs a
+    // commit point, which is what made an earlier version of this grow the index
+    // it exists to shrink.
+    directory.syncMetaData();
+    return dropped;
+  }
+
+  /** A commit's `scriptum.uuid`, or null. */
+  private static String lastUuid(IndexCommit commit) throws IOException {
+    return commit.getUserData().get(COMMIT_UUID_KEY);
+  }
+
+  private static boolean isOlderThan(IndexCommit commit, Instant cutoff) throws IOException {
+    if (cutoff == null) {
+      return false;
+    }
+    String ts = commit.getUserData().get(COMMIT_TIMESTAMP_KEY);
+    return ts != null && Instant.parse(ts).isBefore(cutoff);
+  }
+
   public int gc(Instant before) throws IOException {
+    requireBasePath("gc()");
     if (!isMainBranch) {
       throw new IOException("gc() can only be called on the main branch writer");
     }
@@ -931,6 +1286,17 @@ public class BranchIndexWriter implements Closeable {
               BranchedDirectory branchDir = new BranchedDirectory(baseDir, overlayDir, bName)) {
 
             String[] overlayFiles = overlayDir.listAll();
+            // The branch's HEAD, which is protected regardless of age. `before`
+            // is a retention policy for HISTORY — on main, an old commit point
+            // is a snapshot you may drop, and dropping it is the point of a
+            // collection. On another branch the latest commit is not history,
+            // it is that branch's current state, and ageing it out deletes the
+            // base segments the branch is built from. A branch idle longer than
+            // the grace window was contributing nothing to protectedFiles, so a
+            // collection on main destroyed it: reproduced as CorruptIndexException
+            // opening the fork, once main had merged away the shared segment and
+            // stopped referencing it too.
+            long headGen = SegmentInfos.getLastCommitGeneration(overlayFiles);
             for (String fileName : overlayFiles) {
               if (!fileName.startsWith("segments_")) {
                 continue;
@@ -939,8 +1305,10 @@ public class BranchIndexWriter implements Closeable {
                 SegmentInfos infos = SegmentInfos.readCommit(branchDir, fileName);
 
                 boolean protect = true;
+                boolean isHead =
+                    SegmentInfos.generationFromSegmentsFileName(fileName) == headGen;
                 String tsStr = infos.getUserData().get(COMMIT_TIMESTAMP_KEY);
-                if (tsStr != null) {
+                if (tsStr != null && !isHead) {
                   try {
                     Instant commitTime = Instant.parse(tsStr);
                     protect = !commitTime.isBefore(before);
@@ -979,7 +1347,22 @@ public class BranchIndexWriter implements Closeable {
    * @param source the source branch to merge from
    */
   public void mergeFrom(BranchIndexWriter source) throws IOException {
-    source.commit("Pre-merge snapshot");
+    mergeFrom(source, true);
+  }
+
+  /**
+   * Merge with control over whether the source is committed here.
+   *
+   * <p>{@code commitSource=false} is for a caller that has already committed the source and needs
+   * its post-commit identity — a store-backed merge records the merged lineage as a parent, and
+   * the address it records must be the one the merge actually reads. Committing the source here
+   * would supersede it: {@link #commit(String)} always writes fresh commit data, so it is never a
+   * no-op and always produces a new snapshot.
+   */
+  public void mergeFrom(BranchIndexWriter source, boolean commitSource) throws IOException {
+    if (commitSource) {
+      source.commit("Pre-merge snapshot");
+    }
     commit("Pre-merge snapshot");
     try (DirectoryReader reader = DirectoryReader.open(source.directory)) {
       List<CodecReader> codecReaders = new ArrayList<>();
@@ -1006,9 +1389,111 @@ public class BranchIndexWriter implements Closeable {
     return lastContentHash;
   }
 
+
+  /**
+   * One past the highest segment ordinal in use anywhere under {@code basePath} — the base
+   * directory and every branch overlay.
+   *
+   * <p>A forked branch writes into its own overlay, but {@link BranchedDirectory} composes that
+   * overlay OVER the base, so a new segment whose name matches an inherited one shadows it and the
+   * branch reads its own file where it meant to read the parent's. The counter therefore has to
+   * clear every ordinal any branch has used, not merely the parent's.
+   *
+   * <p>This used to be {@code counter + 10000}, which is the same workaround OpenSearch applies on
+   * primary failover ({@code SI_COUNTER_INCREMENT}). Their comment is candid about it — a constant
+   * "decreases the chances of conflict", and the ideal is to "identify the counter from previous
+   * primary" — and they had to raise theirs from 10 to 100000 when collisions kept happening.
+   * Scriptum can do the sound thing instead, because the ordinals in use are all on disk and
+   * enumerable.
+   *
+   * <p>Falls back to 0 for anything unparseable, so a stray file cannot break a fork; the caller
+   * takes the max with the parent's own counter.
+   */
+  private static long nextFreeSegmentOrdinal(Path basePath) throws IOException {
+    long max = -1;
+    List<Path> dirs = new java.util.ArrayList<>();
+    dirs.add(basePath);
+    Path branchesDir = basePath.resolve("branches");
+    if (Files.isDirectory(branchesDir)) {
+      try (java.util.stream.Stream<Path> branches = Files.list(branchesDir)) {
+        branches.filter(Files::isDirectory).forEach(dirs::add);
+      }
+    }
+    for (Path dir : dirs) {
+      if (!Files.isDirectory(dir)) {
+        continue;
+      }
+      try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+        for (Path f : (Iterable<Path>) files::iterator) {
+          long ordinal = segmentOrdinal(f.getFileName().toString());
+          if (ordinal > max) {
+            max = ordinal;
+          }
+        }
+      }
+    }
+    return max + 1;
+  }
+
+  /**
+   * The ordinal in a Lucene segment filename, or -1 if it is not one.
+   *
+   * <p>Segment files are named {@code _<ordinal>} with the ordinal in base 36, optionally followed
+   * by {@code _<generation>} for per-segment generational files such as {@code _0_5.liv}, then an
+   * extension. Only the leading ordinal matters here.
+   */
+  private static long segmentOrdinal(String fileName) {
+    if (fileName.isEmpty() || fileName.charAt(0) != '_') {
+      return -1;
+    }
+    int end = 1;
+    while (end < fileName.length()
+        && fileName.charAt(end) != '.'
+        && fileName.charAt(end) != '_') {
+      end++;
+    }
+    try {
+      return Long.parseLong(fileName.substring(1, end), Character.MAX_RADIX);
+    } catch (NumberFormatException e) {
+      return -1;
+    }
+  }
+
   /** Returns the branch name. */
   public String getBranchName() {
     return branchName;
+  }
+
+  /**
+   * Cap the size of a merged segment, in megabytes. See {@link
+   * BranchAwareMergePolicy#setMaxMergedSegmentMB(double)} for why a remote store wants a much lower
+   * value than Lucene's 5 GB default.
+   */
+  public void setMaxMergedSegmentMB(double mb) {
+    mergePolicy.setMaxMergedSegmentMB(mb);
+  }
+
+  /** The current merged-segment cap in megabytes. */
+  public double getMaxMergedSegmentMB() {
+    return mergePolicy.getMaxMergedSegmentMB();
+  }
+
+  /**
+   * Set the in-memory buffer a flush accumulates before writing a segment, in megabytes.
+   *
+   * <p>This bounds the size of segments created by a FLUSH, as distinct from a merge — so it sets
+   * the floor of the blob-size distribution where the cap above sets the ceiling. Lucene's default
+   * is 16 MB.
+   *
+   * <p>Live-settable: this reaches {@code IndexWriter.getConfig()}, which applies to the next flush.
+   */
+  public void setRAMBufferSizeMB(double mb) {
+    writer.getConfig().setRAMBufferSizeMB(mb);
+  }
+
+  /** The current flush buffer size in megabytes. */
+  public double getRAMBufferSizeMB() {
+    return writer.getConfig().getRAMBufferSizeMB();
   }
 
   /** Returns the underlying Directory. */
@@ -1401,8 +1886,27 @@ public class BranchIndexWriter implements Closeable {
       }
     }
 
-    // Note: Commit UUID is random (not content-addressed) in current implementation
-    // Verification only checks that segment hashes match stored metadata
+    // RECOMPUTE THE ROOT AND COMPARE IT. Checking stored-against-computed
+    // segment hashes alone is weaker than it looks, and the comparison above
+    // iterates the STORED map: delete an entry from it and nothing notices, and
+    // editing the recorded `content-hash` was likewise invisible — a merkle
+    // claim that verified everything except the merkle root.
+    //
+    // Recomputing hash(parent-hash + every segment hash we just computed) and
+    // comparing it to the recorded root closes both: a removed entry changes the
+    // root, and so does an edited root.
+    String recordedRoot = (String) metadata.get("content-hash");
+    if (recordedRoot != null) {
+      String parentStr = (String) metadata.get("parent-content-hash");
+      UUID parentHash = parentStr == null ? null : UUID.fromString(parentStr);
+      UUID recomputed = ContentHash.computeCommitHash(parentHash, computedHashes);
+      if (!recordedRoot.equals(recomputed.toString())) {
+        errors.add(
+            "Merkle root mismatch: recorded " + recordedRoot + ", recomputed " + recomputed);
+      }
+      result.put("content-hash", recordedRoot);
+      result.put("recomputed-content-hash", recomputed.toString());
+    }
 
     result.put("valid", errors.isEmpty());
     result.put("errors", errors);
@@ -1411,8 +1915,30 @@ public class BranchIndexWriter implements Closeable {
 
   @Override
   public void close() throws IOException {
-    writer.close();
-    directory.close();
+    // try/finally: the Directory must be released even when the writer's
+    // commit-on-close fails. Without it, a failing close left the Directory open
+    // AND — for a store-backed one — the gc-guard's in-flight sequence never
+    // closed, pinning every later collection at that instant for the life of the
+    // process. That is exactly what the guard exists to prevent.
+    try {
+      // GIVE THE CLOSE-COMMIT AN IDENTITY. `commitOnClose` defaults true, so
+      // close() flushes and commits whatever is buffered — but nothing set commit
+      // data on that path, so the new commit point inherited the PREVIOUS one's
+      // `scriptum.uuid`, timestamp, message and parents verbatim. Two different
+      // index states then answered to one snapshot-id: `as-of` returned the older
+      // of them, `history` listed the id twice, and the commit graph collapsed two
+      // states into one node.
+      //
+      // Only when there is something to commit — `setCommitData` marks the
+      // SegmentInfos changed, so doing it unconditionally would manufacture a
+      // commit point on every close.
+      if (writer.hasUncommittedChanges()) {
+        lastCommitId = setCommitData("Closed " + branchName);
+      }
+      writer.close();
+    } finally {
+      directory.close();
+    }
   }
 
   @Override

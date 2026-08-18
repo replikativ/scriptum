@@ -1,7 +1,11 @@
 (ns scriptum.core-test
   "Unit tests for scriptum.core Lucene functionality."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [scriptum.core :as sc])
+            [scriptum.core :as sc]
+            [clojure.java.io :as io]
+            [konserve.store :as kstore]
+            [scriptum.yggdrasil :as sy]
+            [yggdrasil.protocols :as p])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
            [java.time Instant Duration]))
@@ -596,3 +600,482 @@
 
       (finally
         (delete-dir-recursive path)))))
+
+(deftest index-size-knobs-take-effect
+  (testing "the two knobs that matter against a remote store, where a segment is
+            a blob written and read whole rather than a file on local disk.
+            Lucene's defaults (5120 MB merged, 16 MB flush) are tuned for the
+            latter; both are live settings, so scriptum applies them after the
+            writer is constructed."
+    (let [path (str "/tmp/scriptum-tuning-" (random-uuid))]
+      (try
+        (let [w (sc/create-index path "main" {:max-merged-segment-mb 128
+                                              :ram-buffer-mb 48})
+              bw (sc/->writer w)]
+          (try
+            (is (= 128.0 (.getMaxMergedSegmentMB bw)))
+            (is (= 48.0 (.getRAMBufferSizeMB bw)))
+            (finally (sc/close! w))))
+        ;; and the defaults are Lucene's when nothing is asked for
+        (let [w (sc/create-index (str path "-default") "main")
+              bw (sc/->writer w)]
+          (try
+            (is (= 5120.0 (.getMaxMergedSegmentMB bw))
+                "untuned must stay on Lucene's default")
+            (finally (sc/close! w))))
+        (finally
+          (doseq [p [path (str path "-default")]]
+            (let [f (clojure.java.io/file p)]
+              (when (.exists f)
+                (letfn [(rm [^java.io.File x]
+                          (when (.isDirectory x) (run! rm (.listFiles x)))
+                          (.delete x))]
+                  (rm f))))))))))
+
+(deftest sibling-forks-do-not-reuse-segment-names
+  (testing "a forked branch writes into its own overlay, but BranchedDirectory
+            composes that overlay OVER the base — so a new segment whose name
+            matches an inherited one shadows it, and the branch reads its own
+            file where it meant to read the parent's.
+
+            The counter therefore has to clear every ordinal ANY branch has
+            used, not just the parent's. It used to be `counter + 10000`, the
+            same workaround OpenSearch applies on failover and openly calls a
+            way to 'decrease the chances of conflict' — they raised theirs from
+            10 to 100000 when collisions kept happening. Two forks off one
+            parent both computed the same bumped value and wrote the same
+            names; deriving from the ordinals on disk is exact."
+    (let [path (str "/tmp/scriptum-fork-counter-" (random-uuid))]
+      (try
+        (let [m (sc/create-index path "main")]
+          (sc/add-doc m {:body {:type :text :value "seed"}})
+          (sc/commit! m "seed")
+          (let [a (sc/fork m "sibA")]
+            (sc/add-doc a {:body {:type :text :value "A"}})
+            (sc/commit! a "A")
+            (let [b (sc/fork m "sibB")]
+              (sc/add-doc b {:body {:type :text :value "B"}})
+              (sc/commit! b "B")
+              (let [seg (fn [branch]
+                          (set (filter #(clojure.string/starts-with? % "_")
+                                       (.list (clojure.java.io/file path "branches" branch)))))]
+                (is (seq (seg "sibA")))
+                (is (seq (seg "sibB")))
+                (is (empty? (clojure.set/intersection (seg "sibA") (seg "sibB")))
+                    "two forks off one parent must not write the same segment names"))
+              (sc/close! b))
+            (sc/close! a))
+          (sc/close! m))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
+
+(deftest gc-protects-an-idle-forks-head
+  (testing "REGRESSION: `before` is a retention policy for HISTORY. On main an
+            old commit point is a snapshot you may drop, and dropping it is what
+            a collection is for. `collectBranchReferencedFiles` applied the same
+            age test to every commit point of every BRANCH, including each
+            branch's latest — which is not history, it is that branch's current
+            state.
+
+            So a branch idle longer than the grace window contributed nothing to
+            the protected set, and a collection on main deleted the base
+            segments it was built from. It only bites once main has stopped
+            referencing them too, which is why this forceMerges main first —
+            without that, main's own commit keeps the shared segment alive and
+            the bug hides."
+    (let [path (str "/tmp/scriptum-gc-fork-" (random-uuid))]
+      (try
+        (let [m (sc/create-index path "main")]
+          (sc/add-doc m {:body {:type :text :value "base document"}})
+          (sc/commit! m "base")
+          (let [f (sc/fork m "feature")]
+            (sc/add-doc f {:body {:type :text :value "feature document"}})
+            (sc/commit! f "feature work")
+            (is (= 2 (count (sc/search f :all))))
+            (sc/close! f))
+          ;; main moves on and merges away the segment the fork depends on
+          (dotimes [i 3]
+            (sc/add-doc m {:body {:type :text :value (str "main " i)}})
+            (sc/commit! m (str "main " i)))
+          (.forceMerge (sc/->writer m) 1)
+          (sc/commit! m "merged")
+          ;; collect with a cutoff past the fork's last commit
+          (sc/gc! m (java.time.Instant/now))
+          (sc/close! m)
+          (let [f (sc/open-branch path "feature")]
+            (is (= 2 (count (sc/search f :all)))
+                "an idle fork must survive a collection on main")
+            (sc/close! f)))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
+
+(deftest search-sees-uncommitted-writes-by-default
+  (testing "the default opens a fresh NRT reader, so `search` reflects the
+            WRITER's state. Read-your-own-writes is the semantics a git-like
+            writer wants, and it is why scriptum caches no searcher of its own:
+            a cached one refreshed on commit was measured to lose this, and to
+            resurrect deleted documents between refreshes."
+    (let [path (str "/tmp/scriptum-nrt-" (random-uuid))]
+      (try
+        (let [w (sc/create-index path "main")]
+          (sc/add-doc w {:body {:type :text :value "committed"}})
+          (sc/commit! w "one")
+          (sc/add-doc w {:body {:type :text :value "uncommitted"}})
+          (is (= 2 (count (sc/search w :all)))
+              "an added document is findable before any commit")
+          (sc/delete-docs w "body" "committed")
+          (is (= 1 (count (sc/search w :all)))
+              "and a deleted one is gone before any commit")
+          (sc/close! w))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
+
+(deftest search-accepts-a-held-reader
+  (testing "`DirectoryReader.open(writer)` flushes every in-memory buffer, so a
+            loop that alternates writing and searching materializes a segment
+            PER SEARCH — measured 10.3 ms per write-then-search cycle against
+            0.37 ms with a held reader, and 37 files against 10. The cost is
+            segment churn, not reader construction, which is cheap.
+
+            A held reader is a point in time: it does not see later writes, and
+            scriptum does not close it — whoever opened it owns it."
+    (let [path (str "/tmp/scriptum-held-" (random-uuid))]
+      (try
+        (let [w (sc/create-index path "main")]
+          (sc/add-doc w {:body {:type :text :value "first"}})
+          (sc/commit! w "one")
+          (let [r (sc/snapshot w)]
+            (is (= 1 (count (sc/search w :all {:reader r}))))
+            (sc/add-doc w {:body {:type :text :value "second"}})
+            (sc/commit! w "two")
+            (is (= 1 (count (sc/search w :all {:reader r})))
+                "a held reader is a point in time")
+            (is (= 2 (count (sc/search w :all)))
+                "while the default still sees the writer")
+            ;; still usable, i.e. search did not close it
+            (is (= 1 (.numDocs r)) "search must not close a reader it was given")
+            (.close r))
+          (sc/close! w))
+        (finally
+          (let [f (clojure.java.io/file path)]
+            (when (.exists f)
+              (letfn [(rm [^java.io.File x]
+                        (when (.isDirectory x) (run! rm (.listFiles x)))
+                        (.delete x))]
+                (rm f)))))))))
+
+;; ============================================================
+;; What commit! returns, and what createOver sets up
+;; ============================================================
+
+(deftest commit-returns-a-generation-not-a-sequence-number
+  (testing "REGRESSION: `commit!` returned `IndexWriter.commit()`'s value, which
+            is Lucene's SEQUENCE NUMBER — its ordering token for concurrent
+            operations — bearing no relation to the `segments_N` generation. It
+            was documented and consumed as `:generation`, stored under that name
+            by the metadata index and handed back by `find-generation`, so
+            `open-reader-at` on it always failed: four commits reported 3, 6, 9,
+            12 where the generations were 1, 2, 3, 4.
+
+            The round trip is the assertion — a value `commit!` returns must be
+            one `open-reader-at` accepts."
+    (let [path (temp-dir)
+          w (sc/create-index path "main")]
+      (try
+        (dotimes [i 4]
+          (sc/add-doc w {:body (str "doc " i)})
+          (let [r (sc/commit! w (str "commit " i))
+                ;; `commit!` returns a bare generation without :crypto-hash?,
+                ;; and a map with it — both carry the same number.
+                generation (if (map? r) (:generation r) r)]
+            (is (some? generation) (str "commit " i " must report a generation"))
+            (is (sc/commit-available? w generation)
+                (str "generation " generation " must exist, got " (pr-str r)))
+            (with-open [rdr (sc/open-reader-at w generation)]
+              (is (= (inc i) (.numDocs rdr))
+                  "and opening at it must show exactly the commits so far"))))
+        (finally (sc/close! w) (delete-dir-recursive path))))))
+
+(deftest gc-preserves-metadata-of-a-branch-it-cannot-read
+  (testing "REGRESSION: `gc!` reopens each branch to re-derive its metadata and
+            swallowed failures with `(catch Exception _ acc)`, omitting the
+            branch — and `rebuild-from-snapshots!` then built a fresh index from
+            what it was given, erasing it. The usual reason to fail is
+            LockObtainFailedException from a branch whose writer is open, i.e.
+            the documented main+feature workflow, so collecting on main silently
+            erased the feature branch's metadata.
+
+            Absence is not evidence: a branch that could not be re-derived is one
+            we know nothing about, not one we know to be empty."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "seed" {"tx" "100"})
+        (let [feature (sc/fork main "feature")]
+          (try
+            (sc/add-doc feature {:body "f"})
+            (sc/commit! feature "on feature" {"tx" "200"})
+            (is (some? (sc/find-generation feature "tx" "200"))
+                "precondition: the feature branch's metadata is indexed")
+            ;; feature's writer stays OPEN across the collection
+            (sc/gc! main (Instant/now))
+            (is (some? (sc/find-generation feature "tx" "200"))
+                "a collection on main must not erase an open branch's metadata")
+            (is (some? (sc/find-generation main "tx" "100"))
+                "and main's own survives, as before")
+            (finally (sc/close! feature))))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest forking-onto-an-existing-branch-is-refused
+  (testing "REGRESSION, data loss: `fork` wrote the cloned SegmentInfos into the
+            target overlay BEFORE constructing the IndexWriter that discovers the
+            target's lock. So a fork onto a live branch threw
+            LockObtainFailedException having already installed this branch's
+            commit as the newest durable one there — the target's own writer kept
+            serving its old NRT view, and everything it had committed vanished on
+            the next reopen."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "on main"})
+        (sc/commit! main "m")
+        (let [feature (sc/fork main "feature")]
+          (try
+            (sc/add-doc feature {:body "feature only"})
+            (sc/commit! feature "f")
+            (is (thrown? java.io.IOException (sc/fork main "feature"))
+                "forking onto an existing branch must be refused")
+            (finally (sc/close! feature))))
+        ;; and the branch still has what it committed
+        (let [reopened (sc/open-branch path "feature")]
+          (try
+            (is (= 2 (sc/num-docs reopened))
+                "the target branch must keep its own history")
+            (finally (sc/close! reopened))))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest closing-a-store-backed-writer-closes-its-directory-once
+  (testing "REGRESSION: `createOver`'s javadoc said the caller owned the supplied
+            Directory while `close()` closed it itself, and `close!` closed it
+            again on the javadoc's word — the second close threw
+            AlreadyClosedException on any Directory that reports being closed."
+    (let [path (temp-dir)]
+      (try
+        (let [s (kstore/create-store {:backend :file :path (str path "/store")
+                                      :id (random-uuid)}
+                                     {:sync? true})
+              w (sc/open-store-index s (str path "/cache") "main")]
+          (sc/add-doc w {:body {:type :text :value "x"}})
+          (sc/commit! w "one")
+          (is (nil? (sc/close! w)) "closing must not throw")
+          ;; and reopening works, i.e. nothing was left half-closed
+          (let [w2 (sc/open-store-index s (str path "/cache") "main")]
+            (try (is (= 1 (sc/num-docs w2)))
+                 (finally (sc/close! w2)))))
+        (finally (delete-dir-recursive path))))))
+
+(deftest a-deleted-branch-can-be-recreated
+  (testing "REGRESSION from the fork guard: `fork` refuses a name
+            `discover-branches` still reports, and path-model `delete-branch!`
+            left the overlay directory behind — so `branches` said the branch was
+            gone while `branch!` said it already existed, and no API could remove
+            it. Previously the stale overlay was merely reused, dirty."
+    (let [path (temp-dir)
+          sys (sy/create path)]
+      (try
+        (let [w (get (:writers sys) "main")]
+          (sc/add-doc w {:body "m"})
+          (sc/commit! w "m"))
+        (let [sys (p/branch! sys :feature)
+              f (get (:writers sys) "feature")]
+          (sc/add-doc f {:body "f"})
+          (sc/commit! f "f")
+          (let [sys (p/delete-branch! sys :feature)]
+            (is (not (contains? (p/branches sys) :feature)))
+            ;; and it can be created again, cleanly
+            (let [sys (p/branch! sys :feature)
+                  f2 (get (:writers sys) "feature")]
+              (is (= 1 (sc/num-docs f2))
+                  "a recreated branch forks the current state, not the dead one"))))
+        (finally (sy/close! sys) (delete-dir-recursive path))))))
+
+(deftest forking-onto-main-is-refused
+  (testing "REGRESSION: the guard tested for a `segments*` file under
+            `branches/<name>`, which cannot see MAIN — main's overlay IS the base
+            path. So forking onto \"main\" was allowed and left a stale shadow
+            overlay that later reads resolved through, reporting one document
+            where the index had five."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "a"})
+        (sc/commit! main "one")
+        (is (thrown? java.io.IOException (sc/fork main "main")))
+        (dotimes [i 4]
+          (sc/add-doc main {:body (str "x" i)})
+          (sc/commit! main (str "c" i)))
+        (sc/close! main)
+        (let [reopened (sc/open-branch path "main")]
+          (try (is (= 5 (sc/num-docs reopened))
+                   "main must still resolve to its own index")
+               (finally (sc/close! reopened))))
+        (finally (delete-dir-recursive path))))))
+
+(deftest a-refused-fork-leaves-no-trace
+  (testing "REGRESSION: the guard sat AFTER the source's flush-and-commit, so a
+            refused fork still left a \"Fork point for X\" commit on the source
+            forever — two failed attempts, two junk commit points."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "a"})
+        (sc/commit! main "one")
+        (let [before (count (sc/list-snapshots main))]
+          (dotimes [_ 3] (is (thrown? java.io.IOException (sc/fork main "main"))))
+          (is (= before (count (sc/list-snapshots main)))
+              "a refused fork must not commit the source"))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest open-branch-does-not-create-an-unknown-branch
+  (testing "REGRESSION: `open` fell back to `create` for ANY missing branch
+            directory, not just main — so opening a typo silently created that
+            branch. It became a real overlay that `discover-branches` reported
+            and that `fork` now refuses by name, so a misspelling permanently
+            consumed a branch name."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (is (thrown? java.io.IOException (sc/open-branch path "no-such-branch")))
+        (is (not (contains? (set (sc/discover-branches path)) "no-such-branch"))
+            "and nothing was created")
+        ;; main still opens, since its overlay IS the base path
+        (sc/close! main)
+        (let [reopened (sc/open-branch path "main")]
+          (try (is (= 1 (sc/num-docs reopened)))
+               (finally (sc/close! reopened))))
+        (finally (delete-dir-recursive path))))))
+
+(deftest path-model-branch-names-are-validated
+  (testing "REGRESSION: the store model whitelisted branch names since a review
+            found `\"\"` made a branch view the cache root and `..` escaped it;
+            the path model had nothing. Here `\"\"` and `\".\"` put a branch's
+            segments directly in `branches/`, where `discover-branches` cannot
+            see them — invisible to the fork guard and unprotected from a
+            collection on main."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (doseq [n ["" "." ".." "a/b" "../escape" ".hidden"]]
+          (is (thrown? java.io.IOException (sc/fork main n))
+              (str (pr-str n) " must be refused")))
+        (let [f (sc/fork main "ok-name_1.2")]
+          (is (some? f) "and ordinary names still work")
+          (sc/close! f))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest concurrent-forks-to-one-name-do-not-corrupt-the-winner
+  (testing "REGRESSION: `fork` refuses an existing target, but the check and the
+            write of the cloned commit point are not atomic and the target's own
+            write lock is taken only afterwards. Two concurrent forks to one new
+            name both passed, and the loser wrote its clone into the winner's
+            directory, leaving it unreadable."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (let [results (->> (repeatedly 8 #(future (try (let [f (sc/fork main "target")]
+                                                         (sc/close! f) :ok)
+                                                       (catch Exception _ :refused))))
+                           doall
+                           (map deref))]
+          (is (= 1 (count (filter #{:ok} results)))
+              "exactly one fork may succeed")
+          (let [opened (sc/open-branch path "target")]
+            (try (is (= 1 (sc/num-docs opened))
+                     "and the branch it created must be readable")
+                 (finally (sc/close! opened)))))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest an-existing-branch-name-can-still-be-opened
+  (testing "REGRESSION, compatibility: `open` applied the same whitelist as
+            `create` and `fork`, so branches that released versions of scriptum
+            happily created — \"my branch\", \"feature#1\", \"_scratch\" — threw on
+            open with no way back. Their data was never at risk, since branch
+            protection walks directories rather than names, but the handles were
+            dead. `open` now rejects only names that would not resolve to a
+            directory under branches/."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (sc/close! main)
+        ;; a branch as an older scriptum would have left it on disk
+        (doseq [n ["my branch" "feature#1" "_scratch"]]
+          (let [dir (io/file path "branches" n)]
+            (.mkdirs dir)
+            ;; give it a real index by forking through the legacy layout
+            (let [w (sc/open-branch path "main")
+                  f (sc/fork w "tmp")]
+              (sc/close! f)
+              (sc/close! w))
+            (doseq [^java.io.File src (.listFiles (io/file path "branches" "tmp"))]
+              (io/copy src (io/file dir (.getName src))))
+            (delete-dir-recursive (str (io/file path "branches" "tmp")))
+            (let [opened (sc/open-branch path n)]
+              (try (is (= 1 (sc/num-docs opened))
+                       (str (pr-str n) " must still open"))
+                   (finally (sc/close! opened))))))
+        ;; but inventing such a name is still refused
+        (let [w (sc/open-branch path "main")]
+          (try (is (thrown? java.io.IOException (sc/fork w "brand new")))
+               (finally (sc/close! w))))
+        (finally (delete-dir-recursive path))))))
+
+(deftest search-honours-its-documented-options
+  (testing "REGRESSION: a string query was documented as matching documents
+            containing that term in any field, and fell through to
+            `MatchAllDocsQuery` — so searching for a word silently returned the
+            entire index. `:fields` was destructured and ignored, so every stored
+            field came back whatever was asked for."
+    (let [path (temp-dir)
+          w (sc/create-index path "main")]
+      (try
+        (sc/add-doc w {:title "alpha" :body "distinctive"})
+        (sc/add-doc w {:title "beta" :body "ordinary"})
+        (sc/add-doc w {:title "gamma" :body "ordinary"})
+        (sc/commit! w "seed")
+        (is (= 3 (count (sc/search w :all))) ":all still matches everything")
+        (let [hits (sc/search w "distinctive")]
+          (is (= 1 (count hits))
+              "a string must SEARCH, not match every document")
+          (is (= "alpha" (get (first hits) "title"))))
+        (let [hits (sc/search w "ordinary")]
+          (is (= 2 (count hits)) "and find each match"))
+        (let [hits (sc/search w :all {:fields [:title]})]
+          (is (every? #(nil? (get % "body")) hits) ":fields must restrict what comes back")
+          (is (every? #(some? (get % "title")) hits) "to exactly what was asked for"))
+        (is (thrown? clojure.lang.ExceptionInfo (sc/search w 42))
+            "and an unsupported query is an error, not a silent match-all")
+        (finally (sc/close! w) (delete-dir-recursive path))))))

@@ -5,10 +5,17 @@
   with lazy loading from disk (O(1) startup) and incremental updates.
 
   Each entry is {:branch b :key k :value v :generation g}.
-  Sorted by [:branch :key :value] enabling efficient exact and floor queries."
-  (:require [clojure.core.async :refer [<!!]]
+  Sorted by [:branch :key :value] enabling efficient exact and floor queries.
+
+  Every store call is `{:sync? true}`. It used to block on konserve's async
+  channel with `<!!`, which measured 8.6x slower per write on the same
+  filestore — a flush issues eight of them, so it dominated commit cost for any
+  index carrying metadata. `scriptum.konserve` was already synchronous
+  throughout; this namespace was the outlier."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [konserve.core :as k]
-            [konserve.filestore :refer [connect-fs-store]]
+            [konserve.store :as kstore]
             [org.replikativ.persistent-sorted-set :as pss])
   (:import [org.replikativ.persistent_sorted_set ANode Branch IStorage Leaf Settings]))
 
@@ -55,13 +62,13 @@
                      :keys      (mapv entry->map (.keys node))
                      :addresses (when (instance? Branch node)
                                   (vec (.addresses ^Branch node)))}]
-      (<!! (k/assoc kv-store address node-data))
+      (k/assoc kv-store address node-data {:sync? true})
       (swap! cache assoc address node)
       address))
 
   (restore [_ address]
     (or (get @cache address)
-        (let [node-data (<!! (k/get kv-store address))
+        (let [node-data (k/get kv-store address nil {:sync? true})
               raw-keys (:keys node-data)
               keys (mapv map->entry raw-keys)
               addresses (:addresses node-data)
@@ -77,6 +84,17 @@
   (accessed [_ _address] nil)
 
   (markFreed [_ address]
+    ;; KNOWN LEAK, not yet fixed. This map grows with every node the tree ever
+    ;; frees and nothing prunes it — measured ~1 entry per commit — and
+    ;; `flush-index!` rewrites the whole map on every flush, so the cost is
+    ;; O(commits) per commit and O(n^2) overall: ~0.13 ms at 1 entry against
+    ;; ~3.6 ms at 5000.
+    ;;
+    ;; The fix is to delete the freed node from the store and drop it from the
+    ;; map, which would bound both this and the orphaned nodes it tracks. Left
+    ;; alone deliberately: persistent-sorted-set is the only consumer of
+    ;; `isFreed`/`freedInfo`, and pruning changes the answers it gets, so it
+    ;; needs PSS's contract confirmed rather than a guess about it.
     (when address
       (swap! freed-atom assoc address (System/currentTimeMillis))))
 
@@ -90,11 +108,47 @@
 ;; Store / Storage lifecycle
 ;; ============================================================================
 
+(def ^:private store-id-suffix
+  "Suffix for the file holding a store's identity.
+
+  BESIDE the store directory, never inside it: konserve's filestore treats every
+  file under its path as a blob, and a stray one is picked up by the v1 migration
+  scan and fails there."
+  ".store-id")
+
+(defn- store-id!
+  "This store's konserve id: minted once at random, then persisted.
+
+  A CONSTANT RANDOM UUID, not a function of the path, because konserve's `:id`
+  is a GLOBAL address. Deriving it from the location gets both directions wrong:
+  copy or move the directory and the same logical store answers to a different
+  id, while two unrelated stores that happen to share a mount path answer to the
+  same one. Minting once and writing it beside the store makes the identity
+  travel with the bytes, which is what `konserve.store/validate-store-config`
+  is asking for when it requires a UUID.
+
+  Written before the store is connected, because konserve needs the id at
+  connect time and so it cannot live inside the store it identifies."
+  [path]
+  (let [f (java.io.File. (str path store-id-suffix))]
+    (if (.exists f)
+      (java.util.UUID/fromString (str/trim (slurp f)))
+      (let [id (random-uuid)]
+        (io/make-parents f)
+        (spit f (str id))
+        id))))
+
 (defn- create-store [path]
   (let [dir (java.io.File. (str path))]
     (when-not (.exists dir)
       (.mkdirs dir)))
-  (<!! (connect-fs-store (str path))))
+  ;; `connect-store`, not `connect-fs-store`: only the former attaches the
+  ;; config, and a store with no `:id` answers nil to `konserve.protocols/store-id`
+  ;; — which is what silently disabled the GC guard in `scriptum.konserve`.
+  (let [cfg {:backend :file :path (str path) :id (store-id! path)}]
+    (if (konserve.filestore/store-exists? nil (str path))
+      (kstore/connect-store cfg {:sync? true})
+      (kstore/create-store cfg {:sync? true}))))
 
 (defn- create-storage
   ([kv-store]
@@ -103,16 +157,16 @@
    (->ScriptumMetadataStorage kv-store settings (atom {}) (atom {}))))
 
 (defn- save-roots! [kv-store roots]
-  (<!! (k/assoc kv-store :metadata/roots roots)))
+  (k/assoc kv-store :metadata/roots roots {:sync? true}))
 
 (defn- load-roots [kv-store]
-  (<!! (k/get kv-store :metadata/roots)))
+  (k/get kv-store :metadata/roots nil {:sync? true}))
 
 (defn- save-freed! [kv-store freed]
-  (<!! (k/assoc kv-store :metadata/freed freed)))
+  (k/assoc kv-store :metadata/freed freed {:sync? true}))
 
 (defn- load-freed [kv-store]
-  (or (<!! (k/get kv-store :metadata/freed)) {}))
+  (or (k/get kv-store :metadata/freed nil {:sync? true}) {}))
 
 ;; ============================================================================
 ;; MetadataIndex record
@@ -180,23 +234,41 @@
   (let [idx @(:index-atom mi)
         from {:branch branch :key key :value "" :generation 0}
         to   {:branch branch :key key :value value :generation Long/MAX_VALUE}
-        results (pss/slice idx from to metadata-comparator)]
-    (when-let [entry (last (seq results))]
+        ;; rslice, not slice+last: `last` realizes the whole forward slice from
+        ;; the branch/key's first entry up to the target, so a floor lookup was
+        ;; O(matched entries) where the tree gives O(log n). Measured 0.0147 /
+        ;; 0.126 / 0.968 ms at 100 / 1000 / 10000 entries — perfectly linear —
+        ;; against a flat 0.001-0.003 ms for the exact lookup beside it.
+        results (pss/rslice idx to from metadata-comparator)]
+    (when-let [entry (first (seq results))]
       (when (and (= (:branch entry) branch)
                  (= (:key entry) key))
         {:generation (:generation entry)
          :indexed-value (:value entry)}))))
 
 (defn rebuild-from-snapshots!
-  "Rebuild the metadata index from surviving snapshots after GC.
+  "Rebuild the metadata index for the branches named in `snapshots-by-branch`.
+
   snapshots-by-branch: map of branch-name -> seq of snapshot maps
-  (each with :custom-metadata and :generation)."
+  (each with :custom-metadata and :generation).
+
+  AUTHORITATIVE ONLY FOR THE BRANCHES IT IS GIVEN. Entries for any other branch
+  are carried across untouched. It used to rebuild from the map alone and
+  `reset!` the result, so a branch missing from it lost every entry — and the
+  caller drops exactly the branches it could not read, which for `scriptum.core/gc!`
+  means any branch with a live writer, i.e. the ordinary main+feature workflow.
+  A collection on main silently erased the feature branch's metadata.
+
+  Absence is not evidence here: a branch that could not be re-derived is a
+  branch we know nothing about, not one we know to be empty."
   [^MetadataIndex mi snapshots-by-branch]
   (let [storage (:storage mi)
+        rebuilt (set (keys snapshots-by-branch))
         fresh-idx (into (pss/sorted-set* {:comparator metadata-comparator
                                           :storage storage
                                           :branching-factor 64})
-                        [])]
+                        ;; everything we are NOT rebuilding, preserved
+                        (remove #(contains? rebuilt (:branch %)) @(:index-atom mi)))]
     (reset! (:index-atom mi)
             (reduce
              (fn [idx [branch-name snapshots]]
@@ -229,6 +301,35 @@
       (save-roots! kv-store {:index root})
       (save-freed! kv-store @(:freed-atom storage))
       (reset! (:dirty-atom mi) false))))
+
+(defn mark
+  "Every key this index needs kept, for a collector over its store.
+
+  MUST BE UNIONED WITH `scriptum.konserve/mark` WHEN BOTH SHARE A STORE.
+  `konserve.gc/sweep!` is allow-list — it deletes every key not named — and
+  scriptum's own mark cannot infer these: `:metadata/roots` and
+  `:metadata/freed` are bare keywords, and every PSS node is stored under a
+  raw `(random-uuid)`, so there is no `[:scriptum …]` prefix to match on. The
+  result was not a collision but something quieter: a sweep from scriptum's
+  whitelist deleted the roots and every node, leaving the in-memory atom as the
+  only surviving copy until restart.
+
+  No in-tree caller shares a store today — `create-metadata-index` always builds
+  its own filestore under `<path>/scriptum-metadata` — but `open-store-index`
+  accepts a `:metadata-index` over any store, so the wiring is one line away.
+
+  Walks the tree from the roots, so it costs a read per node."
+  [kv-store]
+  (let [roots (load-roots kv-store)]
+    (loop [queue (if-let [r (:index roots)] [r] [])
+           seen #{}]
+      (if-let [address (first queue)]
+        (if (contains? seen address)
+          (recur (rest queue) seen)
+          (let [node (k/get kv-store address nil {:sync? true})]
+            (recur (into (vec (rest queue)) (:addresses node))
+                   (conj seen address))))
+        (into #{:metadata/roots :metadata/freed} seen)))))
 
 (defn close-index!
   "Flush and close the metadata index store."

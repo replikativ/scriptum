@@ -98,8 +98,8 @@ clj -T:build compile-java
 (sc/commit! feature "Added experimental doc")
 
 ;; Main still has 1 doc, branch has 2
-(count (sc/search writer {:match-all {}} 100))    ;; => 1
-(count (sc/search feature {:match-all {}} 100))   ;; => 2
+(count (sc/search writer :all))    ;; => 1
+(count (sc/search feature :all))   ;; => 2
 
 ;; Merge branch back
 (sc/merge-from! writer feature)
@@ -162,7 +162,7 @@ Scriptum's field types are designed for real-world use cases like email indexing
 (sc/open-branch path branch-name)                     ; open existing branch
 (sc/fork writer "branch-name")                        ; fast fork from writer
 (sc/close! writer)                                    ; close writer and release resources
-(sc/discover-branches path)                           ; => ["main" "feature" ...]
+(sc/discover-branches path)                           ; => #{"feature"} — forks only, not main
 
 ;; Accessors
 (sc/num-docs writer)                ; document count (excluding deletions)
@@ -327,11 +327,24 @@ Scriptum provides composable query builders so you don't need to import Lucene c
 ### Garbage Collection
 
 ```clojure
-;; Remove commits older than 1 hour, respecting branch references
-(sc/gc! writer)
+;; Remove commits older than an hour, respecting branch references
+(sc/gc! writer (.minus (java.time.Instant/now) (java.time.Duration/ofHours 1)))
 ```
 
-GC only runs on the main branch and protects all segment files referenced by any branch.
+GC only runs on the main branch and protects all segment files referenced by any
+branch.
+
+**It reclaims nothing while a branch still shares files with main** — which
+after an ordinary fork is always. Protection is per commit point (one is spared
+if it references any file a branch references) and a fresh fork shares every
+base segment, so every commit point on main stays pinned. Measured over 6
+commits: 6 removed with no branch, **0** with one untouched fork, 7 once that
+fork has merged away its inherited segments. A call that reclaims nothing still
+adds a commit point.
+
+The conservatism is in the safe direction. The **store-backed** model avoids the
+sharing problem — reachability is computed across every branch's manifest — but
+still needs `retain!` before anything becomes unreachable; see Retention below.
 
 ## Java API
 
@@ -425,6 +438,143 @@ main.close();
 | `numDocs()` / `maxDoc()` | Document counts |
 | `getBranchName()` | Current branch name |
 | `isMainBranch()` | Check if main branch |
+
+## Konserve-Backed Storage
+
+An index can live in a [konserve](https://github.com/replikativ/konserve) store
+instead of a directory tree, which is what makes it usable on an object store.
+Konserve is the source of truth; the local directory is a derived cache that may
+be deleted at any time and rebuilt from the store.
+
+A branch is a manifest rather than a directory:
+
+```
+[:scriptum :manifest <branch>]  ->  <commit address>          ; the one mutable cell
+[:scriptum :snapshot <address>] ->  {:files   {name -> address}
+                                     :parents [<address> ...]}
+[:scriptum :blob <address>]     ->  segment bytes             ; content-addressed
+```
+
+Segments shared between branches are one blob, and one inode locally, so a fork
+copies a pointer and no bytes move.
+
+```clojure
+(require '[konserve.store :as kstore]
+         '[scriptum.core :as sc]
+         '[scriptum.konserve :as sk])
+
+;; The store must carry a konserve :id — connect-store attaches one,
+;; konserve.filestore/connect-fs-store does not, and scriptum refuses a store
+;; without one because the GC guard is keyed on it.
+(def store (kstore/create-store {:backend :file
+                                 :path "/data/index-store"
+                                 :id #uuid "..."}
+                                {:sync? true}))
+
+(def writer (sc/open-store-index store "/tmp/index-cache" "main"))
+(sc/add-doc writer {:title "Hello" :body "world"})
+(sc/commit! writer "first")
+
+(sc/fork writer "feature")        ; copies a pointer; no bytes move
+(sc/branches writer)              ; => #{"main" "feature"}
+```
+
+### Snapshots are values
+
+Every commit has an immutable, content-addressed address covering its files and
+its ancestry. Hold one and you can come back to exactly that state:
+
+```clojure
+(def held (sc/snapshot-address writer))     ; a UUID naming this index state
+
+;; read-only, on any machine with the store
+(with-open [d (sk/snapshot-directory store "/tmp/cache" held)]
+  ...)
+
+;; or restore a branch to it, writable
+(sc/open-store-index-at store "/tmp/cache" "main" held)
+(sk/fork-from-snapshot! store "from-held" held)
+```
+
+### Warming a cold machine
+
+Materialization is lazy — a selective query does not pay for segments it never
+reads. On a machine with an empty cache that is about to serve, that is the
+wrong trade: Lucene opens segment readers serially, so a cold query costs one
+round trip per file, in sequence. Measured on a 35-segment index at 60 ms
+latency: **2.2 s lazily against 275 ms warmed**.
+
+```clojure
+(sc/warm! writer)                                     ; fetch this branch, in parallel
+(sc/warm! writer {:only #(str/ends-with? % ".cfs")})  ; or part of it
+```
+
+Lucene's own warming hooks do not help here, because they all assume the file is
+already on the machine: `IndexInput.prefetch` fires after this Directory has
+materialized the whole blob, `MMapDirectory.setPreload` pages in what is on
+disk, and `setMergedSegmentWarmer` warms this writer's own merges.
+
+### Collection
+
+`scriptum.core/gc!` is for directory-backed indices and throws here. A
+store-backed index collects by reachability:
+
+```clojure
+(sk/gc! store (sk/store-id-for store))       ; collect the store
+(sk/gc-cache! store "/tmp/index-cache")      ; and the local cache, separately
+```
+
+Both take the snapshot addresses an external holder still references, so a state
+no branch names is not collected out from under them.
+
+**On a store you do not own** — one shared with datahike, say — do not call
+`sk/gc!` at all. konserve's sweep is allow-list, so it would delete every key
+scriptum does not name. Use `sk/mark` to contribute scriptum's keys to that
+store's own collector, unioned with `scriptum.metadata/mark` if a metadata index
+shares the store.
+
+### Retention
+
+Every commit point is kept by default, so a branch's file map is cumulative —
+30 commits of 30 documents were measured naming 130 files, 30 of them commit
+points. All of that is legitimately reachable, which is why collection reclaims
+nothing however long the index runs. `retain!` is what bounds it:
+
+```clojure
+(sc/retain! writer {:before (.minus (Instant/now) (Duration/ofDays 30))})
+(sk/gc! store (sk/store-id-for store))     ; now there is something to collect
+```
+
+Dropping a commit point removes its files from the manifest; the collector then
+takes the blobs no other branch names. Reading a dropped commit **by generation**
+stops working — its state is still reachable by snapshot address.
+
+**Holding an address pins nothing.** `snapshot-address` hands you a value; it
+registers no claim. To keep a state alive you must pass it on every collection,
+to both collectors:
+
+```clojure
+(def held (sc/snapshot-address writer))
+(sk/gc! store (sk/store-id-for store) (ku/now) #{held})
+(sk/gc-cache! store "/tmp/index-cache" #{held})
+```
+
+Under yggdrasil this is automatic: the coordinator computes reachability from
+every system's `gc-roots` and the commit graph, and `gc-sweep!` drops the
+candidates it is handed.
+
+### Limits worth knowing
+
+- **One writer per branch**, in one JVM. The write lock lives in the local
+  cache, so it does not span machines, and the manifest write is not yet a
+  compare-and-set. Writers on *different* branches are safe by construction.
+- **History accumulates until you prune it.** Every commit point is retained by
+  default, so the store grows with commit count regardless of live document
+  count. See Retention above.
+- **`scriptum.audit` needs `:crypto-hash?`**, which store-backed indices do not
+  yet enable, so audit degrades to `{:status :advisory}` there.
+- Against a remote store, start from `scriptum.konserve/remote-tuning` — Lucene's
+  default 5 GB merged-segment cap is not appropriate for an object store.
 
 ## Yggdrasil Integration
 

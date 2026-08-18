@@ -53,19 +53,38 @@ public class ContentHash {
     }
   }
 
+  /** Digest buffer size. Large enough that the syscall cost disappears, small enough to stay off
+   *  the heap's radar — the point of streaming is that this number, not the file size, is the
+   *  memory this costs. */
+  private static final int HASH_BUFFER_SIZE = 1 << 16;
+
   /**
-   * Hash a file's contents to UUID5.
+   * Hash a file's contents to UUID5, reading it in bounded chunks.
    *
-   * <p>Reads the entire file into memory and computes its SHA-512 hash. For very large files (>1GB
-   * segments), consider streaming approaches.
+   * <p>Streaming rather than {@code Files.readAllBytes}: a merged Lucene segment routinely exceeds
+   * what a single {@code byte[]} can even address, so materializing one is not merely wasteful but
+   * an outright ceiling — {@code readAllBytes} throws above {@code Integer.MAX_VALUE}, and the JVM
+   * runs out of heap long before that. The digest is identical either way; only the peak memory
+   * differs, and here it is {@link #HASH_BUFFER_SIZE} regardless of segment size.
    *
    * @param filePath Path to file to hash
    * @return UUID5 of file contents
    * @throws IOException if file cannot be read
    */
   public static UUID hashFile(Path filePath) throws IOException {
-    byte[] fileBytes = Files.readAllBytes(filePath);
-    return hashBytes(fileBytes);
+    try {
+      MessageDigest md = MessageDigest.getInstance("SHA-512");
+      try (java.io.InputStream in = Files.newInputStream(filePath)) {
+        byte[] buf = new byte[HASH_BUFFER_SIZE];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+          md.update(buf, 0, n);
+        }
+      }
+      return bytesToUUID5(md.digest());
+    } catch (NoSuchAlgorithmException e) {
+      throw new RuntimeException("SHA-512 not available", e);
+    }
   }
 
   /**

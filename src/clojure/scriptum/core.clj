@@ -9,7 +9,8 @@
   - Snapshot: immutable DirectoryReader at a specific commit point
   - Branch: COW overlay sharing base segments with the trunk
   - GC: explicit cleanup of old snapshots respecting branch references"
-  (:require [scriptum.metadata :as metadata])
+  (:require [scriptum.konserve :as sk]
+            [scriptum.metadata :as metadata])
   (:import [java.nio.file Path Paths]
            [java.time Instant Duration]
            [org.apache.lucene.analysis Analyzer]
@@ -33,7 +34,18 @@
 
 ;; --- ScriptumWriter wrapper ---
 
-(defrecord ScriptumWriter [writer metadata-index])
+(defrecord ScriptumWriter [writer metadata-index backing]
+  ;; `backing` is nil for a directory-backed index and
+  ;; `{:store s :cache c :directory d}` for a store-backed one. Everything a
+  ;; writer does to DOCUMENTS is pure Lucene and identical either way; only
+  ;; branch TOPOLOGY — fork, branch discovery, collection — differs, because a
+  ;; branch is a directory in one model and a manifest in the other.
+  )
+
+(defn store-backed?
+  "Is this writer backed by a konserve store rather than a directory tree?"
+  [sw]
+  (boolean (and (instance? ScriptumWriter sw) (:backing sw))))
 
 (defn ->writer
   "Extract the BranchIndexWriter from a ScriptumWriter or pass through a raw writer."
@@ -50,6 +62,18 @@
 
 ;; --- Index Lifecycle ---
 
+(defn- tune!
+  "Apply the segment-size knobs to a freshly opened writer.
+
+  Both are live settings on Lucene's side — the merge policy re-reads its cap on
+  every merge decision and the flush buffer applies to the next flush — so they
+  are set after construction rather than threaded through the Java
+  constructors."
+  [^BranchIndexWriter writer max-merged-segment-mb ram-buffer-mb]
+  (when max-merged-segment-mb (.setMaxMergedSegmentMB writer (double max-merged-segment-mb)))
+  (when ram-buffer-mb (.setRAMBufferSizeMB writer (double ram-buffer-mb)))
+  writer)
+
 (defn create-index
   "Create a new branched index at the given path.
 
@@ -58,17 +82,33 @@
   Options:
     :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)
     :crypto-hash? - enable merkle hashing for commits (default: false)
+    :max-merged-segment-mb - cap on a merged segment, in MB (Lucene default: 5120)
+    :ram-buffer-mb - flush buffer, in MB (Lucene default: 16)
+
+  THE TWO SIZE KNOBS ARE THE ONES THAT MATTER FOR A REMOTE STORE. Lucene's
+  defaults are tuned for a local disk, where a segment is just a file and 5 GB
+  costs nothing to leave lying there. Against an object store a segment is a
+  blob written and read whole, so the merged-segment cap sets the peak memory a
+  commit costs — konserve's S3 backing holds a blob in the heap to PUT it — and
+  it has to stay clear of S3's 5 GB single-PUT limit. A few hundred MB is a
+  reasonable cap there; `scriptum.konserve/remote-tuning` carries defaults.
+
+  The flush buffer sets the other end of the distribution: it bounds segments
+  created by a flush, before any merge, and so governs how small the small
+  objects are.
 
   Returns a ScriptumWriter wrapping BranchIndexWriter + metadata index."
   ([^String path ^String branch-name]
    (create-index path branch-name {}))
-  ([^String path ^String branch-name {:keys [analyzer crypto-hash?]}]
+  ([^String path ^String branch-name {:keys [analyzer crypto-hash?
+                                             max-merged-segment-mb ram-buffer-mb]}]
    (let [base-path (->path path)
          analyzer (or analyzer (StandardAnalyzer.))
          crypto-hash (boolean crypto-hash?)
          writer (BranchIndexWriter/create base-path branch-name analyzer crypto-hash)
          mi (metadata/create-metadata-index path)]
-     (->ScriptumWriter writer mi))))
+     (tune! writer max-merged-segment-mb ram-buffer-mb)
+     (->ScriptumWriter writer mi nil))))
 
 (defn open-branch
   "Open an existing branch writer (for out-of-process branch access).
@@ -77,15 +117,33 @@
 
   Options:
     :analyzer - the Lucene Analyzer to use (default: StandardAnalyzer)
-    :metadata-index - shared metadata index (default: creates new one)"
+    :metadata-index - shared metadata index (default: creates new one)
+    :max-merged-segment-mb - cap on a merged segment, in MB (Lucene default: 5120)
+    :ram-buffer-mb - flush buffer, in MB (Lucene default: 16)
+
+  THE TWO SIZE KNOBS ARE THE ONES THAT MATTER FOR A REMOTE STORE. Lucene's
+  defaults are tuned for a local disk, where a segment is just a file and 5 GB
+  costs nothing to leave lying there. Against an object store a segment is a
+  blob written and read whole, so the merged-segment cap sets the peak memory a
+  commit costs — konserve's S3 backing holds a blob in the heap to PUT it — and
+  it has to stay clear of S3's 5 GB single-PUT limit. A few hundred MB is a
+  reasonable cap there; `scriptum.konserve/remote-tuning` carries defaults.
+
+  The flush buffer sets the other end of the distribution: it bounds segments
+  created by a flush, before any merge, and so governs how small the small
+  objects are."
   ([^String path ^String branch-name]
    (open-branch path branch-name {}))
-  ([^String path ^String branch-name {:keys [analyzer metadata-index]}]
+  ([^String path ^String branch-name {:keys [analyzer metadata-index
+                                             max-merged-segment-mb ram-buffer-mb]}]
    (let [base-path (->path path)
          analyzer (or analyzer (StandardAnalyzer.))
          writer (BranchIndexWriter/open base-path branch-name analyzer)
          mi (or metadata-index (metadata/create-metadata-index path))]
-     (->ScriptumWriter writer mi))))
+     (tune! writer max-merged-segment-mb ram-buffer-mb)
+     (->ScriptumWriter writer mi nil))))
+
+(declare open-store-index)
 
 (defn fork
   "Fork the index into a new branch. Returns the new branch writer.
@@ -93,10 +151,235 @@
   The new branch shares all existing segments with the parent.
   Cost: ~3-5ms (flush buffer + copy manifest)."
   [sw ^String new-branch-name]
-  (let [w (->writer sw)
-        mi (->metadata-index sw)
-        new-writer (.fork w new-branch-name)]
-    (->ScriptumWriter new-writer mi)))
+  (if (store-backed? sw)
+    ;; Forking a store-backed index copies a manifest — no bytes move and no
+    ;; directory is created. The parent must land its buffered writes first, or
+    ;; the copy names a manifest that does not yet describe them.
+    (let [{:keys [store cache store-id analyzer
+                  max-merged-segment-mb ram-buffer-mb]} (:backing sw)]
+      ;; CHECK BEFORE COMMITTING. This committed the parent first, so a fork onto
+      ;; a name that already exists left a commit point on the source and then
+      ;; threw — the same defect the Java `fork` was rewritten to remove, still
+      ;; here on the store path.
+      (when (sk/branch-exists? store new-branch-name)
+        (throw (ex-info "scriptum: branch already exists" {:branch new-branch-name})))
+      (.commit (->writer sw))
+      (sk/fork! store (.getBranchName (->writer sw)) new-branch-name)
+      ;; CARRY THE PARENT'S GUARD ID. Dropping it left a caller who passed
+      ;; `:store-id` explicitly with a parent guarded under their id and a fork
+      ;; guarded under the derived one — two ids for one store, which is the
+      ;; case `konserve.gc-guard` names as deleting live data, and which
+      ;; measured as thousands of lost blobs and a branch that would not open.
+      ;; CARRY THE PARENT'S SETTINGS, not just its guard id. A fork builds a
+      ;; fresh IndexWriterConfig, so anything not passed reverts to Lucene's
+      ;; defaults — including the 5 GB merged-segment cap the remote-store
+      ;; guidance exists to keep clear of S3's single-PUT limit. A parent tuned
+      ;; to 256 MB silently produced a fork at 5120.
+      (open-store-index store cache new-branch-name
+                        {:metadata-index (->metadata-index sw)
+                         :store-id store-id
+                         :analyzer analyzer
+                         :max-merged-segment-mb max-merged-segment-mb
+                         :ram-buffer-mb ram-buffer-mb}))
+    (let [w (->writer sw)
+          mi (->metadata-index sw)
+          new-writer (.fork w new-branch-name)]
+      (->ScriptumWriter new-writer mi nil))))
+
+(defn open-store-index
+  "Open `branch` of a konserve-backed index, materializing through `cache`.
+
+  The store is the source of truth; `cache` is a derived local directory that
+  may be deleted at any time — see `scriptum.konserve`. Lucene still mmaps
+  local files, so a cache is required even when the store is remote; what the
+  store buys is that it is the only thing that must be durable.
+
+  Takes a CONNECTED store. A secondary index that must reconnect from a
+  serialized key-map (datahike's `-sec-restore`) connects it itself and passes
+  the store in — that belongs in the adapter, which owns the config, not here.
+
+  Options:
+    :analyzer - the Lucene Analyzer (default: StandardAnalyzer)
+    :metadata-index - shared metadata index (default: none)
+    :store-id - id for konserve.gc-guard, so a collection cannot sweep this
+                index's in-flight segment writes. Defaults to the store's own
+                id, which is what keeps two components on one store from
+                disagreeing about its name.
+    :max-merged-segment-mb / :ram-buffer-mb - see `create-index`. Against a
+                remote store start from `scriptum.konserve/remote-tuning`.
+
+  Returns a ScriptumWriter. Document operations, search, commit and readers
+  behave exactly as for a directory-backed index, and `fork` and `branches`
+  answer from the manifests instead of the filesystem. COLLECTION IS DIFFERENT:
+  `scriptum.core/gc!` throws here and `scriptum.konserve/gc!` is the one to
+  call, because a store-backed index collects by reachability and has to read
+  the gc-guard's cutoff before walking, which the directory-backed collector
+  does not do."
+  ([store cache branch] (open-store-index store cache branch {}))
+  ([store ^String cache ^String branch
+    {:keys [analyzer metadata-index store-id max-merged-segment-mb ram-buffer-mb]}]
+   (let [analyzer (or analyzer (StandardAnalyzer.))
+         ;; Default the guard id off the store rather than making the caller
+         ;; track it, so two components on one store cannot disagree about its
+         ;; name — see konserve.gc-guard on why only that direction is unsafe.
+         ;;
+         ;; A nil id silently disables the guard — a collection then sweeps an
+         ;; in-flight commit's blobs and bricks the branch — so connect the store
+         ;; with `konserve.store/connect-store`, which requires a UUID `:id` and
+         ;; attaches it. `konserve.filestore/connect-fs-store` carries no config
+         ;; and answers nil; see `scriptum.konserve/store-id-for`.
+         store-id (or store-id (sk/store-id-for store))
+         ;; Where `merge-from!` records the lineage it brought in, so the next
+         ;; commit can name it as a parent. It has to be created out here
+         ;; because the Directory is a proxy with no way to reach into it.
+         pending-parents (atom #{})
+         dir (sk/konserve-directory store cache branch store-id pending-parents)
+         ;; CLOSE THE DIRECTORY IF THE WRITER CANNOT BE BUILT. `createOver` takes
+         ;; ownership only once it returns; if it throws — a second writer on the
+         ;; branch gives LockObtainFailedException — nobody owned this Directory
+         ;; and its mmap arena, and for a store-backed one the gc-guard sequence
+         ;; it may have opened, were left to the garbage collector.
+         writer (try (BranchIndexWriter/createOver dir branch analyzer)
+                     (catch Throwable t
+                       (try (.close ^java.io.Closeable dir) (catch Throwable _))
+                       (throw t)))]
+     (tune! writer max-merged-segment-mb ram-buffer-mb)
+     (->ScriptumWriter writer metadata-index
+                       {:store store :cache cache :directory dir :store-id store-id
+                        :pending-parents pending-parents
+                        ;; Kept so `fork` can reproduce them. Lucene's config is
+                        ;; per-writer and a fork builds a fresh one, so anything
+                        ;; not carried here silently reverts to Lucene's defaults.
+                        :analyzer analyzer
+                        :max-merged-segment-mb max-merged-segment-mb
+                        :ram-buffer-mb ram-buffer-mb}))))
+
+(defn snapshot-address
+  "The immutable address of this branch's current index state, or nil.
+
+  THE VALUE A CALLER HOLDS TO COME BACK TO THIS EXACT STATE. A branch name is a
+  mutable cell and says nothing about which commit it is on; this is content-
+  addressed and cannot change under the holder. It is what a secondary-index
+  key-map should carry — datahike's already carries `:commit-id` for proximum
+  and `:dataset-commit-id` for stratum, and scriptum was the outlier naming a
+  branch.
+
+  It is also a merkle root over the whole history — `ContentHash/hashMap` over
+  the file map AND the parents, whose values are themselves content hashes of
+  segments — so it doubles as a content hash without `:crypto-hash?` being on.
+
+  Reflects the last COMMIT, since the branch pointer moves at commit time —
+  buffered writes are not in it. Store-backed indices only; nil otherwise."
+  [sw]
+  (when (store-backed? sw)
+    (sk/branch-snapshot (:store (:backing sw)) (.getBranchName (->writer sw)))))
+
+(defn open-store-index-at
+  "Open `branch` as a WRITABLE index at the state named by `address`.
+
+  Points the branch at `address` and opens it — the restore half of
+  `snapshot-address`. Without it a holder could read a snapshot
+  (`scriptum.konserve/snapshot-directory`) but never write from one, so
+  restoring a secondary index to a specific state was impossible and opening the
+  branch silently gave whatever it had moved on to instead.
+
+  THIS MOVES THE BRANCH. Whatever it named before becomes unreachable and
+  collectable; hold that address yourself if you still want it. Do not call it
+  on a branch another writer has open — see
+  `scriptum.konserve/point-branch-at!`.
+
+  Takes the same options as `open-store-index`."
+  ([store cache branch address] (open-store-index-at store cache branch address {}))
+  ([store ^String cache ^String branch address opts]
+   (sk/point-branch-at! store branch address)
+   (open-store-index store cache branch opts)))
+
+(defn retain!
+  "Drop old commit points from a store-backed index, bounding its growth.
+
+  THE THING THAT MAKES A STORE-BACKED INDEX FINITE. Nothing else prunes it:
+  every commit point is kept, so the branch's file map is cumulative — 30
+  commits of 30 documents were measured naming 130 files, 30 of them commit
+  points — and all of it is legitimately reachable, so `scriptum.konserve/gc!`
+  correctly reclaims nothing. Dropping a commit point removes its files from the
+  manifest, and the collector can then take the blobs no other branch names.
+
+  Two ways to say what goes, because two callers ask different questions:
+
+    :before     — an Instant; drop commit points committed before it. This is
+                  yggdrasil's `:remove-before`, and the timestamp compared is
+                  the real commit time from user-data.
+    :commit-ids — drop exactly these `snapshot-id`s. yggdrasil's coordinator
+                  computes reachability itself, from every system's `gc-roots`
+                  and the commit graph, and hands each adapter its own
+                  candidates; a cutoff cannot express that, since an unreachable
+                  commit may be newer than a reachable one elsewhere.
+
+  Issues a commit WHEN IT WILL ACTUALLY DROP SOMETHING, because `onCommit` is
+  the only place Lucene lets a deletion policy act — and because committing is
+  not free here, since the commit itself becomes a commit point. A sweep that
+  matches nothing returns 0 without touching the index; doing otherwise made
+  the collector grow the index on every cycle under yggdrasil, whose candidates
+  come from a registry that never names scriptum's own bookkeeping commits.
+
+  THE BRANCH HEAD IS NEVER DROPPED, whatever the cutoff says, so a caller who
+  passes `:before (now)` does not lose the commit `gc-roots` just reported.
+
+  THE SHRINK IS PUBLISHED AT THE NEXT COMMIT, not this one: Lucene removes a
+  dropped commit point's files during the checkpoint that follows the flip, so
+  the manifest for the retain commit is already written by then. `retain!`
+  reports what it dropped; the manifest reflects it once you commit again.
+
+  IT ALSO COMMITS WHATEVER IS BUFFERED, because `IndexWriter.commit` cannot do
+  otherwise. Collection should not be what makes a caller's in-flight writes
+  durable — commit first if that distinction matters to you.
+
+  READING A DROPPED COMMIT BY GENERATION STOPS WORKING — that is the trade. Its
+  state is still reachable by snapshot address, which is what
+  `scriptum.konserve/snapshot-directory` opens and what yggdrasil's `as-of`
+  maps onto.
+
+  HOLDING AN ADDRESS PINS NOTHING. `snapshot-address` hands you a value; it
+  registers no claim on it, and once no branch names that state `gc!` collects
+  it. To keep one you must pass it as `extra-snapshots` on EVERY collection —
+  to `scriptum.konserve/gc!` for the store and to `gc-cache!` for the local
+  cache, which take it separately.
+
+  Returns the number of commit points dropped, or nil for a directory-backed
+  index, which must use `gc!` — there a commit point holds real files another
+  branch may share."
+  [sw {:keys [before commit-ids]}]
+  (when (store-backed? sw)
+    (.retain (->writer sw) before (when commit-ids (set (map str commit-ids))))))
+
+(defn warm!
+  "Materialize this branch's segments into the local cache, in parallel.
+
+  FOR A COLD MACHINE — a fresh container, a thawed Lambda, a cache that was
+  wiped. The store has everything and this machine has nothing, and Lucene will
+  otherwise fetch one file per round trip in sequence, because
+  `StandardDirectoryReader` opens segment readers serially. Measured on a
+  35-segment index at 60 ms latency: 2.2 s lazily against 275 ms warmed.
+
+  Explicit rather than automatic: materialization is lazy by design, since a
+  selective query should not pay for segments it never reads. Warming is worth
+  it when you know the machine is cold and about to serve.
+
+  Options: `:only`, a predicate on the Lucene filename. Returns the number of
+  files materialized. Store-backed indices only; nil otherwise."
+  ([sw] (warm! sw {}))
+  ([sw opts]
+   (when (store-backed? sw)
+     (let [{:keys [store cache]} (:backing sw)]
+       (sk/warm! store cache (.getBranchName (->writer sw)) opts)))))
+
+(defn branches
+  "Every branch of a store-backed index, from its manifests."
+  [sw]
+  (if (store-backed? sw)
+    (sk/branches (:store (:backing sw)))
+    (throw (ex-info "scriptum: branches is for store-backed indices; use discover-branches for a path"
+                    {:writer sw}))))
 
 (defn discover-branches
   "Discover all branch names at the given path.
@@ -447,12 +730,42 @@
 
   Options:
     :limit - max results (default 10)
-    :fields - fields to retrieve (default: all stored fields)"
+    :fields - fields to retrieve (default: all stored fields)
+    :reader - search THIS reader instead of opening one (see below)
+
+  BY DEFAULT THIS OPENS A FRESH NRT READER, so it reflects the writer's state
+  including uncommitted changes — add a document and it is findable before any
+  commit. That is the semantics a git-like writer wants and it is not free:
+  `DirectoryReader.open(writer)` flushes every in-memory buffer, so a loop that
+  alternates writing and searching materializes a segment PER SEARCH. Measured
+  at 5.08 ms per write-then-search cycle against 0.159 ms reusing a reader —
+  32x, and the cost is segment churn rather than reader construction, which is
+  cheap (0.016 ms at one segment, 0.121 ms at 54).
+
+  So pass `:reader` when searching repeatedly without writing, or when writing
+  and searching in a loop. `snapshot`, `with-snapshot` and `open-reader-at`
+  hand out exactly the right object, which is also what makes this compose with
+  time travel. Whoever opens the reader closes it; scriptum owns no lifecycle
+  here, deliberately.
+
+  A held reader is a POINT IN TIME. It will not show later writes, and — more
+  sharply — it will still return documents deleted since, so a caller filtering
+  on identity must expect rows it has already removed. Reopen or take a fresh
+  `snapshot` to move forward.
+
+  Scriptum caches no searcher of its own, and that is a decision rather than an
+  omission: a cached NRT searcher refreshed on `commit!` was measured to break
+  read-your-own-writes, resurrect deleted documents between refreshes, and miss
+  `merge-from!` entirely — 5 documents against 13 — because that path commits
+  inside the Java layer without passing through `commit!`. The realistic gain
+  was 1.05-3.5x on a mixed query load, which is a poor price for those."
   ([sw query]
    (search sw query {}))
-  ([sw query {:keys [limit fields] :or {limit 10}}]
-   (let [^BranchIndexWriter writer (->writer sw)]
-     (with-open [reader (.openReader writer)]
+  ([sw query {:keys [limit fields reader] :or {limit 10}}]
+   (let [^BranchIndexWriter writer (->writer sw)
+         own-reader? (nil? reader)
+         ^DirectoryReader reader (or reader (.openReader writer))]
+     (try
        (let [searcher (IndexSearcher. reader)
              q (cond
                  (instance? org.apache.lucene.search.Query query)
@@ -462,21 +775,57 @@
                  (let [[field value] (:term query)]
                    (TermQuery. (Term. (name field) (str value))))
 
+                 ;; A STRING SEARCHES, it does not match everything. It was
+                 ;; documented as "matches all documents containing this term in
+                 ;; any field" and fell through to `MatchAllDocsQuery`, so a
+                 ;; caller searching for a word silently got the entire index —
+                 ;; wrong answers rather than an error.
+                 ;;
+                 ;; Parsed against the reader's indexed fields with the standard
+                 ;; analyzer, which matches how `add-doc` indexes `:text` fields.
+                 ;; A caller who indexed with a different analyzer should build
+                 ;; the Query themselves and pass it; that path is untouched.
+                 (string? query)
+                 (let [fields (into-array String
+                                          (sort (org.apache.lucene.index.FieldInfos/getIndexedFields
+                                                 reader)))]
+                   (if (zero? (alength fields))
+                     (MatchAllDocsQuery.)
+                     (.parse (MultiFieldQueryParser. fields (StandardAnalyzer.))
+                             ^String query)))
+
+                 (= :all query)
+                 (MatchAllDocsQuery.)
+
                  :else
-                 (MatchAllDocsQuery.))
+                 (throw (ex-info (str "scriptum: unsupported query " (pr-str query)
+                                      " — pass :all, {:term [field value]}, a string, "
+                                      "or a Lucene Query")
+                                 {:query query})))
              top-docs (.search searcher q (int limit))
-             hits (.-scoreDocs top-docs)]
+             hits (.-scoreDocs top-docs)
+             ;; Hoisted: this was built per HIT. It is a per-reader structure,
+             ;; not per-document, and rebuilding it for every result measured
+             ;; 1.8x on the extraction path at 100 hits.
+             sf (.storedFields searcher)]
          (mapv (fn [^ScoreDoc sd]
-                 (let [doc (.storedFields searcher)
-                       stored (.document doc (.-doc sd))
+                 (let [stored (.document sf (.-doc sd))
+                       ;; `:fields` was destructured and then ignored, so every
+                       ;; stored field came back whatever was asked for.
+                       keep? (if (seq fields) (set (map name fields)) (constantly true))
                        field-map (into {}
-                                       (map (fn [^IndexableField f]
-                                              [(.name f) (.stringValue f)]))
+                                       (comp (filter (fn [^IndexableField f] (keep? (.name f))))
+                                             (map (fn [^IndexableField f]
+                                                    [(.name f) (.stringValue f)])))
                                        (.getFields stored))]
                    (assoc field-map
                           :doc-id (.-doc sd)
                           :score (.-score sd))))
-               hits))))))
+               hits))
+       ;; Close only what we opened. A caller-supplied reader outlives this
+       ;; call by design — that is the whole point of passing one.
+       (finally
+         (when own-reader? (.close reader)))))))
 
 ;; --- Snapshots & Time-Travel ---
 
@@ -564,9 +913,44 @@
   Only callable on the main branch writer. Scans all branches to determine
   which files are still needed before removing anything.
 
+  IT RECLAIMS NOTHING WHILE A BRANCH STILL SHARES FILES WITH MAIN, which after
+  an ordinary fork is always. Protection is per COMMIT POINT: one is spared if
+  it references any file some branch references, and a fresh fork shares every
+  base segment by construction. Measured over 6 commits:
+
+    no branch                  6 removed
+    one fork, untouched        0 removed   (and the call adds a commit point)
+    one fork, closed           0 removed
+    fork force-merged onto
+      its own segment          7 removed
+    empty branch directory     6 removed
+
+  So the condition is narrower than `a branch exists`: a branch that has merged
+  away its inherited segments stops protecting them, and an empty directory
+  protects nothing. But the common case — fork and keep working — does pin every
+  commit point on main indefinitely, and a call that reclaims nothing still adds
+  one, so history grows.
+
+  The conservatism is in the safe direction: nothing is deleted that a branch
+  might need. Fixing it means protecting FILES rather than commit points, which
+  Lucene's deletion-policy interface cannot express directly.
+
+  The store-backed model does not have the SHARING problem — reachability is
+  computed across every branch's manifest, so a shared segment is protected by
+  being named rather than by freezing the commit point that names it. It still
+  needs `retain!` to drop commit points before anything becomes unreachable;
+  neither model collects history you have not asked it to drop.
+
   before: java.time.Instant — delete commits older than this
   Returns the number of commit points removed."
   [sw ^Instant before]
+  (when (store-backed? sw)
+    ;; A store-backed index collects by reachability from the live manifests,
+    ;; not by ageing commit points out of a directory — and its cutoff has to
+    ;; be derived from konserve.gc-guard BEFORE the manifests are walked, which
+    ;; `scriptum.konserve/gc!` does and this cannot.
+    (throw (ex-info "scriptum: use scriptum.konserve/gc! for a store-backed index"
+                    {:branch (.getBranchName (->writer sw))})))
   (let [^BranchIndexWriter writer (->writer sw)
         mi (->metadata-index sw)
         removed (.gc writer before)]
@@ -580,18 +964,30 @@
             snapshots-by-branch
             (reduce
              (fn [acc bname]
-               (try
-                 (let [bw (BranchIndexWriter/open (->path base-path) bname (StandardAnalyzer.))
-                       snaps (mapv (fn [m]
-                                     (let [base {:generation (.get m "generation")
-                                                 :custom-metadata
-                                                 (when-let [cm (.get m "customMetadata")]
-                                                   (into {} cm))}]
-                                       base))
-                                   (.listSnapshots bw))]
-                   (.close bw)
-                   (assoc acc bname snaps))
-                 (catch Exception _ acc)))
+               ;; A branch we cannot read is OMITTED, and omission now means
+               ;; "leave its entries alone" rather than "it has none" — see
+               ;; `metadata/rebuild-from-snapshots!`. The common reason to land
+               ;; here is LockObtainFailedException from a branch whose writer is
+               ;; open, i.e. the documented main+feature workflow, and erasing
+               ;; that branch's metadata on every collection of main is not a
+               ;; defensible reading of a lock being held.
+               (let [bw (try (BranchIndexWriter/open (->path base-path) bname
+                                                     (StandardAnalyzer.))
+                             (catch Exception _ nil))]
+                 (if-not bw
+                   acc
+                   (try
+                     (assoc acc bname
+                            (mapv (fn [m]
+                                    {:generation (.get m "generation")
+                                     :custom-metadata
+                                     (when-let [cm (.get m "customMetadata")]
+                                       (into {} cm))})
+                                  (.listSnapshots bw)))
+                     (catch Exception _ acc)
+                     ;; `.close` in a finally: it was after `.listSnapshots`, so a
+                     ;; throw there leaked the writer AND left its lock held.
+                     (finally (.close bw))))))
              {(.getBranchName writer) (mapv (fn [s] {:generation (:generation s)
                                                      :custom-metadata (:custom-metadata s)})
                                             main-snaps)}
@@ -639,7 +1035,37 @@
   [target source]
   (let [^BranchIndexWriter tw (->writer target)
         ^BranchIndexWriter sw (->writer source)]
-    (.mergeFrom tw sw)))
+    ;; RECORD THE LINEAGE BEING MERGED IN, so the commit that follows names it
+    ;; as a parent. Without this the merged branch's history is not an ancestor
+    ;; of the result: it survives as segments, but nothing walking parents can
+    ;; reach it, and the head address stops covering it.
+    ;; COMMIT THE SOURCE FIRST, THEN RECORD, THEN MERGE — and the ordering took
+    ;; two attempts to get right, so it is worth spelling out. `mergeFrom` commits
+    ;; the source (for a consistent read), then commits the TARGET twice: once
+    ;; pre-merge and once for the merge itself.
+    ;;
+    ;; Recording before that sequence attached the source's PRE-commit head — not
+    ;; the state actually merged. Recording after it attached nothing at all: the
+    ;; target's own commits inside `mergeFrom` had already consumed and cleared
+    ;; the pending set, so the address sat in an atom nobody read, and the merged
+    ;; lineage was not an ancestor of the result by any route.
+    ;;
+    ;; Committing the source ourselves makes its address the merged state, and
+    ;; recording it before `mergeFrom` lets the target's pre-merge commit carry
+    ;; it — which the merge commit then descends from. Both invariants hold: the
+    ;; merged lineage is reachable, and it is the lineage that was merged. The
+    ;; source commit inside `mergeFrom` is then a no-op, since nothing changed.
+    (if (and (store-backed? target) (store-backed? source))
+      (do
+        ;; Commit the source HERE, so the address recorded is the state the merge
+        ;; will actually read, and tell `mergeFrom` not to commit it again —
+        ;; `commit` always writes fresh commit data, so it is never a no-op and
+        ;; would supersede the address with one nothing points at.
+        (.commit sw "Pre-merge snapshot")
+        (when-let [a (snapshot-address source)]
+          (swap! (:pending-parents (:backing target)) conj a))
+        (.mergeFrom tw sw false))
+      (.mergeFrom tw sw))))
 
 (defn close!
   "Close a branch writer and its resources."
@@ -648,4 +1074,8 @@
         mi (->metadata-index sw)]
     (when mi
       (metadata/close-index! mi))
+    ;; ONE close. `BranchIndexWriter.close` closes the Directory it was given —
+    ;; `createOver`'s javadoc used to claim the caller owned it, and closing it
+    ;; again here on that basis threw AlreadyClosedException on any Directory
+    ;; that reports being closed.
     (.close writer)))

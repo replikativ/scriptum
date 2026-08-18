@@ -10,6 +10,7 @@ import org.apache.lucene.index.MergePolicy;
 import org.apache.lucene.index.MergeTrigger;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.index.TieredMergePolicy;
 
 /**
  * A MergePolicy wrapper that prevents merging segments that are all shared across branches.
@@ -27,6 +28,32 @@ public class BranchAwareMergePolicy extends FilterMergePolicy {
 
   public void setSharedSegmentNames(Set<String> names) {
     this.sharedSegmentNames = Collections.unmodifiableSet(new HashSet<>(names));
+  }
+
+  /**
+   * Cap the size of a merged segment, in megabytes.
+   *
+   * <p>Lucene's default is 5 GB, which is tuned for a local disk where a segment is just a file. It
+   * is the wrong default for a remote store: a blob is written and read whole, so the largest
+   * segment sets the peak memory a commit costs, and konserve's S3 backing holds a blob in the heap
+   * to PUT it. A cap of a few hundred MB keeps that bounded and stays well clear of S3's 5 GB
+   * single-PUT limit.
+   *
+   * <p>Merge policies read their settings on each merge decision, so this takes effect immediately
+   * and can be changed on a live writer.
+   *
+   * <p>No-op unless the wrapped policy is a {@link TieredMergePolicy}, which is what
+   * {@code BranchIndexWriter} always wraps.
+   */
+  public void setMaxMergedSegmentMB(double mb) {
+    if (in instanceof TieredMergePolicy tiered) {
+      tiered.setMaxMergedSegmentMB(mb);
+    }
+  }
+
+  /** The current merged-segment cap in megabytes, or -1 if the wrapped policy has no such notion. */
+  public double getMaxMergedSegmentMB() {
+    return (in instanceof TieredMergePolicy tiered) ? tiered.getMaxMergedSegmentMB() : -1.0;
   }
 
   public synchronized void addSharedSegment(String name) {

@@ -11,6 +11,7 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
@@ -23,7 +24,24 @@ import org.apache.lucene.store.Lock;
  * base. Deletes of base files are recorded but not performed on the base, preserving shared
  * segments for other branches.
  */
-public class BranchedDirectory extends Directory {
+/*
+ * A FilterDirectory over the OVERLAY, not a bare Directory. It composes two
+ * directories, so neither is "the" wrapped one — but `FilterDirectory.unwrap`
+ * is how Lucene discovers that an index is mmap-backed, and answering "nothing"
+ * made this class deny being mmap-backed while handing out IndexInputs that
+ * reported otherwise. Lucene's own conformance suite catches the inconsistency
+ * (testIsLoaded, testIsLoadedOnSlice), and it costs a capability hint —
+ * preload/madvise — that the directory-backed model was silently forgoing.
+ *
+ * The overlay is the right answer of the two: every write and every newly
+ * created file lives there, so it is what a hint should be applied to. Base
+ * reads are of shared, already-written segments.
+ *
+ * Every Directory method below is overridden, so nothing is silently delegated
+ * to the overlay by FilterDirectory's defaults; `close` remains explicit about
+ * closing both.
+ */
+public class BranchedDirectory extends FilterDirectory {
 
   private final Directory baseDir;
   private final Directory overlayDir;
@@ -36,6 +54,7 @@ public class BranchedDirectory extends Directory {
   private volatile boolean closed = false;
 
   public BranchedDirectory(Directory baseDir, Directory overlayDir, String branchName) {
+    super(overlayDir);
     this.baseDir = baseDir;
     this.overlayDir = overlayDir;
     this.branchName = branchName;
@@ -105,6 +124,23 @@ public class BranchedDirectory extends Directory {
   @Override
   public IndexOutput createOutput(String name, IOContext context) throws IOException {
     ensureOpen();
+    // KNOWN DEVIATION from Directory, which says "Calling createOutput on an
+    // existing file must throw FileAlreadyExistsException" — a base file is an
+    // existing file of this Directory, since listAll reports it and openInput
+    // serves it, and writing the same name into the overlay shadows it instead.
+    //
+    // Enforcing it was tried and reverted: shadowing is the MECHANISM here, not
+    // an accident. `segments_N` must shadow, or a fork could not have a commit
+    // history of its own. Main writes through a BranchedDirectory whose overlay
+    // IS the base, so every file it creates is already "in the base". And a fork
+    // legitimately writes `_1.cfs` while main later writes its own `_1.cfs` into
+    // the base, because main's segment counter is independent and catches up —
+    // the fork's commits reference its own file and never inherited main's,
+    // which did not exist when the fork was taken.
+    //
+    // The harmful case is narrower: a fork shadowing a segment the base held AT
+    // FORK TIME and the fork still references. `nextFreeSegmentOrdinal` prevents
+    // exactly that by starting the fork past every ordinal then in use.
     IndexOutput out = overlayDir.createOutput(name, context);
     overlayFiles.add(name);
     return out;
