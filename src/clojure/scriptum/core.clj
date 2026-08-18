@@ -337,8 +337,13 @@
   READING A DROPPED COMMIT BY GENERATION STOPS WORKING — that is the trade. Its
   state is still reachable by snapshot address, which is what
   `scriptum.konserve/snapshot-directory` opens and what yggdrasil's `as-of`
-  maps onto. Pin an address with `snapshot-address` before dropping if you need
-  it.
+  maps onto.
+
+  HOLDING AN ADDRESS PINS NOTHING. `snapshot-address` hands you a value; it
+  registers no claim on it, and once no branch names that state `gc!` collects
+  it. To keep one you must pass it as `extra-snapshots` on EVERY collection —
+  to `scriptum.konserve/gc!` for the store and to `gc-cache!` for the local
+  cache, which take it separately.
 
   Returns the number of commit points dropped, or nil for a directory-backed
   index, which must use `gc!` — there a commit point holds real files another
@@ -770,8 +775,33 @@
                  (let [[field value] (:term query)]
                    (TermQuery. (Term. (name field) (str value))))
 
+                 ;; A STRING SEARCHES, it does not match everything. It was
+                 ;; documented as "matches all documents containing this term in
+                 ;; any field" and fell through to `MatchAllDocsQuery`, so a
+                 ;; caller searching for a word silently got the entire index —
+                 ;; wrong answers rather than an error.
+                 ;;
+                 ;; Parsed against the reader's indexed fields with the standard
+                 ;; analyzer, which matches how `add-doc` indexes `:text` fields.
+                 ;; A caller who indexed with a different analyzer should build
+                 ;; the Query themselves and pass it; that path is untouched.
+                 (string? query)
+                 (let [fields (into-array String
+                                          (sort (org.apache.lucene.index.FieldInfos/getIndexedFields
+                                                 reader)))]
+                   (if (zero? (alength fields))
+                     (MatchAllDocsQuery.)
+                     (.parse (MultiFieldQueryParser. fields (StandardAnalyzer.))
+                             ^String query)))
+
+                 (= :all query)
+                 (MatchAllDocsQuery.)
+
                  :else
-                 (MatchAllDocsQuery.))
+                 (throw (ex-info (str "scriptum: unsupported query " (pr-str query)
+                                      " — pass :all, {:term [field value]}, a string, "
+                                      "or a Lucene Query")
+                                 {:query query})))
              top-docs (.search searcher q (int limit))
              hits (.-scoreDocs top-docs)
              ;; Hoisted: this was built per HIT. It is a per-reader structure,
@@ -780,9 +810,13 @@
              sf (.storedFields searcher)]
          (mapv (fn [^ScoreDoc sd]
                  (let [stored (.document sf (.-doc sd))
+                       ;; `:fields` was destructured and then ignored, so every
+                       ;; stored field came back whatever was asked for.
+                       keep? (if (seq fields) (set (map name fields)) (constantly true))
                        field-map (into {}
-                                       (map (fn [^IndexableField f]
-                                              [(.name f) (.stringValue f)]))
+                                       (comp (filter (fn [^IndexableField f] (keep? (.name f))))
+                                             (map (fn [^IndexableField f]
+                                                    [(.name f) (.stringValue f)])))
                                        (.getFields stored))]
                    (assoc field-map
                           :doc-id (.-doc sd)

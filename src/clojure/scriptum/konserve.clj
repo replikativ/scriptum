@@ -383,6 +383,15 @@
   from a store assembled by other means, cannot repair itself. This is the way
   back, and the expensive scan `branches` used to do on every call.
 
+  RUN IT QUIET. This scans manifests and then writes the registry
+  unconditionally, and it does NOT take the store lock the branch-pointer
+  operations use — the lock is defined below it and hoisting it is a change for
+  its own commit. So a `delete-branch!` running concurrently can be resurrected
+  as a registry entry for a branch that is gone, and a concurrent
+  `register-branch!` can be lost by the write. Neither loses data — `reachable`
+  discovers branches by scanning manifests, so an entry either way is corrected
+  there — but `branches` can be wrong until the next repair.
+
   Returns the repaired set."
   [store]
   (ensure-format! store)
@@ -539,6 +548,8 @@
         ;; bytes under the same address, which is exactly what this wanted.
         (catch FileAlreadyExistsException _ nil)))))
 
+;; =============================================================================
+;; The Directory
 ;; =============================================================================
 ;; The Directory
 ;; =============================================================================
@@ -1013,6 +1024,13 @@
              (link-into-view! store cache branch n a)))
          (.sync live names)
          (open-guard!)
+         ;; RELEASE THE GUARD IF THIS THROWS. It is closed by the pointer flip
+         ;; that makes these blobs reachable — but only on the success path, so
+         ;; an upload or manifest failure left the sequence open for the life of
+         ;; the process, pinning the store's safe point and stopping collection
+         ;; entirely. What was written before the failure is unreachable, i.e.
+         ;; garbage, so releasing is exactly right: a later retry re-uploads
+         ;; under the same content addresses.
          ;; BLOBS IN PARALLEL, THEN THE POINTER — the shape datahike uses, and the
          ;; one an object store needs. These writes are independent of each other:
          ;; a blob is content-addressed, so nothing orders one against another,
@@ -1046,8 +1064,16 @@
                    [n address]))
                ;; Partitioned rather than handed to `pmap` whole: that bounds the
                ;; number in flight, which `pmap` does not.
-               pairs (doall (mapcat #(doall (pmap upload %))
-                                    (partition-all blob-upload-parallelism fresh)))]
+               pairs (try (doall (mapcat #(doall (pmap upload %))
+                                         (partition-all blob-upload-parallelism fresh)))
+                          (catch Throwable t
+                            (close-guard!)
+                            ;; `pmap` wraps a worker's IOException in an
+                            ;; ExecutionException, which Lucene would not
+                            ;; recognise as an IO failure. Unwrap it.
+                            (throw (if (instance? java.util.concurrent.ExecutionException t)
+                                     (or (.getCause ^Throwable t) t)
+                                     t))))]
            (locking lock
              ;; Re-read under the lock rather than reusing `have`: only the
              ;; manifest edit needs ordering, and merging the pairs in is
@@ -1193,9 +1219,18 @@
 
   Exposed so a caller can refuse BEFORE doing work it would have to undo — the
   store-backed `fork` committed its parent first and only then discovered the
-  target, leaving a commit point behind on every refused attempt."
+  target, leaving a commit point behind on every refused attempt.
+
+  THE REGISTRY COUNTS, NOT JUST THE MANIFEST. A branch that has been opened but
+  not yet committed is in the registry with no manifest — `konserve-directory`
+  registers at open — and testing only the manifest declared such a branch
+  available as a fork target. `fork` then committed the source, overwrote that
+  branch's pointer with the source's snapshot, and only afterwards failed
+  opening the forked writer on its held `write.lock`. The call reported failure
+  having already moved someone else's branch."
   [store branch]
-  (k/exists? store (manifest-key branch) {:sync? true}))
+  (or (contains? (branches store) branch)
+      (k/exists? store (manifest-key branch) {:sync? true})))
 
 (defn fork!
   "Branch `from` as `to`: copy the manifest. O(1) — no segment bytes move, and
@@ -1234,7 +1269,7 @@
     ;; serialized afterwards, and BOTH reported success — leaving whichever ran
     ;; last, so one caller's branch silently was not the one it believed it had
     ;; created. Reproduced 57 times in 100.
-    (when (k/exists? store (manifest-key to) {:sync? true})
+    (when (branch-exists? store to)
       (throw (ex-info "scriptum: branch already exists" {:branch to})))
     (let [registered-here? (register-branch! store to)] ; registry first — see there
       (loop [attempt 0]
@@ -1333,7 +1368,7 @@
   ;; by `point-branch-at!` rather than here — see `fork!` for what checking
   ;; outside it cost.
   (with-store-lock store
-    (when (k/exists? store (manifest-key to) {:sync? true})
+    (when (branch-exists? store to)
       (throw (ex-info "scriptum: branch already exists" {:branch to})))
     (point-branch-at! store to address)))
 

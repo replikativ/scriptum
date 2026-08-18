@@ -1052,3 +1052,30 @@
           (try (is (thrown? java.io.IOException (sc/fork w "brand new")))
                (finally (sc/close! w))))
         (finally (delete-dir-recursive path))))))
+
+(deftest search-honours-its-documented-options
+  (testing "REGRESSION: a string query was documented as matching documents
+            containing that term in any field, and fell through to
+            `MatchAllDocsQuery` — so searching for a word silently returned the
+            entire index. `:fields` was destructured and ignored, so every stored
+            field came back whatever was asked for."
+    (let [path (temp-dir)
+          w (sc/create-index path "main")]
+      (try
+        (sc/add-doc w {:title "alpha" :body "distinctive"})
+        (sc/add-doc w {:title "beta" :body "ordinary"})
+        (sc/add-doc w {:title "gamma" :body "ordinary"})
+        (sc/commit! w "seed")
+        (is (= 3 (count (sc/search w :all))) ":all still matches everything")
+        (let [hits (sc/search w "distinctive")]
+          (is (= 1 (count hits))
+              "a string must SEARCH, not match every document")
+          (is (= "alpha" (get (first hits) "title"))))
+        (let [hits (sc/search w "ordinary")]
+          (is (= 2 (count hits)) "and find each match"))
+        (let [hits (sc/search w :all {:fields [:title]})]
+          (is (every? #(nil? (get % "body")) hits) ":fields must restrict what comes back")
+          (is (every? #(some? (get % "title")) hits) "to exactly what was asked for"))
+        (is (thrown? clojure.lang.ExceptionInfo (sc/search w 42))
+            "and an unsupported query is an error, not a silent match-all")
+        (finally (sc/close! w) (delete-dir-recursive path))))))

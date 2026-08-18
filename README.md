@@ -547,8 +547,17 @@ nothing however long the index runs. `retain!` is what bounds it:
 
 Dropping a commit point removes its files from the manifest; the collector then
 takes the blobs no other branch names. Reading a dropped commit **by generation**
-stops working — its state is still reachable by snapshot address, so pin one with
-`snapshot-address` first if you need it.
+stops working — its state is still reachable by snapshot address.
+
+**Holding an address pins nothing.** `snapshot-address` hands you a value; it
+registers no claim. To keep a state alive you must pass it on every collection,
+to both collectors:
+
+```clojure
+(def held (sc/snapshot-address writer))
+(sk/gc! store (sk/store-id-for store) (ku/now) #{held})
+(sk/gc-cache! store "/tmp/index-cache" #{held})
+```
 
 Under yggdrasil this is automatic: the coordinator computes reachability from
 every system's `gc-roots` and the commit graph, and `gc-sweep!` drops the

@@ -220,6 +220,27 @@ public class BranchIndexWriter implements Closeable {
     return last != null ? last.getGeneration() : fallback;
   }
 
+  /**
+   * Restore the merkle root of the branch head, alongside its commit id.
+   *
+   * <p>Only {@code lastCommitId} was restored, so after reopening a crypto-hash index {@code
+   * getLastContentHash} answered null — and `scriptum.audit`'s `-merkle-root` with it — until the
+   * process happened to commit again.
+   */
+  private void initLastContentHash() {
+    if (!cryptoHash || lastCommitId == null || basePath == null) {
+      return;
+    }
+    try {
+      Map<String, Object> metadata = loadSegmentHashMetadata(lastCommitId);
+      if (metadata != null) {
+        lastContentHash = (String) metadata.get("content-hash");
+      }
+    } catch (IOException e) {
+      // leave null; the next commit recomputes it
+    }
+  }
+
   private void initLastCommitId() {
     IndexCommit last = deletionPolicy.getLastCommit();
     if (last != null) {
@@ -328,6 +349,7 @@ public class BranchIndexWriter implements Closeable {
     // That breaks ancestors, common-ancestor and commit-graph for store-backed
     // indices.
     biw.initLastCommitId();
+    biw.initLastContentHash();
 
     return biw;
   }
@@ -397,6 +419,7 @@ public class BranchIndexWriter implements Closeable {
 
     // Initialize parent tracking from existing commits
     biw.initLastCommitId();
+    biw.initLastContentHash();
 
     // Discover existing branches and protect their shared segments
     biw.discoverAndProtectBranches();
@@ -508,6 +531,7 @@ public class BranchIndexWriter implements Closeable {
                 writer, branchDir, deletionPolicy, mergePolicy, branchName, basePath, analyzer,
                 false, cryptoHash);
         biw.initLastCommitId();
+    biw.initLastContentHash();
         return biw;
       } catch (IOException e) {
         overlayDir.close();
@@ -1862,8 +1886,27 @@ public class BranchIndexWriter implements Closeable {
       }
     }
 
-    // Note: Commit UUID is random (not content-addressed) in current implementation
-    // Verification only checks that segment hashes match stored metadata
+    // RECOMPUTE THE ROOT AND COMPARE IT. Checking stored-against-computed
+    // segment hashes alone is weaker than it looks, and the comparison above
+    // iterates the STORED map: delete an entry from it and nothing notices, and
+    // editing the recorded `content-hash` was likewise invisible — a merkle
+    // claim that verified everything except the merkle root.
+    //
+    // Recomputing hash(parent-hash + every segment hash we just computed) and
+    // comparing it to the recorded root closes both: a removed entry changes the
+    // root, and so does an edited root.
+    String recordedRoot = (String) metadata.get("content-hash");
+    if (recordedRoot != null) {
+      String parentStr = (String) metadata.get("parent-content-hash");
+      UUID parentHash = parentStr == null ? null : UUID.fromString(parentStr);
+      UUID recomputed = ContentHash.computeCommitHash(parentHash, computedHashes);
+      if (!recordedRoot.equals(recomputed.toString())) {
+        errors.add(
+            "Merkle root mismatch: recorded " + recordedRoot + ", recomputed " + recomputed);
+      }
+      result.put("content-hash", recordedRoot);
+      result.put("recomputed-content-hash", recomputed.toString());
+    }
 
     result.put("valid", errors.isEmpty());
     result.put("errors", errors);

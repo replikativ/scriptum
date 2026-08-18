@@ -13,7 +13,8 @@
      - `IAuditable` on a live `ScriptumWriter`: `-merkle-root` returns
        the cached content-hash; `-recompute-merkle-root` returns `:ok`
        on a clean store, `:mismatch` after tampering"
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
             [scriptum.audit :as audit]
             [scriptum.core :as sc])
   (:import [java.util UUID]))
@@ -151,3 +152,33 @@
       (finally
         (sc/close! w)
         (delete-dir-recursive path)))))
+
+(deftest verification-catches-a-tampered-merkle-root
+  (testing "REGRESSION: `verifyCommit` recomputed segment hashes and compared
+            them against the stored map — iterating the STORED map, so deleting
+            an entry from it went unnoticed — and never recomputed the commit
+            hash at all. Editing the recorded `content-hash` left verification
+            reporting success: a merkle claim that verified everything except
+            the merkle root."
+    (let [path (temp-dir)
+          w (sc/create-index path "main" {:crypto-hash? true})]
+      (try
+        (sc/add-doc w {:body "one"})
+        (sc/commit! w "c1")
+        (sc/add-doc w {:body "two"})
+        (sc/commit! w "c2")
+        (is (= :ok (:status (audit/verify-chain w))) "precondition: it verifies")
+        ;; tamper with the recorded root only — every segment file is untouched
+        (let [dir (io/file path "scriptum-hashes")
+              f (first (filter #(.endsWith (.getName ^java.io.File %) ".json")
+                               (.listFiles dir)))
+              original (slurp f)
+              tampered (clojure.string/replace
+                        original
+                        #"\"content-hash\"\s*:\s*\"[^\"]+\""
+                        "\"content-hash\": \"00000000-0000-5000-8000-000000000000\"")]
+          (is (not= original tampered) "precondition: the root was rewritten")
+          (spit f tampered)
+          (is (not= :ok (:status (audit/verify-chain w)))
+              "a rewritten root must not verify"))
+        (finally (sc/close! w) (delete-dir-recursive path))))))
