@@ -4,11 +4,18 @@
 
 Copy-on-write branching for Apache Lucene. Git-like snapshot and branch semantics on full-text search indices with structural sharing.
 
-Built on Lucene 10.3.2. Forking a branch takes a few ms regardless of index size by sharing immutable segment files.
+Built on Lucene 10.3.2. Forking a branch copies no segment data — branches share
+immutable segment files — so it costs milliseconds however much is indexed.
+
+An index can live either **on disk** as a directory tree, or **in a
+[konserve](https://github.com/replikativ/konserve) store**, which is what makes
+it usable on an object store. Both models support the same document, search and
+branching API; they differ in how a branch is represented and collected. See
+[Konserve-Backed Storage](#konserve-backed-storage).
 
 ## Core Concepts
 
-- **Branch**: A COW overlay directory sharing base segments with trunk. Each branch has its own commit history.
+- **Branch**: A lineage sharing base segments with trunk, with its own commit history. On disk it is a COW overlay directory; in a konserve store it is a manifest naming content-addressed blobs.
 - **Snapshot**: An immutable reader at a specific commit generation. All commits are retained until explicit GC.
 - **Fork**: Creates a new branch by copying segment metadata only (not data). Near-instant regardless of index size.
 - **GC**: Explicit garbage collection of old snapshots, respecting branch references to shared segments.
@@ -30,8 +37,10 @@ Enable with `:crypto-hash? true` when creating an index. Metadata stored in exte
 | Layer | Namespace | Use Case |
 |-------|-----------|----------|
 | **Java** | `org.replikativ.scriptum.BranchIndexWriter` | Direct Java usage |
-| **Core** | `scriptum.core` | Low-level Clojure wrapper |
+| **Core** | `scriptum.core` | Low-level Clojure wrapper, both storage models |
+| **Konserve** | `scriptum.konserve` | The store-backed `Directory`, its collector and snapshots |
 | **Metadata** | `scriptum.metadata` | Durable metadata index (PSS + konserve) |
+| **Audit** | `scriptum.audit` | Merkle-chain verification (needs `:crypto-hash?`) |
 | **Yggdrasil** | `scriptum.yggdrasil` | High-level protocols |
 
 For Clojure users: `scriptum.yggdrasil` for high-level API, `scriptum.core` for lower-level control.
@@ -346,6 +355,25 @@ The conservatism is in the safe direction. The **store-backed** model avoids the
 sharing problem — reachability is computed across every branch's manifest — but
 still needs `retain!` before anything becomes unreachable; see Retention below.
 
+### Store-backed operations
+
+These exist only for an index in a konserve store, and are covered in
+[Konserve-Backed Storage](#konserve-backed-storage):
+
+```clojure
+(sc/open-store-index store cache branch)      ; open a branch in a store
+(sc/open-store-index-at store cache branch a) ; open it at a specific state
+(sc/snapshot-address writer)                  ; the immutable address of that state
+(sc/warm! writer)                             ; fetch a cold index in parallel
+(sc/retain! writer {:before instant})         ; drop old commit points
+(sk/gc! store store-id)                       ; collect the store
+(sk/gc-cache! store cache)                    ; collect the local cache
+(sk/mark store)                               ; the root set, for an embedding collector
+```
+
+`scriptum.core/gc!` is for directory-backed indices and throws on a store-backed
+one; `scriptum.konserve/gc!` is its counterpart.
+
 ## Java API
 
 For Java users, `BranchIndexWriter` provides the complete API:
@@ -601,9 +629,18 @@ Passes the full yggdrasil compliance test suite (22 tests, 203 assertions).
 ## Performance
 
 Typical results:
-- Fork latency: few ms (independent of index size)
-- Indexing: ~50k docs/sec (text fields, SSD)
-- Search: sub-millisecond for simple queries
+- **Fork**: no segment data is copied, so it is independent of how much is
+  indexed — but it scans the index directory to pick a free segment ordinal, so
+  it grows with the number of *files*. Measured 8 ms at 548 files, 28 ms at 2235.
+- **Indexing**: ~50k docs/sec (text fields, SSD)
+- **Search**: sub-millisecond for simple queries
+
+Store-backed, measured against a 60 ms-per-request store:
+- **Commit**: 6 requests — 4 segment blobs, 1 snapshot, 1 branch pointer. Blobs
+  upload in parallel: a 35-segment commit takes 348 ms against 2100 ms serially.
+- **Cold read**: Lucene opens segment readers serially, so a cold query costs one
+  round trip per file. `warm!` fetches them in parallel first — 2.2 s against
+  275 ms on a 35-segment index.
 
 ## Directory Layout
 
@@ -645,8 +682,10 @@ See [docs/LUCENE_EXTENSION.md](docs/LUCENE_EXTENSION.md) for a deep-dive into ho
 ```
 src/
   clojure/scriptum/
-    core.clj                 # Low-level COW branching API
+    core.clj                 # Low-level COW branching API, both storage models
+    konserve.clj             # Store-backed Directory, collector, snapshots
     metadata.clj             # Durable metadata index (PSS + konserve)
+    audit.clj                # Merkle-chain verification
     yggdrasil.clj            # Yggdrasil protocol adapter
   java/org/replikativ/scriptum/
     BranchIndexWriter.java   # Branch-aware Lucene writer (main Java API)
@@ -658,8 +697,18 @@ docs/
   LUCENE_EXTENSION.md        # Technical deep-dive
 test/scriptum/
   core_test.clj              # Unit tests
+  konserve_test.clj          # Store-backed storage model
   crypto_test.clj            # Crypto-hash integrity tests
+  audit_test.clj             # Merkle-chain verification
   yggdrasil_test.clj         # Compliance tests
+  tck.clj, tck_runner.clj    # Lucene's own Directory conformance suite
+```
+
+Both directories are held to Lucene's `BaseDirectoryTestCase`, which is what
+`MMapDirectory` itself is tested with:
+
+```bash
+clj -T:build compile-tck && clj -M:local:tck -m scriptum.tck-runner
 ```
 
 ## Requirements
