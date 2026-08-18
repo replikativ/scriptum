@@ -2,6 +2,7 @@
   "Unit tests for scriptum.core Lucene functionality."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [scriptum.core :as sc]
+            [clojure.java.io :as io]
             [konserve.store :as kstore]
             [scriptum.yggdrasil :as sy]
             [yggdrasil.protocols :as p])
@@ -1015,3 +1016,39 @@
                      "and the branch it created must be readable")
                  (finally (sc/close! opened)))))
         (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest an-existing-branch-name-can-still-be-opened
+  (testing "REGRESSION, compatibility: `open` applied the same whitelist as
+            `create` and `fork`, so branches that released versions of scriptum
+            happily created — \"my branch\", \"feature#1\", \"_scratch\" — threw on
+            open with no way back. Their data was never at risk, since branch
+            protection walks directories rather than names, but the handles were
+            dead. `open` now rejects only names that would not resolve to a
+            directory under branches/."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (sc/close! main)
+        ;; a branch as an older scriptum would have left it on disk
+        (doseq [n ["my branch" "feature#1" "_scratch"]]
+          (let [dir (io/file path "branches" n)]
+            (.mkdirs dir)
+            ;; give it a real index by forking through the legacy layout
+            (let [w (sc/open-branch path "main")
+                  f (sc/fork w "tmp")]
+              (sc/close! f)
+              (sc/close! w))
+            (doseq [^java.io.File src (.listFiles (io/file path "branches" "tmp"))]
+              (io/copy src (io/file dir (.getName src))))
+            (delete-dir-recursive (str (io/file path "branches" "tmp")))
+            (let [opened (sc/open-branch path n)]
+              (try (is (= 1 (sc/num-docs opened))
+                       (str (pr-str n) " must still open"))
+                   (finally (sc/close! opened))))))
+        ;; but inventing such a name is still refused
+        (let [w (sc/open-branch path "main")]
+          (try (is (thrown? java.io.IOException (sc/fork w "brand new")))
+               (finally (sc/close! w))))
+        (finally (delete-dir-recursive path))))))

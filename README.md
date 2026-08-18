@@ -334,13 +334,17 @@ Scriptum provides composable query builders so you don't need to import Lucene c
 GC only runs on the main branch and protects all segment files referenced by any
 branch.
 
-**It reclaims nothing once any branch exists.** Protection is per commit point —
-one is spared if it references any file a branch references — and a fork shares
-every base segment, so after a single fork every commit point on main is spared.
-The conservatism is in the safe direction, but the directory-backed collector is
-effectively inert once you branch. The **store-backed** model does not have this
-limitation, because reachability is computed across every branch's manifest; see
-Retention below.
+**It reclaims nothing while a branch still shares files with main** — which
+after an ordinary fork is always. Protection is per commit point (one is spared
+if it references any file a branch references) and a fresh fork shares every
+base segment, so every commit point on main stays pinned. Measured over 6
+commits: 6 removed with no branch, **0** with one untouched fork, 7 once that
+fork has merged away its inherited segments. A call that reclaims nothing still
+adds a commit point.
+
+The conservatism is in the safe direction. The **store-backed** model avoids the
+sharing problem — reachability is computed across every branch's manifest — but
+still needs `retain!` before anything becomes unreachable; see Retention below.
 
 ## Java API
 

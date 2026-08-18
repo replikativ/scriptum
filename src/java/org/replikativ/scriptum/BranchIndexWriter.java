@@ -98,8 +98,31 @@ public class BranchIndexWriter implements Closeable {
   private static final java.util.regex.Pattern BRANCH_NAME =
       java.util.regex.Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]*");
 
+  /**
+   * Reject only names that would escape or collide with the branch layout.
+   *
+   * <p>The bar for a name that ALREADY EXISTS: it has to resolve to a directory under {@code
+   * branches/} and nowhere else. Everything short of that is a naming preference, and released
+   * versions of scriptum accepted it.
+   */
+  private static void checkBranchPathSafe(String branchName) throws IOException {
+    if (branchName == null
+        || branchName.isEmpty()
+        || ".".equals(branchName)
+        || "..".equals(branchName)
+        || branchName.indexOf('/') >= 0
+        || branchName.indexOf('\\') >= 0
+        || branchName.indexOf('\u0000') >= 0) {
+      throw new IOException(
+          "scriptum: " + branchName + " is not a usable branch name; it would not resolve to a"
+              + " directory under branches/");
+    }
+  }
+
+  /** The stricter bar for a name being INVENTED, by {@code create} or {@code fork}. */
   private static void checkBranchName(String branchName) throws IOException {
-    if (branchName == null || !BRANCH_NAME.matcher(branchName).matches()) {
+    checkBranchPathSafe(branchName);
+    if (!BRANCH_NAME.matcher(branchName).matches()) {
       throw new IOException(
           "scriptum: "
               + branchName
@@ -393,7 +416,14 @@ public class BranchIndexWriter implements Closeable {
    */
   public static BranchIndexWriter open(Path basePath, String branchName, Analyzer analyzer)
       throws IOException {
-    checkBranchName(branchName);
+    // ONLY THE UNSAFE FORMS, not the whitelist. `create` and `fork` may be strict
+    // about names they are about to invent; `open` may not, because scriptum has
+    // released versions that accepted anything. Applying the whitelist here made
+    // existing branches — "my branch", "café", "feature#1", "_scratch" — throw on
+    // open with no way back, turning a naming preference into a compatibility
+    // break. Their data was never at risk (branch protection walks directories,
+    // not names), but the handles were dead.
+    checkBranchPathSafe(branchName);
     Path branchPath = basePath.resolve("branches").resolve(branchName);
     if (!Files.isDirectory(branchPath)) {
       // The main branch writes directly to basePath (not branches/main/), so it

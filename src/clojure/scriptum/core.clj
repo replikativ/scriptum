@@ -879,22 +879,33 @@
   Only callable on the main branch writer. Scans all branches to determine
   which files are still needed before removing anything.
 
-  IT RECLAIMS NOTHING ONCE ANY BRANCH EXISTS, and that is a limitation of this
-  model rather than a bug to work around. Protection is per COMMIT POINT: one is
-  spared if it references any file some branch references. A fork shares every
-  base segment by construction, so after a single fork every commit point on
-  main is spared forever — measured at 5 of 6 removed with no branch, 0 of 6
-  with one. Each call still adds a commit point, so history grows.
+  IT RECLAIMS NOTHING WHILE A BRANCH STILL SHARES FILES WITH MAIN, which after
+  an ordinary fork is always. Protection is per COMMIT POINT: one is spared if
+  it references any file some branch references, and a fresh fork shares every
+  base segment by construction. Measured over 6 commits:
 
-  The conservatism is in the safe direction — nothing is deleted that a branch
-  might need — but the collector is effectively inert in the configuration most
-  users will have. Fixing it means protecting FILES rather than commit points,
-  which Lucene's deletion-policy interface cannot express directly.
+    no branch                  6 removed
+    one fork, untouched        0 removed   (and the call adds a commit point)
+    one fork, closed           0 removed
+    fork force-merged onto
+      its own segment          7 removed
+    empty branch directory     6 removed
 
-  The store-backed model does not have this problem: reachability is computed
-  across every branch's manifest, so a shared segment is protected by being
-  named, not by freezing the commit point that names it. See
-  `scriptum.core/retain!` and `scriptum.konserve/gc!`.
+  So the condition is narrower than `a branch exists`: a branch that has merged
+  away its inherited segments stops protecting them, and an empty directory
+  protects nothing. But the common case — fork and keep working — does pin every
+  commit point on main indefinitely, and a call that reclaims nothing still adds
+  one, so history grows.
+
+  The conservatism is in the safe direction: nothing is deleted that a branch
+  might need. Fixing it means protecting FILES rather than commit points, which
+  Lucene's deletion-policy interface cannot express directly.
+
+  The store-backed model does not have the SHARING problem — reachability is
+  computed across every branch's manifest, so a shared segment is protected by
+  being named rather than by freezing the commit point that names it. It still
+  needs `retain!` to drop commit points before anything becomes unreachable;
+  neither model collects history you have not asked it to drop.
 
   before: java.time.Instant — delete commits older than this
   Returns the number of commit points removed."
