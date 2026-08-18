@@ -25,17 +25,17 @@
 (def expected-failures
   "Failures that are known, understood, and not worth failing the build over.
 
-  `BranchedDirectory` extends `Directory` directly, so `FilterDirectory.unwrap`
-  cannot see the `MMapDirectory` underneath while the `IndexInput`s it hands out
-  do report `isLoaded` — the same inconsistency the konserve Directory was fixed
-  for by becoming a `FilterDirectory`. It costs Lucene a capability hint
-  (preload/madvise) and nothing else.
+  EMPTY, and worth keeping rather than deleting. It held `testIsLoaded` and
+  `testIsLoadedOnSlice` for `BranchedDirectory`, which extended `Directory`
+  directly — so `FilterDirectory.unwrap` could not see the `MMapDirectory`
+  underneath while the `IndexInput`s it handed out did report `isLoaded`. Making
+  it a `FilterDirectory` over its overlay closed both, and both suites are now
+  clean.
 
-  Recorded rather than silenced: a suite that is red on arrival teaches people
-  to ignore it, and a suite that hides its known gaps stops being evidence. The
-  run reports these and still exits 0; anything NOT listed here fails the build."
-  {"org.replikativ.scriptum.BranchedDirectoryTCK"
-   #{"testIsLoaded" "testIsLoadedOnSlice"}})
+  The mechanism stays because the reasoning does: a suite that is red on arrival
+  teaches people to ignore it, and a suite that hides its known gaps stops being
+  evidence. Anything failing now fails the build."
+  {})
 
 (def suites
   ["org.replikativ.scriptum.ScriptumDirectoryTCK"
@@ -77,7 +77,7 @@
              (+ acc (count novel))))
          0 names)]
     (println (if (zero? unexpected)
-               "\nAll Directory contracts hold (known gaps aside)."
+               "\nAll Directory contracts hold."
                (str "\n" unexpected " unexpected failure(s).")))
     (shutdown-agents)
     (System/exit (if (zero? unexpected) 0 1))))

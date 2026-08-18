@@ -11,6 +11,7 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
@@ -23,7 +24,24 @@ import org.apache.lucene.store.Lock;
  * base. Deletes of base files are recorded but not performed on the base, preserving shared
  * segments for other branches.
  */
-public class BranchedDirectory extends Directory {
+/*
+ * A FilterDirectory over the OVERLAY, not a bare Directory. It composes two
+ * directories, so neither is "the" wrapped one — but `FilterDirectory.unwrap`
+ * is how Lucene discovers that an index is mmap-backed, and answering "nothing"
+ * made this class deny being mmap-backed while handing out IndexInputs that
+ * reported otherwise. Lucene's own conformance suite catches the inconsistency
+ * (testIsLoaded, testIsLoadedOnSlice), and it costs a capability hint —
+ * preload/madvise — that the directory-backed model was silently forgoing.
+ *
+ * The overlay is the right answer of the two: every write and every newly
+ * created file lives there, so it is what a hint should be applied to. Base
+ * reads are of shared, already-written segments.
+ *
+ * Every Directory method below is overridden, so nothing is silently delegated
+ * to the overlay by FilterDirectory's defaults; `close` remains explicit about
+ * closing both.
+ */
+public class BranchedDirectory extends FilterDirectory {
 
   private final Directory baseDir;
   private final Directory overlayDir;
@@ -36,6 +54,7 @@ public class BranchedDirectory extends Directory {
   private volatile boolean closed = false;
 
   public BranchedDirectory(Directory baseDir, Directory overlayDir, String branchName) {
+    super(overlayDir);
     this.baseDir = baseDir;
     this.overlayDir = overlayDir;
     this.branchName = branchName;
