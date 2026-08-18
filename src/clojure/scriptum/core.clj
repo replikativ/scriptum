@@ -234,7 +234,15 @@
          ;; because the Directory is a proxy with no way to reach into it.
          pending-parents (atom #{})
          dir (sk/konserve-directory store cache branch store-id pending-parents)
-         writer (BranchIndexWriter/createOver dir branch analyzer)]
+         ;; CLOSE THE DIRECTORY IF THE WRITER CANNOT BE BUILT. `createOver` takes
+         ;; ownership only once it returns; if it throws — a second writer on the
+         ;; branch gives LockObtainFailedException — nobody owned this Directory
+         ;; and its mmap arena, and for a store-backed one the gc-guard sequence
+         ;; it may have opened, were left to the garbage collector.
+         writer (try (BranchIndexWriter/createOver dir branch analyzer)
+                     (catch Throwable t
+                       (try (.close ^java.io.Closeable dir) (catch Throwable _))
+                       (throw t)))]
      (tune! writer max-merged-segment-mb ram-buffer-mb)
      (->ScriptumWriter writer metadata-index
                        {:store store :cache cache :directory dir :store-id store-id
@@ -871,8 +879,25 @@
   Only callable on the main branch writer. Scans all branches to determine
   which files are still needed before removing anything.
 
+  IT RECLAIMS NOTHING ONCE ANY BRANCH EXISTS, and that is a limitation of this
+  model rather than a bug to work around. Protection is per COMMIT POINT: one is
+  spared if it references any file some branch references. A fork shares every
+  base segment by construction, so after a single fork every commit point on
+  main is spared forever — measured at 5 of 6 removed with no branch, 0 of 6
+  with one. Each call still adds a commit point, so history grows.
+
+  The conservatism is in the safe direction — nothing is deleted that a branch
+  might need — but the collector is effectively inert in the configuration most
+  users will have. Fixing it means protecting FILES rather than commit points,
+  which Lucene's deletion-policy interface cannot express directly.
+
+  The store-backed model does not have this problem: reachability is computed
+  across every branch's manifest, so a shared segment is protected by being
+  named, not by freezing the commit point that names it. See
+  `scriptum.core/retain!` and `scriptum.konserve/gc!`.
+
   before: java.time.Instant — delete commits older than this
-  Returns the number of commit points removed."
+  Returns the number of commit points removed.
   [sw ^Instant before]
   (when (store-backed? sw)
     ;; A store-backed index collects by reachability from the live manifests,

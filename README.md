@@ -332,7 +332,15 @@ Scriptum provides composable query builders so you don't need to import Lucene c
 ```
 
 GC only runs on the main branch and protects all segment files referenced by any
-branch. A **store-backed** index collects differently — see below.
+branch.
+
+**It reclaims nothing once any branch exists.** Protection is per commit point —
+one is spared if it references any file a branch references — and a fork shares
+every base segment, so after a single fork every commit point on main is spared.
+The conservatism is in the safe direction, but the directory-backed collector is
+effectively inert once you branch. The **store-backed** model does not have this
+limitation, because reachability is computed across every branch's manifest; see
+Retention below.
 
 ## Java API
 

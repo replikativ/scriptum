@@ -85,6 +85,45 @@ public class BranchIndexWriter implements Closeable {
   /** The branch that "self-overlays" the base path in the directory-backed model. */
   private static final String MAIN_BRANCH_NAME = "main";
 
+  /**
+   * What a branch may be called. A whitelist, because the name becomes a directory under {@code
+   * branches/} and several operations delete from that path.
+   *
+   * <p>The store-backed model has validated this since a review found that an empty name made a
+   * branch view the cache root and {@code ".."} escaped it entirely; the path-backed model had
+   * nothing. Here {@code ""} and {@code "."} put a branch's segments directly in {@code branches/},
+   * where {@code discoverBranches} cannot see them — so they were invisible to the fork guard and
+   * unprotected from a collection on main.
+   */
+  private static final java.util.regex.Pattern BRANCH_NAME =
+      java.util.regex.Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]*");
+
+  private static void checkBranchName(String branchName) throws IOException {
+    if (branchName == null || !BRANCH_NAME.matcher(branchName).matches()) {
+      throw new IOException(
+          "scriptum: "
+              + branchName
+              + " is not a usable branch name; it must match "
+              + BRANCH_NAME.pattern());
+    }
+  }
+
+  /**
+   * One lock per index root, so forks of one index serialize.
+   *
+   * <p>{@code fork} refuses an existing target, but the check and the write of the cloned commit
+   * point are not atomic together and the target's own write lock is only taken afterwards, when
+   * the IndexWriter is constructed. Two concurrent forks to one new name therefore both passed and
+   * the loser wrote its clone into a directory the winner owned, leaving it unreadable. Serializing
+   * is the same answer the store-backed model uses.
+   */
+  private static final java.util.concurrent.ConcurrentMap<String, Object> FORK_LOCKS =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static Object forkLock(Path basePath) {
+    return FORK_LOCKS.computeIfAbsent(basePath.toAbsolutePath().normalize().toString(), k -> new Object());
+  }
+
   private static final String COMMIT_TIMESTAMP_KEY = "scriptum.timestamp";
   private static final String COMMIT_MESSAGE_KEY = "scriptum.message";
   private static final String COMMIT_BRANCH_KEY = "scriptum.branch";
@@ -277,6 +316,7 @@ public class BranchIndexWriter implements Closeable {
 
   public static BranchIndexWriter create(
       Path basePath, String branchName, Analyzer analyzer, boolean cryptoHash) throws IOException {
+    checkBranchName(branchName);
     Files.createDirectories(basePath);
 
     boolean isMain = MAIN_BRANCH_NAME.equals(branchName);
@@ -353,12 +393,17 @@ public class BranchIndexWriter implements Closeable {
    */
   public static BranchIndexWriter open(Path basePath, String branchName, Analyzer analyzer)
       throws IOException {
+    checkBranchName(branchName);
     Path branchPath = basePath.resolve("branches").resolve(branchName);
     if (!Files.isDirectory(branchPath)) {
-      // The main branch writes directly to basePath (not branches/main/).
-      // Fall back to create() which handles the root directory layout and
-      // detects crypto-hash from existing commits.
-      if (Files.isDirectory(basePath) && indexExistsAt(basePath)) {
+      // The main branch writes directly to basePath (not branches/main/), so it
+      // legitimately has no directory here. ONLY main: the fallback used to
+      // apply to any name, so `open` on a typo silently CREATED that branch —
+      // a real overlay that `discoverBranches` then reported and that `fork`
+      // now refuses by name.
+      if (MAIN_BRANCH_NAME.equals(branchName)
+          && Files.isDirectory(basePath)
+          && indexExistsAt(basePath)) {
         // Detect crypto-hash from existing index metadata
         boolean cryptoHash = false;
         try (Directory dir = MMapDirectory.open(basePath)) {
@@ -370,7 +415,9 @@ public class BranchIndexWriter implements Closeable {
         }
         return create(basePath, branchName, analyzer, cryptoHash);
       }
-      throw new IOException("Branch directory not found: " + branchPath);
+      throw new IOException(
+          "scriptum: branch " + branchName + " does not exist at " + branchPath
+              + "; `open` opens an existing branch — use `fork` to create one");
     }
 
     Directory baseDir = MMapDirectory.open(basePath);
@@ -519,6 +566,13 @@ public class BranchIndexWriter implements Closeable {
    */
   public synchronized BranchIndexWriter fork(String newBranchName) throws IOException {
     requireBasePath("fork()");
+    checkBranchName(newBranchName);
+    synchronized (forkLock(basePath)) {
+      return forkLocked(newBranchName);
+    }
+  }
+
+  private BranchIndexWriter forkLocked(String newBranchName) throws IOException {
 
     // REFUSE FIRST, BEFORE TOUCHING ANYTHING. Two things went wrong when this
     // check sat lower down. It came after the source's own flush-and-commit, so

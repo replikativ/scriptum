@@ -950,3 +950,68 @@
           (is (= before (count (sc/list-snapshots main)))
               "a refused fork must not commit the source"))
         (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest open-branch-does-not-create-an-unknown-branch
+  (testing "REGRESSION: `open` fell back to `create` for ANY missing branch
+            directory, not just main — so opening a typo silently created that
+            branch. It became a real overlay that `discover-branches` reported
+            and that `fork` now refuses by name, so a misspelling permanently
+            consumed a branch name."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (is (thrown? java.io.IOException (sc/open-branch path "no-such-branch")))
+        (is (not (contains? (set (sc/discover-branches path)) "no-such-branch"))
+            "and nothing was created")
+        ;; main still opens, since its overlay IS the base path
+        (sc/close! main)
+        (let [reopened (sc/open-branch path "main")]
+          (try (is (= 1 (sc/num-docs reopened)))
+               (finally (sc/close! reopened))))
+        (finally (delete-dir-recursive path))))))
+
+(deftest path-model-branch-names-are-validated
+  (testing "REGRESSION: the store model whitelisted branch names since a review
+            found `\"\"` made a branch view the cache root and `..` escaped it;
+            the path model had nothing. Here `\"\"` and `\".\"` put a branch's
+            segments directly in `branches/`, where `discover-branches` cannot
+            see them — invisible to the fork guard and unprotected from a
+            collection on main."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (doseq [n ["" "." ".." "a/b" "../escape" ".hidden"]]
+          (is (thrown? java.io.IOException (sc/fork main n))
+              (str (pr-str n) " must be refused")))
+        (let [f (sc/fork main "ok-name_1.2")]
+          (is (some? f) "and ordinary names still work")
+          (sc/close! f))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
+
+(deftest concurrent-forks-to-one-name-do-not-corrupt-the-winner
+  (testing "REGRESSION: `fork` refuses an existing target, but the check and the
+            write of the cloned commit point are not atomic and the target's own
+            write lock is taken only afterwards. Two concurrent forks to one new
+            name both passed, and the loser wrote its clone into the winner's
+            directory, leaving it unreadable."
+    (let [path (temp-dir)
+          main (sc/create-index path "main")]
+      (try
+        (sc/add-doc main {:body "m"})
+        (sc/commit! main "one")
+        (let [results (->> (repeatedly 8 #(future (try (let [f (sc/fork main "target")]
+                                                         (sc/close! f) :ok)
+                                                       (catch Exception _ :refused))))
+                           doall
+                           (map deref))]
+          (is (= 1 (count (filter #{:ok} results)))
+              "exactly one fork may succeed")
+          (let [opened (sc/open-branch path "target")]
+            (try (is (= 1 (sc/num-docs opened))
+                     "and the branch it created must be readable")
+                 (finally (sc/close! opened)))))
+        (finally (sc/close! main) (delete-dir-recursive path))))))
