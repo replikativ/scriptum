@@ -1083,7 +1083,22 @@ public class BranchIndexWriter implements Closeable {
     // retaining if that matters to you.
     lastCommitId = setCommitData("scriptum-retain");
     writer.commit();
-    return deletionPolicy.getLastGcDeleted();
+    int dropped = deletionPolicy.getLastGcDeleted();
+
+    // PUBLISH THE SHRINK. Lucene drops the selected commit points during the
+    // checkpoint that runs AFTER this commit's flip, so at this point the
+    // removals exist only in the Directory's memory. Closing the writer does not
+    // publish them either — IndexWriter.close skips a commit when nothing
+    // Lucene-level changed, and dropping commit points is not such a change — so
+    // retain-then-close published nothing and every dropped point came back on
+    // reopen, while a coordinator that read the successful return as deletion had
+    // already written those ids off.
+    //
+    // syncMetaData rather than a second commit: a commit would work but costs a
+    // commit point, which is what made an earlier version of this grow the index
+    // it exists to shrink.
+    directory.syncMetaData();
+    return dropped;
   }
 
   /** A commit's `scriptum.uuid`, or null. */
@@ -1779,6 +1794,20 @@ public class BranchIndexWriter implements Closeable {
     // closed, pinning every later collection at that instant for the life of the
     // process. That is exactly what the guard exists to prevent.
     try {
+      // GIVE THE CLOSE-COMMIT AN IDENTITY. `commitOnClose` defaults true, so
+      // close() flushes and commits whatever is buffered — but nothing set commit
+      // data on that path, so the new commit point inherited the PREVIOUS one's
+      // `scriptum.uuid`, timestamp, message and parents verbatim. Two different
+      // index states then answered to one snapshot-id: `as-of` returned the older
+      // of them, `history` listed the id twice, and the commit graph collapsed two
+      // states into one node.
+      //
+      // Only when there is something to commit — `setCommitData` marks the
+      // SegmentInfos changed, so doing it unconditionally would manufacture a
+      // commit point on every close.
+      if (writer.hasUncommittedChanges()) {
+        lastCommitId = setCommitData("Closed " + branchName);
+      }
       writer.close();
     } finally {
       directory.close();

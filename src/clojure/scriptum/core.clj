@@ -157,6 +157,12 @@
     ;; the copy names a manifest that does not yet describe them.
     (let [{:keys [store cache store-id analyzer
                   max-merged-segment-mb ram-buffer-mb]} (:backing sw)]
+      ;; CHECK BEFORE COMMITTING. This committed the parent first, so a fork onto
+      ;; a name that already exists left a commit point on the source and then
+      ;; threw — the same defect the Java `fork` was rewritten to remove, still
+      ;; here on the store path.
+      (when (sk/branch-exists? store new-branch-name)
+        (throw (ex-info "scriptum: branch already exists" {:branch new-branch-name})))
       (.commit (->writer sw))
       (sk/fork! store (.getBranchName (->writer sw)) new-branch-name)
       ;; CARRY THE PARENT'S GUARD ID. Dropping it left a caller who passed

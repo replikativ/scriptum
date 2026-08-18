@@ -844,7 +844,21 @@
          ;; nothing is dirty then, so that call costs nothing.
          flip! (fn []
                  (locking lock
-                   (when @synced-since-flip
+                   ;; `dirty` as well as `synced-since-flip`. Gating on content
+                   ;; alone meant a flip carrying only DELETIONS never happened —
+                   ;; and `retain!` produces exactly that: Lucene drops its commit
+                   ;; points during the checkpoint after the commit, so the
+                   ;; shrink was still only in memory. Closing the writer then
+                   ;; published nothing (`IndexWriter.close` skips a commit when
+                   ;; nothing Lucene-level changed), and every dropped commit
+                   ;; point came BACK on reopen — while the coordinator, reading
+                   ;; a successful return as deletion, had already written those
+                   ;; ids off for good.
+                   ;;
+                   ;; Cheap, because deletions are rare: `BranchDeletionPolicy`
+                   ;; retains every commit point, so nothing is normally dropped
+                   ;; and this is false whenever `synced-since-flip` is.
+                   (when (or @synced-since-flip @dirty)
                      (let [{:keys [files pointer]} @state
                            ;; WHERE THIS BRANCH WAS, which is what the pointer
                            ;; still holds until the line below moves it, PLUS any
@@ -1191,6 +1205,16 @@
       (sync [names] nil)
       (syncMetaData [] nil)
       (close [] (.close live)))))
+
+(defn branch-exists?
+  "Does `branch` have a manifest? Existence of a branch IS existence of its
+  manifest, so this is a lookup rather than an enumeration.
+
+  Exposed so a caller can refuse BEFORE doing work it would have to undo — the
+  store-backed `fork` committed its parent first and only then discovered the
+  target, leaving a commit point behind on every refused attempt."
+  [store branch]
+  (k/exists? store (manifest-key branch) {:sync? true}))
 
 (defn fork!
   "Branch `from` as `to`: copy the manifest. O(1) — no segment bytes move, and

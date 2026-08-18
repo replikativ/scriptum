@@ -1952,3 +1952,72 @@
           (is (empty? orphans)
               (str "no commit may dangle off a parent that is gone: " (pr-str orphans))))
         (finally (sc/close! w))))))
+
+(deftest retention-survives-closing-the-writer
+  (testing "REGRESSION: `retain!` returned what it dropped while the shrink was
+            only in the Directory's memory. Lucene drops commit points during the
+            checkpoint AFTER the commit's flip, and `IndexWriter.close` publishes
+            nothing (it skips a commit when nothing Lucene-level changed) — so
+            retain-then-close brought every dropped commit point BACK on reopen,
+            while a coordinator reading the successful return as deletion had
+            already written those ids off for good."
+    (let [s (store)
+          sid (sk/store-id-for s)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try
+          (dotimes [i 6] (sc/add-doc w {:body {:type :text :value (str i)}})
+                   (sc/commit! w (str "c" i)))
+          (is (pos? (sc/retain! w {:before (Instant/now)})))
+          (finally (sc/close! w))))
+      ;; reopen: the drop must have survived the close
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try
+          (is (< (count (sc/list-snapshots w)) 6)
+              "the dropped commit points must not come back")
+          (is (= 6 (sc/num-docs w)) "and no document is lost")
+          (finally (sc/close! w))))
+      ;; and the blobs are genuinely reclaimable now
+      (let-the-millisecond-turn-over!)
+      (is (pos? (count (sk/gc! s sid))) "collection has something to take"))))
+
+(deftest closing-a-writer-does-not-reuse-the-previous-commit-identity
+  (testing "REGRESSION: `commitOnClose` is true, so `close` commits what is
+            buffered — but nothing set commit data on that path, so the new
+            commit point inherited the PREVIOUS one's uuid, timestamp and
+            parents. Two index states answered to one snapshot-id: `as-of`
+            returned the older, `history` listed the id twice, and the graph
+            collapsed two states into one node."
+    (let [s (store)]
+      (let [w (sc/open-store-index s (cache) "main")]
+        (sc/add-doc w {:body {:type :text :value "committed"}})
+        (sc/commit! w "one")
+        ;; buffered, never explicitly committed
+        (sc/add-doc w {:body {:type :text :value "buffered"}})
+        (sc/close! w))
+      (let [w (sc/open-store-index s (cache) "main")]
+        (try
+          (let [snaps (sc/list-snapshots w)
+                ids (map :snapshot-id snaps)]
+            (is (= 2 (count snaps)) "the close produced its own commit point")
+            (is (= (count ids) (count (set ids)))
+                "and it must carry its own identity, not the previous one's")
+            (is (= 2 (sc/num-docs w)) "with the buffered document in it"))
+          (finally (sc/close! w)))))))
+
+(deftest a-refused-store-fork-does-not-commit-the-parent
+  (testing "REGRESSION: store-backed `fork` committed the parent before
+            discovering the target existed — the same defect the Java `fork` was
+            rewritten to remove, still present on this path."
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (sc/add-doc w {:body {:type :text :value "x"}})
+        (sc/commit! w "one")
+        (let [f (sc/fork w "feature")]
+          (sc/close! f))
+        (let [before (count (sc/list-snapshots w))]
+          (dotimes [_ 3]
+            (is (thrown? clojure.lang.ExceptionInfo (sc/fork w "feature"))))
+          (is (= before (count (sc/list-snapshots w)))
+              "a refused fork must leave the parent untouched"))
+        (finally (sc/close! w))))))
