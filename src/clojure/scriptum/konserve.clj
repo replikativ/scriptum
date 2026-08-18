@@ -767,30 +767,6 @@
          ;; `snapshot-address` against `pointer`, because `listAll` asks on every
          ;; call and that comparison is a SHA-512 over the serialized map.
          dirty (atom false)
-         ;; Has a `sync` landed blobs since the last flip? Distinct from `dirty`,
-         ;; and the distinction is worth two store writes per commit.
-         ;;
-         ;; Lucene deletes a superseded `segments_N` AFTER the commit that
-         ;; supersedes it, so every commit ends with an edit that arrives too
-         ;; late for its own flip. Flipping on `dirty` alone therefore fires
-         ;; twice per commit: once at the NEXT commit's `prepareCommit` to
-         ;; publish that trailing delete, and again at its `finishCommit`.
-         ;; Measured at 8 store writes per commit against 6.
-         ;;
-         ;; Gating on content instead lets the trailing delete ride the next
-         ;; commit's flip, which publishes the whole map anyway. `dirty` still
-         ;; guards `listAll` in the meantime, so the delete is never undone —
-         ;; only deferred.
-         ;;
-         ;; INVARIANT: `synced-since-flip` IMPLIES `dirty`. Every site that sets
-         ;; the former sets the latter, and `flip!` clears both under `lock`.
-         ;; This is what keeps `listAll` safe during the flip's store writes —
-         ;; the only moment the store pointer and the in-memory one disagree —
-         ;; because `dirty` is necessarily true there and `listAll` skips. Set
-         ;; `synced-since-flip` without `dirty`, or clear `dirty` first in
-         ;; `flip!`, and a poll can adopt the store's map and resurrect a name
-         ;; this Directory has deleted.
-         synced-since-flip (atom false)
          ;; The open unreferenced-write sequence, if any. Blobs land in `sync`
          ;; and the pointer flips in `syncMetaData`, so the window the guard has
          ;; to cover spans two Directory calls and cannot be a scoped macro —
@@ -844,21 +820,28 @@
          ;; nothing is dirty then, so that call costs nothing.
          flip! (fn []
                  (locking lock
-                   ;; `dirty` as well as `synced-since-flip`. Gating on content
-                   ;; alone meant a flip carrying only DELETIONS never happened —
-                   ;; and `retain!` produces exactly that: Lucene drops its commit
-                   ;; points during the checkpoint after the commit, so the
-                   ;; shrink was still only in memory. Closing the writer then
-                   ;; published nothing (`IndexWriter.close` skips a commit when
-                   ;; nothing Lucene-level changed), and every dropped commit
-                   ;; point came BACK on reopen — while the coordinator, reading
-                   ;; a successful return as deletion, had already written those
-                   ;; ids off for good.
-                   ;;
-                   ;; Cheap, because deletions are rare: `BranchDeletionPolicy`
-                   ;; retains every commit point, so nothing is normally dropped
-                   ;; and this is false whenever `synced-since-flip` is.
-                   (when (or @synced-since-flip @dirty)
+                   ;; GATED ON `dirty`, i.e. on the in-memory map differing from
+                   ;; the pointer — which is exactly when a flip is owed. It once
+                   ;; keyed on new content instead, and a flip carrying only
+                   ;; DELETIONS then never happened: `retain!` produces exactly
+                   ;; that, since Lucene drops commit points during the checkpoint
+                   ;; after the commit, so the shrink stayed in memory and closing
+                   ;; the writer published nothing.
+                   (when @dirty
+                     ;; UNDER THE GUARD. This is a values-then-pointer
+                     ;; sequence — snapshot first, branch pointer second — and it
+                     ;; has to be covered like any other. It used to be covered
+                     ;; only by accident: a flip could not happen without a
+                     ;; preceding `sync`, which opened the guard. `retain!`
+                     ;; publishes by calling `syncMetaData` directly, with no
+                     ;; sync in front of it, so that flip ran unguarded — a
+                     ;; collection landing between the two writes swept the
+                     ;; snapshot the pointer was about to name, bricking the
+                     ;; branch AND leaving `gc!` throwing for every branch in the
+                     ;; store. Reproduced at iteration 39 of a commit/retain loop
+                     ;; against a background collector; the same loop without
+                     ;; `retain!` ran 800 commits clean.
+                     (open-guard!)
                      (let [{:keys [files pointer]} @state
                            ;; WHERE THIS BRANCH WAS, which is what the pointer
                            ;; still holds until the line below moves it, PLUS any
@@ -883,7 +866,6 @@
                        (k/assoc store (manifest-key branch) address {:sync? true})
                        (swap! state assoc :pointer address)
                        (reset! dirty false)
-                       (reset! synced-since-flip false)
                        ;; Consumed: they belong to the commit just written, not
                        ;; to whatever is committed next.
                        (reset! pending-parents #{}))))
@@ -1073,8 +1055,7 @@
              (let [m (into (files-now) pairs)]
                (when (not= m (files-now))
                  (swap! state assoc :files m)
-                 (reset! dirty true)
-                 (reset! synced-since-flip true)))
+                 (reset! dirty true)))
              ;; Synced names are the manifest's now. Handing them over keeps a
              ;; name from living in both sets, so `rename` and `deleteFile` have
              ;; one place to edit.

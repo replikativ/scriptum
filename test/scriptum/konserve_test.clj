@@ -2021,3 +2021,49 @@
           (is (= before (count (sc/list-snapshots w)))
               "a refused fork must leave the parent untouched"))
         (finally (sc/close! w))))))
+
+(deftest retention-publishes-under-the-guard
+  (testing "CRITICAL REGRESSION: `flip!` writes a snapshot and then a branch
+            pointer — a values-then-pointer sequence — and was covered by the
+            gc-guard only by accident, because a flip could not happen without a
+            preceding `sync` having opened it. `retain!` publishes by calling
+            `syncMetaData` directly with no sync in front, so that flip ran
+            UNGUARDED: a collection landing between the two writes swept the
+            snapshot the pointer was about to name, bricking the branch and
+            leaving `gc!` throwing for every branch in the store.
+
+            Driven deterministically — a collection is run in the window between
+            the snapshot write and the pointer write, which is the whole race. A
+            timing loop did not reproduce it reliably enough to be a regression
+            test."
+    (let [s (store)
+          sid (sk/store-id-for s)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (dotimes [i 4]
+          (sc/add-doc w {:body {:type :text :value (str "d" i)}})
+          (sc/commit! w (str "c" i)))
+        (let [real k/assoc
+              fired (atom 0)]
+          ;; Collect in the gap: just before EVERY branch-pointer write, while
+          ;; the snapshot it is about to name has already been written. Every
+          ;; one, because `retain!` flips twice — once for its own commit, which
+          ;; a preceding `sync` has guarded, and once to publish the deletions,
+          ;; which is the unguarded one. Intercepting only the first tested the
+          ;; safe flip and passed either way.
+          (with-redefs [k/assoc (fn [store' key v & opts]
+                                  (when (and (vector? key) (= :manifest (second key)))
+                                    (swap! fired inc)
+                                    (let-the-millisecond-turn-over!)
+                                    (try (sk/gc! s sid) (catch Exception _ nil)))
+                                  (apply real store' key v opts))]
+            (sc/retain! w {:before (Instant/now)}))
+          (is (<= 2 @fired) "precondition: a collection ran inside the publish window"))
+        (is (map? (sk/read-manifest s "main"))
+            "the branch must still resolve — its snapshot must not have been swept")
+        (is (= 4 (sc/num-docs w)) "and no committed document is lost")
+        (finally (sc/close! w)))
+      (is (set? (sk/mark s)) "collection must not be wedged for the store")
+      (let [w2 (sc/open-store-index s (cache) "main")]
+        (try (is (= 4 (sc/num-docs w2)) "and the branch reopens cold")
+             (finally (sc/close! w2)))))))
