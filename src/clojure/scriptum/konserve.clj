@@ -1538,26 +1538,41 @@
   policy.
 
   `:only` is a predicate on the Lucene filename, for warming part of an index —
-  `#(clojure.string/ends-with? % \".cfs\")`, say. Returns the number of files
-  materialized.
+  `#(clojure.string/ends-with? % \".cfs\")`, say. `:budget` bounds how many files
+  are materialized (manifest order, a hard ceiling); files past it stay cold
+  and the report says so.
+
+  Returns the ecosystem's warm-report envelope rather than a bare count —
+  {:fetched :ms :budget-left :budget-exhausted?} — so a caller warming
+  scriptum next to datahike's and stratum's trees reads one shape. `:fetched`
+  counts files ENSURED LOCAL: a file already present costs one stat and still
+  counts, exactly as the bare count did. The units are files, not tree nodes;
+  budgets do not translate across index families and are not meant to.
 
   Safe alongside live readers and writers: materialization converges rather than
   races (see `link-into-view!`), and a file already present costs one stat."
   ([store ^String cache ^String branch] (warm! store cache branch {}))
-  ([store ^String cache ^String branch {:keys [only]}]
+  ([store ^String cache ^String branch {:keys [only budget]}]
    (ensure-format! store)
    (check-branch-name branch)
-   (let [files (cond->> (read-manifest store branch)
-                 only (filter (fn [[n _]] (only n)))
-                 true (into {}))]
-     (->> (seq files)
-          (partition-all blob-upload-parallelism)
-          (mapcat (fn [batch]
-                    (doall (pmap (fn [[n address]]
-                                   (link-into-view! store cache branch n address)
-                                   1)
-                                 batch))))
-          (reduce + 0)))))
+   (let [t0        (System/nanoTime)
+         all       (cond->> (read-manifest store branch)
+                     only (filter (fn [[n _]] (only n)))
+                     true (into {}))
+         capped    (if budget (take budget (seq all)) (seq all))
+         truncated? (boolean (and budget (> (count all) (long budget))))
+         fetched   (->> capped
+                        (partition-all blob-upload-parallelism)
+                        (mapcat (fn [batch]
+                                  (doall (pmap (fn [[n address]]
+                                                 (link-into-view! store cache branch n address)
+                                                 1)
+                                               batch))))
+                        (reduce + 0))]
+     {:fetched fetched
+      :budget-left (when budget (max 0 (- (long budget) fetched)))
+      :budget-exhausted? truncated?
+      :ms (/ (- (System/nanoTime) t0) 1e6)})))
 
 (defn gc-cache!
   "Delete pooled blobs no branch's manifest names, and views of branches that
