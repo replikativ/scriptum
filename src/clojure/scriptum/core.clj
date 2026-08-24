@@ -365,8 +365,12 @@
   selective query should not pay for segments it never reads. Warming is worth
   it when you know the machine is cold and about to serve.
 
-  Options: `:only`, a predicate on the Lucene filename. Returns the number of
-  files materialized. Store-backed indices only; nil otherwise."
+  Options: `:only` (a predicate on the Lucene filename) and `:budget` (max
+  files materialized, a hard ceiling in manifest order). Returns the
+  ecosystem's warm-report envelope — {:fetched :ms :budget-left
+  :budget-exhausted?}, `:fetched` in FILES — so warming scriptum next to
+  datahike's and stratum's trees reads one shape. Store-backed indices only;
+  nil otherwise."
   ([sw] (warm! sw {}))
   ([sw opts]
    (when (store-backed? sw)

@@ -1785,19 +1785,30 @@
         (is (< 1 n-files) "precondition: several segments")
         ;; wipe the derived cache — this is the cold machine
         (rm-rf (io/file (cache)))
-        (is (= n-files (sk/warm! s (cache) "main"))
-            "warming materializes every file the snapshot names")
+        (let [r (sk/warm! s (cache) "main")]
+          (is (= n-files (:fetched r))
+              "warming materializes every file the snapshot names")
+          (is (false? (:budget-exhausted? r)))
+          (is (number? (:ms r))))
         ;; and the index reads without touching the store again
         (let [w (sc/open-store-index s (cache) "main")]
           (try (is (= 60 (sc/num-docs w))
                    "the whole index reads without touching the store again")
                (finally (sc/close! w))))
         ;; idempotent, and selective
-        (is (= n-files (sk/warm! s (cache) "main")) "warming again is a no-op cost")
+        (is (= n-files (:fetched (sk/warm! s (cache) "main")))
+            "warming again is a no-op cost")
         (rm-rf (io/file (cache)))
-        (let [segs (sk/warm! s (cache) "main"
-                             {:only #(clojure.string/starts-with? % "segments_")})]
-          (is (< 0 segs n-files) ":only warms a subset"))))))
+        (let [r (sk/warm! s (cache) "main"
+                          {:only #(clojure.string/starts-with? % "segments_")})]
+          (is (< 0 (:fetched r) n-files) ":only warms a subset"))
+        ;; the budget is a hard ceiling, in files — scriptum's own unit; budgets
+        ;; do not translate across index families and are not meant to
+        (rm-rf (io/file (cache)))
+        (let [r (sk/warm! s (cache) "main" {:budget 2})]
+          (is (= 2 (:fetched r)) "exactly the budget, not one more")
+          (is (true? (:budget-exhausted? r)))
+          (is (zero? (:budget-left r))))))))
 
 ;; =============================================================================
 ;; Retention
