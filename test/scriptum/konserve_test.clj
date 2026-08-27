@@ -820,6 +820,90 @@
                                                          {:after old-cursor})))))))
         (finally (sc/close! w))))))
 
+(deftest analyzer-free-term-builders-query-multi-valued-string-fields
+  (testing "exact and prefix builders operate on complete StringField values,
+            not analyzer output, and a multi-valued document remains one hit"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [[id lexemes]
+                [["one" ["cat" "cater" "running"]]
+                 ["two" ["catalog" "dog"]]
+                 ["three" ["Cat" "run"]]]]
+          (sc/add-doc w {:id {:type :string :value id}
+                         :lexeme {:type :string :value lexemes :store? false}}))
+        (sc/commit! w "exact lexeme generation")
+        (with-open [snapshot (sc/open-store-snapshot
+                              s (cache) (sc/snapshot-address w))]
+          (letfn [(ids [query]
+                    (set (map #(get % "id")
+                              (sc/search-store-snapshot snapshot query
+                                                        {:limit 20
+                                                         :fields [:id]}))))]
+            (is (= #{"one"} (ids (sc/term-query :lexeme "cat")))
+                "exact means one complete indexed term")
+            (is (empty? (ids (sc/term-query :lexeme "ca")))
+                "the exact builder does not analyze or expand a prefix")
+            (is (= #{"one" "two"} (ids (sc/prefix-query :lexeme "cat")))
+                "two matching values in document one still produce one hit")
+            (is (= #{"three"} (ids (sc/prefix-query :lexeme "Cat")))
+                "no analyzer lower-cases an already-normalized term")))
+        (finally (sc/close! w))))))
+
+(deftest analyzer-free-prefix-candidates-page-through-one-immutable-snapshot
+  (testing "candidate continuation stays on its snapshot while the branch
+            advances; constant Lucene scores are cursor data, not ranking"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [[id lexemes]
+                [["one" ["cat" "cater"]]
+                 ["two" ["catalog"]]
+                 ["miss" ["dog"]]]]
+          (sc/add-doc w {:id {:type :string :value id}
+                         :lexeme {:type :string :value lexemes :store? false}}))
+        (sc/commit! w "pinned prefix generation")
+        (let [old-address (sc/snapshot-address w)
+              query (sc/prefix-query :lexeme "cat")]
+          (with-open [snapshot (sc/open-store-snapshot s (cache) old-address)]
+            (let [first-page (sc/candidate-page snapshot query
+                                                {:page-size 1
+                                                 :fields [:id]
+                                                 :query-id [:prefix :lexeme "cat"]})]
+              (is (false? (:exhausted? first-page)))
+              (is (= 1 (count (:candidates first-page))))
+              (sc/add-doc w {:id {:type :string :value "later"}
+                             :lexeme {:type :string
+                                      :value ["catfish" "category"]
+                                      :store? false}})
+              (sc/commit! w "branch advances past held candidate snapshot")
+              (loop [after (:continuation first-page)
+                     candidates (:candidates first-page)]
+                (let [page (sc/candidate-page snapshot query
+                                              {:page-size 1
+                                               :after after
+                                               :fields [:id]
+                                               :query-id [:prefix :lexeme "cat"]})
+                      candidates' (into candidates (:candidates page))]
+                  (if (:exhausted? page)
+                    (do
+                      (is (= #{"one" "two"}
+                             (set (map #(get % "id") candidates')))
+                          "the old snapshot neither sees the later document nor
+                           repeats the multi-valued document")
+                      (is (= 1 (count (set (map :score candidates'))))
+                          "constant score is stable paging state, not relevance"))
+                    (recur (:continuation page) candidates'))))))
+          (with-open [new-snapshot (sc/open-store-snapshot
+                                    s (cache) (sc/snapshot-address w))]
+            (is (= #{"one" "two" "later"}
+                   (set (map #(get % "id")
+                             (sc/search-store-snapshot new-snapshot query
+                                                       {:limit 20
+                                                        :fields [:id]}))))
+                "a new snapshot sees the branch's later matching document")))
+        (finally (sc/close! w))))))
+
 (deftest a-commit-that-never-finished-does-not-move-the-branch
   (testing "THE LOAD-BEARING ASSUMPTION of putting the flip in `syncMetaData`.
 

@@ -24,7 +24,7 @@
             KnnFloatVectorField]
            [org.apache.lucene.index DirectoryReader IndexableField Term
             VectorSimilarityFunction]
-           [org.apache.lucene.search IndexSearcher TermQuery BooleanQuery
+           [org.apache.lucene.search IndexSearcher TermQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
             MatchAllDocsQuery KnnFloatVectorQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
@@ -957,6 +957,39 @@
 
 ;; --- Query Builders ---
 
+(defn term-query
+  "Build an analyzer-free exact query for one indexed term.
+
+  This is the query counterpart of a `:string` (`StringField`) value: the term
+  is used exactly as supplied, with no tokenization, stemming, case folding or
+  stop-word removal. It is therefore suitable for already-normalized tokens
+  such as PostgreSQL lexemes. It is not a shortcut for querying `:text`
+  (`TextField`) values; callers of analyzed fields should use `text-query`.
+
+  The query is constant-score deliberately. Scriptum still exposes Lucene's
+  score in search results and candidate continuations, because `searchAfter`
+  needs the complete sort cursor, but that score has no semantic meaning here:
+  it is neither PostgreSQL text-search rank nor evidence of a better match."
+  [field term]
+  (ConstantScoreQuery.
+   (TermQuery. (Term. (name field) (str term)))))
+
+(defn prefix-query
+  "Build an analyzer-free prefix query over indexed terms.
+
+  Like `term-query`, this is intended for `:string` (`StringField`) values and
+  already-normalized tokens. `prefix` is matched byte-for-byte at the start of
+  each complete indexed term; no analyzer runs and case is preserved. A
+  multi-valued StringField document is returned once when one or more of its
+  values match.
+
+  The constant Lucene score is intentionally non-semantic. It exists in
+  candidate pages only as part of the immutable `searchAfter` cursor; callers
+  implementing PostgreSQL ranking must compute that rank themselves."
+  [field prefix]
+  (ConstantScoreQuery.
+   (PrefixQuery. (Term. (name field) (str prefix)))))
+
 (defn text-query
   "Parse a text query string against a single field using the given analyzer.
 
@@ -1176,7 +1209,7 @@
      (hits->results searcher (.-scoreDocs top-docs) fields))))
 
 (defn candidate-page
-  "Return one resumable page of scored candidates from an immutable snapshot.
+  "Return one resumable page of candidates from an immutable snapshot.
 
   The envelope is stable for the lifetime of the snapshot:
 
@@ -1192,6 +1225,12 @@
   silently skipping or repeating candidates. Lucene's `searchAfter` supplies
   the ordering, so callers can keep requesting pages until `:exhausted?`
   without imposing a fixed top-N cutoff.
+
+  `:score` and the score-first `:ordering` describe Lucene's paging cursor,
+  not application semantics. In particular, the analyzer-free `term-query`
+  and `prefix-query` builders use constant scores. A PostgreSQL adapter must
+  recheck candidates and compute `ts_rank` or any other user-visible rank from
+  PostgreSQL semantics rather than interpreting this score.
 
   Options:
     :page-size - positive number of candidates to return (default 100)
