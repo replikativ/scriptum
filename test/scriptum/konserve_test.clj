@@ -418,6 +418,24 @@
               "the store is the source of truth; the cache is derived")
           (finally (sc/close! w2)))))))
 
+(deftest abort-discards-buffered-store-backed-changes
+  (testing "abort is a real Lucene rollback, unlike close's deliberate
+            commit-on-close, and therefore never advances the branch manifest"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (sc/add-doc w {:id {:type :string :value "committed"}})
+      (sc/commit! w "durable base")
+      (let [before (sc/snapshot-address w)]
+        (sc/add-doc w {:id {:type :string :value "buffered"}})
+        (sc/abort! w)
+        (is (= before (sk/branch-snapshot s "main"))
+            "rollback must not publish a new snapshot")
+        (let [reopened (sc/open-store-index s (cache) "main")]
+          (try
+            (is (= ["committed"]
+                   (mapv #(get % "id") (sc/search reopened :all {:limit 10}))))
+            (finally (sc/close! reopened))))))))
+
 (deftest forking-a-store-backed-index-copies-a-manifest
   (testing "fork goes through the manifests rather than the filesystem, and the
             branches then diverge independently"
@@ -678,6 +696,96 @@
               "and the new commit records the one it descends from")
           (is (= #{"first"} (bodies-at s (cache) a1))
               "and the OLD snapshot still resolves to the old index state"))))))
+
+(deftest a-store-snapshot-search-needs-no-live-branch-writer
+  (testing "an address-pinned search handle remains on its generation while the
+            branch advances, and owns only read-only resources"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [i (range 5)]
+          (sc/add-doc w {:id {:type :string :value (str i)}
+                         :body {:type :text :value "common text"}}))
+        (sc/commit! w "first generation")
+        (let [address (sc/snapshot-address w)]
+          (with-open [snapshot (sc/open-store-snapshot s (cache) address)]
+            (is (= address (:snapshot-address snapshot)))
+            (is (= 5 (count (sc/search-store-snapshot snapshot
+                                                      (sc/text-query :body "common")
+                                                      {:limit 20
+                                                       :fields [:id]}))))
+            (sc/add-doc w {:id {:type :string :value "later"}
+                           :body {:type :text :value "common text"}})
+            (sc/commit! w "branch advances")
+            (is (= 5 (count (sc/search-store-snapshot snapshot
+                                                      (sc/text-query :body "common")
+                                                      {:limit 20})))
+                "the held snapshot cannot move with the branch")))
+        (finally (sc/close! w))))))
+
+(deftest candidates-page-through-an-entire-pinned-snapshot
+  (testing "searchAfter exposes every candidate without a fixed top-N and the
+            continuation cannot be reused on a different snapshot"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [i (range 23)]
+          (sc/add-doc w {:id {:type :string :value (format "%02d" i)}
+                         :body {:type :text :value "same score"}}))
+        (sc/commit! w "candidate generation")
+        (let [address (sc/snapshot-address w)]
+          (with-open [snapshot (sc/open-store-snapshot s (cache) address)]
+            (loop [after nil
+                   ids []
+                   page-count 0]
+              (let [{:keys [candidates continuation exhausted? ordering]
+                     :as page}
+                    (sc/candidate-page snapshot (sc/text-query :body "same")
+                                       {:page-size 7
+                                        :after after
+                                        :fields [:id]
+                                        :query-id :same-query})
+                    ids' (into ids (map #(get % "id")) candidates)]
+                (is (= address (:snapshot-address page)))
+                (is (= :score-desc-doc-id-asc ordering))
+                (is (every? #(and (contains? % :doc-id)
+                                  (contains? % :score)
+                                  (= #{"id" :doc-id :score} (set (keys %))))
+                            candidates))
+                (is (apply <= (map :doc-id candidates))
+                    "equal-score hits use Lucene's stable doc-id tie break")
+                (when (and after (seq candidates))
+                  (is (< (:doc-id after) (:doc-id (first candidates)))
+                      "the tie break remains monotonic across page boundaries"))
+                (if exhausted?
+                  (do
+                    (is (nil? continuation))
+                    (is (= 4 (inc page-count)))
+                    (is (= (set (map #(format "%02d" %) (range 23)))
+                           (set ids')))
+                    (is (= 23 (count ids'))))
+                  (do
+                    (is (= address (:snapshot-address continuation)))
+                    (recur continuation ids' (inc page-count))))))
+
+            (let [first-page (sc/candidate-page snapshot :all
+                                                {:page-size 3 :query-id :match-all})
+                  old-cursor (:continuation first-page)]
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                    #"continuation does not belong"
+                                    (sc/candidate-page snapshot :all
+                                                       {:after old-cursor
+                                                        :query-id :different-query})))
+              (sc/add-doc w {:id {:type :string :value "new"}
+                             :body {:type :text :value "same score"}})
+              (sc/commit! w "new snapshot")
+              (with-open [new-snapshot (sc/open-store-snapshot
+                                        s (cache) (sc/snapshot-address w))]
+                (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                      #"continuation does not belong"
+                                      (sc/candidate-page new-snapshot :all
+                                                         {:after old-cursor})))))))
+        (finally (sc/close! w))))))
 
 (deftest a-commit-that-never-finished-does-not-move-the-branch
   (testing "THE LOAD-BEARING ASSUMPTION of putting the flip in `syncMetaData`.
