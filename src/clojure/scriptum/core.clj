@@ -12,8 +12,11 @@
   (:require [scriptum.konserve :as sk]
             [scriptum.metadata :as metadata]
             [konserve.gc-guard :as guard])
-  (:import [java.nio.file Path Paths]
+  (:import [java.io File]
+           [java.lang.ref Cleaner Cleaner$Cleanable]
+           [java.nio.file Path Paths]
            [java.time Instant Duration]
+           [java.util IdentityHashMap]
            [org.apache.lucene.analysis Analyzer]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
            [org.apache.lucene.document Document Field$Store TextField StringField
@@ -43,15 +46,94 @@
   ;; branch is a directory in one model and a manifest in the other.
   )
 
-(defrecord StoreSnapshot [snapshot-address directory reader]
+(defonce ^:private ^Cleaner snapshot-cleaner (Cleaner/create))
+(defonce ^:private snapshot-resource-lock (Object.))
+(defonce ^:private ^IdentityHashMap snapshot-resources (IdentityHashMap.))
+
+(defrecord StoreSnapshotResource [store resource-key directory reader refs])
+
+(defn- release-snapshot-resource! [^StoreSnapshotResource resource]
+  (locking snapshot-resource-lock
+    (let [store (:store resource)
+          resource-key (:resource-key resource)
+          resources (.get snapshot-resources store)
+          registered (get resources resource-key)]
+      (when-not (identical? resource registered)
+        (throw (ex-info "scriptum: snapshot lease resource is no longer registered"
+                        {:snapshot-resource resource-key})))
+      (if (> (long @(:refs resource)) 1)
+        (swap! (:refs resource) dec)
+        (try
+          ;; A DirectoryReader retains the Directory, so release it first.
+          (try
+            (.close ^DirectoryReader (:reader resource))
+            (finally
+              (.close ^Directory (:directory resource))))
+          (finally
+            (let [remaining (dissoc resources resource-key)]
+              (if (seq remaining)
+                (.put snapshot-resources store remaining)
+                (.remove snapshot-resources store)))))))))
+
+(defrecord SnapshotLeaseCleanup [resource closed?]
+  Runnable
+  (run [_]
+    (when (compare-and-set! closed? false true)
+      (try
+        (release-snapshot-resource! resource)
+        ;; Cleaner fallback cannot report to a caller. Explicit close invokes
+        ;; the same action synchronously and therefore still surfaces failures.
+        (catch Throwable _)))))
+
+(defrecord StoreSnapshot [snapshot-address directory reader resource cleanable*
+                          closed?]
   java.io.Closeable
   (close [_]
-    ;; A DirectoryReader retains the Directory, so release it first.  The
-    ;; directory is owned by this handle and is never shared with a writer.
+    (locking closed?
+      (when-not @closed?
+        ;; Explicit close is synchronous and reports native/Lucene failures.
+        (try
+          (release-snapshot-resource! resource)
+          (finally
+            ;; Native close is not a safely retryable protocol after partial
+            ;; progress. Mark this logical lease consumed either way.
+            (reset! closed? true)
+            (.clean ^Cleaner$Cleanable @cleanable*)))))))
+
+(defn- snapshot-resource-key [^String cache address]
+  [(.getCanonicalPath (File. cache)) address])
+
+(defn- acquire-snapshot-resource! [store ^String cache address]
+  (let [resource-key (snapshot-resource-key cache address)]
+    (locking snapshot-resource-lock
+      (let [resources (or (.get snapshot-resources store) {})]
+        (if-let [resource (get resources resource-key)]
+          (do
+            (swap! (:refs resource) inc)
+            resource)
+          (let [^Directory directory (sk/snapshot-directory store cache address)]
+            (try
+              (let [resource (->StoreSnapshotResource
+                              store resource-key directory
+                              (DirectoryReader/open directory) (atom 1))]
+                (.put snapshot-resources store (assoc resources resource-key resource))
+                resource)
+              (catch Throwable failure
+                (.close directory)
+                (throw failure)))))))))
+
+(defn- snapshot-lease [^StoreSnapshotResource resource address]
+  (let [cleanable* (atom nil)
+        closed? (atom false)
+        snapshot (->StoreSnapshot address (:directory resource) (:reader resource)
+                                  resource cleanable* closed?)
+        cleanup (->SnapshotLeaseCleanup resource closed?)]
     (try
-      (.close ^DirectoryReader reader)
-      (finally
-        (.close ^Directory directory)))))
+      (reset! cleanable* (.register snapshot-cleaner snapshot cleanup))
+      snapshot
+      (catch Throwable failure
+        (release-snapshot-resource! resource)
+        (throw failure)))))
 
 (defn generation?
   "Whether `sw` is a detached immutable-generation writer."
@@ -1045,21 +1127,39 @@
   "Open the immutable konserve index state named by `address`.
 
   Unlike `open-store-index`, this does not resolve or create a branch and never
-  opens an IndexWriter. The returned Closeable owns a read-only Directory and
-  DirectoryReader pinned to the exact snapshot address. Branch commits made
-  after this call cannot change what it sees.
+  opens an IndexWriter. The returned Closeable owns one logical lease on a
+  read-only Directory and DirectoryReader pinned to the exact snapshot address.
+  Opens of the same store/cache/address share that physical resource safely;
+  it closes after the last lease. Branch commits cannot change what it sees.
 
   The caller must keep `address` in the `extra-snapshots` root set passed to
   `scriptum.konserve/gc!` for as long as the handle may need to be reopened.
   An already-open reader remains usable from its materialized files, but an
   unrooted snapshot is intentionally eligible for durable collection."
   ^StoreSnapshot [store ^String cache address]
-  (let [^Directory directory (sk/snapshot-directory store cache address)]
-    (try
-      (->StoreSnapshot address directory (DirectoryReader/open directory))
-      (catch Throwable t
-        (.close directory)
-        (throw t)))))
+  (snapshot-lease (acquire-snapshot-resource! store cache address) address))
+
+(defn retain-store-snapshot
+  "Return an independent closeable lease on the same immutable snapshot.
+
+  The physical Directory and DirectoryReader remain open until every retained
+  lease closes. This is the operation immutable DB wrappers use when preparation
+  returns a new wrapper over an unchanged generation: sharing the same
+  StoreSnapshot object gives two owners one close bit and lets either invalidate
+  the other. A Cleaner releases an abandoned logical lease eventually, but
+  callers should close explicitly for deterministic cache/resource reclamation."
+  ^StoreSnapshot [^StoreSnapshot snapshot]
+  (let [resource (:resource snapshot)]
+    (locking snapshot-resource-lock
+      (when @(:closed? snapshot)
+        (throw (ex-info "scriptum: cannot retain a closed snapshot lease"
+                        {:snapshot-address (:snapshot-address snapshot)})))
+      (let [resources (.get snapshot-resources (:store resource))]
+        (when-not (identical? resource (get resources (:resource-key resource)))
+          (throw (ex-info "scriptum: snapshot resource is no longer registered"
+                          {:snapshot-address (:snapshot-address snapshot)})))
+        (swap! (:refs resource) inc)))
+    (snapshot-lease resource (:snapshot-address snapshot))))
 
 (defn search-store-snapshot
   "Search an immutable `StoreSnapshot`, returning the same result vector as

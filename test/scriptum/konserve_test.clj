@@ -723,6 +723,39 @@
                 "the held snapshot cannot move with the branch")))
         (finally (sc/close! w))))))
 
+(deftest immutable-snapshot-leases-have-independent-lifetimes
+  (testing "overlapping immutable DB values share the read-only Lucene resource,
+            but closing either logical lease cannot invalidate the other"
+    (let [s (store)
+          c (cache)
+          w (sc/open-store-index s c "main")]
+      (try
+        (sc/add-doc w {:body {:type :text :value "shared snapshot"}})
+        (sc/commit! w)
+        (let [address (sc/snapshot-address w)
+              first (sc/open-store-snapshot s c address)
+              second (sc/open-store-snapshot s c address)
+              retained (sc/retain-store-snapshot first)]
+          (try
+            (is (identical? (:reader first) (:reader second)))
+            (is (identical? (:directory first) (:directory retained)))
+            (.close ^java.io.Closeable first)
+            (.close ^java.io.Closeable first)
+            (is (= 1 (count (sc/search-store-snapshot
+                             second (sc/text-query :body "shared") {}))))
+            (.close ^java.io.Closeable second)
+            (is (= 1 (count (sc/search-store-snapshot
+                             retained (sc/text-query :body "snapshot") {})))
+                "the last retained lease still owns the physical reader")
+            (finally
+              (.close ^java.io.Closeable first)
+              (.close ^java.io.Closeable second)
+              (.close ^java.io.Closeable retained)))
+          (with-open [reopened (sc/open-store-snapshot s c address)]
+            (is (= 1 (count (sc/search-store-snapshot reopened :all {})))
+                "the final close released enough state for a clean reopen")))
+        (finally (sc/close! w))))))
+
 (deftest candidates-page-through-an-entire-pinned-snapshot
   (testing "searchAfter exposes every candidate without a fixed top-N and the
             continuation cannot be reused on a different snapshot"
