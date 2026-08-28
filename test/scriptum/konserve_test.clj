@@ -2263,6 +2263,87 @@
             (sc/close! b))))
       (finally (sc/close! source)))))
 
+(defn- segment-commit-files [store address]
+  (into #{}
+        (filter #(.startsWith ^String % "segments_"))
+        (keys (sk/snapshot-files store address))))
+
+(deftest detached-generations-keep-only-the-latest-lucene-commit
+  (testing "external snapshot roots own history; a derived generation does not
+            copy every old Lucene commit point into its current file map"
+    (let [s (store)
+          c (cache)
+          source (sc/open-store-index s c "source")]
+      (try
+        ;; A native Scriptum branch deliberately retains its commit points. This
+        ;; makes the source a strong regression fixture rather than assuming a
+        ;; single-commit base.
+        (dotimes [n 3]
+          (sc/add-doc source {:body (str "base-" n)})
+          (sc/commit! source (str "base-" n)))
+        (let [base (sc/snapshot-address source)]
+          (is (= 3 (count (segment-commit-files s base)))
+              "precondition: the native source carries three commit points")
+          (loop [address base
+                 n 0]
+            (when (< n 3)
+              (let [workspace (str "latest-only-" n)
+                    generation (sc/begin-generation
+                                s c address {:workspace-id workspace})
+                    next-address
+                    (try
+                      (sc/add-doc generation {:body (str "derived-" n)})
+                      (let [sealed (sc/seal-generation! generation)]
+                        (sc/release-generation! generation)
+                        sealed)
+                      (finally
+                        (sc/close! generation)))]
+                (let [segments (segment-commit-files s next-address)]
+                  (is (= 1 (count segments))
+                      (str "the new immutable state contains only its current segments_N: "
+                           (pr-str segments))))
+                (is (= (+ 4 n) (count (bodies-at s c next-address))))
+                (is (= (+ 3 n) (count (bodies-at s c address)))
+                    "deriving does not rewrite the exact source snapshot")
+                (recur next-address (inc n))))))
+        (finally
+          (sc/close! source))))))
+
+(deftest detached-generation-workspaces-clean-up-idempotently
+  (let [s (store)
+        c (cache)
+        sealed-workspace "sealed-workspace"
+        sealed-path (io/file c sealed-workspace)
+        sealed-generation
+        (sc/begin-generation s c nil {:workspace-id sealed-workspace})]
+    (is (.isDirectory sealed-path))
+    (sc/add-doc sealed-generation {:body "durable"})
+    (let [address (sc/seal-generation! sealed-generation)]
+      (is (not (.exists sealed-path))
+          "sealing closes and removes the private hard-link view")
+      ;; Every lifecycle operation is safe to repeat and must not make the
+      ;; immutable result unreadable.
+      (dotimes [_ 2]
+        (sc/release-generation! sealed-generation)
+        (sc/abort-generation! sealed-generation)
+        (sc/close! sealed-generation))
+      (is (= #{"durable"} (bodies-at s c address)))
+      (is (not (.exists sealed-path))))
+
+    (let [aborted-workspace "aborted-workspace"
+          aborted-path (io/file c aborted-workspace)
+          aborted-generation
+          (sc/begin-generation s c nil {:workspace-id aborted-workspace})]
+      (is (.isDirectory aborted-path))
+      (sc/add-doc aborted-generation {:body "discarded"})
+      (dotimes [_ 2]
+        (sc/abort-generation! aborted-generation)
+        (sc/close! aborted-generation))
+      (is (not (.exists aborted-path))
+          "rollback closes and removes the private hard-link view")
+      (is (empty? (sk/branches s)))
+      (is (not (k/exists? s (sk/manifest-key aborted-workspace) {:sync? true}))))))
+
 (deftest detached-generation-has-an-exact-gc-mark
   (let [s (store-at (str *root* "/detached-store"))
         c (str *root* "/detached-cache")

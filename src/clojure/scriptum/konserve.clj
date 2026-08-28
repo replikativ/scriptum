@@ -1211,6 +1211,32 @@
       :store-id store-id
       :pending-parents pending-parents})))
 
+(defn cleanup-detached-workspace!
+  "Remove a detached generation's private local workspace.
+
+  The workspace is a derived hard-link view directly below `cache`; durable
+  bytes live in the content-addressed pool and konserve store. Call only after
+  the generation writer has closed or rolled back. Idempotent: an absent
+  workspace is success. Returns false when the filesystem refuses cleanup so a
+  later lifecycle call can retry it."
+  [^String cache ^String workspace]
+  (check-branch-name workspace)
+  (let [root (.normalize (.toAbsolutePath (->path cache)))
+        target (.normalize (.resolve root workspace))]
+    (when-not (= root (.getParent target))
+      (throw (ex-info "scriptum: detached workspace must be directly below its cache"
+                      {:cache cache :workspace workspace})))
+    (try
+      (when (Files/exists target (make-array LinkOption 0))
+        (with-open [paths (Files/walk target (make-array java.nio.file.FileVisitOption 0))]
+          (doseq [path (->> (iterator-seq (.iterator paths))
+                            (sort-by #(.getNameCount ^java.nio.file.Path %))
+                            reverse)]
+            (Files/deleteIfExists ^java.nio.file.Path path))))
+      true
+      (catch java.nio.file.NoSuchFileException _ true)
+      (catch java.io.IOException _ false))))
+
 ;; =============================================================================
 ;; Branch operations
 ;; =============================================================================

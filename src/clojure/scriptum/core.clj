@@ -74,6 +74,14 @@
       (reset! guard-token nil))
     (swap! lifecycle assoc :released? true)))
 
+(defn- cleanup-generation-workspace!
+  [sw]
+  (let [{:keys [cache workspace workspace-cleaned?]} (generation-backing sw)]
+    (when-not @workspace-cleaned?
+      (when (sk/cleanup-detached-workspace! cache workspace)
+        (reset! workspace-cleaned? true)))
+    @workspace-cleaned?))
+
 (defn store-backed?
   "Is this writer backed by a konserve store rather than a directory tree?"
   [sw]
@@ -318,14 +326,15 @@
          workspace (str (or workspace-id (random-uuid)))
          token (guard/writing! store-id)
          guard-token (atom token)
-         lifecycle (atom {:status :open :released? false})]
+         lifecycle (atom {:status :open :released? false})
+         workspace-cleaned? (atom false)]
      (try
        (let [{:keys [directory state pending-parents]}
              (sk/detached-directory store cache workspace base-address
                                     (cond-> {:store-id store-id}
                                       (:pending-parents opts)
                                       (assoc :pending-parents (:pending-parents opts))))
-             writer (try (BranchIndexWriter/createOver
+             writer (try (BranchIndexWriter/createDetachedOver
                           directory (str (or logical-name "detached")) analyzer)
                          (catch Throwable failure
                            (try (.close ^java.io.Closeable directory) (catch Throwable _))
@@ -347,13 +356,17 @@
            :pending-parents pending-parents
            :guard-token guard-token
            :lifecycle lifecycle
+           :workspace-cleaned? workspace-cleaned?
            :analyzer analyzer
            :max-merged-segment-mb max-merged-segment-mb
            :ram-buffer-mb ram-buffer-mb}))
        (catch Throwable failure
-         (when-let [held @guard-token]
-           (guard/done! store-id held)
-           (reset! guard-token nil))
+         (try
+           (sk/cleanup-detached-workspace! cache workspace)
+           (finally
+             (when-let [held @guard-token]
+               (guard/done! store-id held)
+               (reset! guard-token nil))))
          (throw failure))))))
 
 (defn snapshot-address
@@ -758,25 +771,34 @@
   ([sw message]
    (seal-generation! sw message nil))
   ([sw message metadata]
-   (let [{:keys [lifecycle]} (generation-backing sw)]
+   (let [{:keys [lifecycle directory]} (generation-backing sw)]
      (when-not (= :open (:status @lifecycle))
        (throw (ex-info "scriptum: detached generation is not open"
                        {:lifecycle @lifecycle})))
      (try
        (commit! sw message metadata)
+       ;; Latest-only deletion runs from Lucene's post-commit policy callback.
+       ;; It removes the superseded segments_N after the commit's first metadata
+       ;; sync. Lucene has no reason to sync again after its deletion policy
+       ;; returns, so explicitly publish the deletion-only file map before the
+       ;; Directory is closed. The detached outer guard covers both immutable
+       ;; snapshots, and only this final address escapes to the embedder.
+       (.syncMetaData ^Directory directory)
+       (.close ^BranchIndexWriter (->writer sw))
        (let [address (snapshot-address sw)]
          (when-not address
            (throw (ex-info "scriptum: detached generation sealed without an address" {})))
-         ;; There must be no writable handle after preparation. An explicit
-         ;; commit leaves no buffered changes, so close performs no second seal.
-         (.close ^BranchIndexWriter (->writer sw))
+         (cleanup-generation-workspace! sw)
          (reset! lifecycle {:status :sealed
                             :address address
                             :released? false})
          address)
        (catch Throwable failure
          (try (.rollback ^BranchIndexWriter (->writer sw)) (catch Throwable _))
-         (release-generation-guard! sw)
+         (try
+           (cleanup-generation-workspace! sw)
+           (finally
+             (release-generation-guard! sw)))
          (reset! lifecycle {:status :failed
                             :failure failure
                             :released? true})
@@ -795,6 +817,7 @@
                       {:lifecycle @lifecycle})))
     (when-not released?
       (release-generation-guard! sw))
+    (cleanup-generation-workspace! sw)
     nil))
 
 (defn abort-generation!
@@ -811,9 +834,12 @@
           (.rollback ^BranchIndexWriter (->writer sw))
           (swap! lifecycle assoc :status :aborted))
         (finally
-          ;; A rollback failure must not pin every future collection at this
-          ;; generation's start time. Its objects are unreachable garbage.
-          (release-generation-guard! sw))))
+          (try
+            (cleanup-generation-workspace! sw)
+            (finally
+              ;; A rollback failure must not pin every future collection at this
+              ;; generation's start time. Its objects are unreachable garbage.
+              (release-generation-guard! sw))))))
     nil))
 
 (defn verify-commit
