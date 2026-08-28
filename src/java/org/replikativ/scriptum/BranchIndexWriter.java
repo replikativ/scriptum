@@ -1941,6 +1941,26 @@ public class BranchIndexWriter implements Closeable {
     }
   }
 
+  /**
+   * Abandon every uncommitted change and close this writer without publishing a commit.
+   *
+   * <p>This is intentionally distinct from {@link #close()}, because Lucene's commit-on-close is
+   * enabled and Scriptum relies on it for the ordinary lifecycle. A transaction or private index
+   * generation needs the opposite guarantee: failure must not make buffered documents visible.
+   *
+   * <p>The supplied Directory is still Scriptum's responsibility. {@code IndexWriter.rollback()}
+   * closes the writer but not that Directory, so release it in {@code finally}; for a
+   * konserve-backed Directory this also releases any in-flight GC guard without flipping the
+   * branch manifest.
+   */
+  public void rollback() throws IOException {
+    try {
+      writer.rollback();
+    } finally {
+      directory.close();
+    }
+  }
+
   @Override
   public String toString() {
     return "BranchIndexWriter("

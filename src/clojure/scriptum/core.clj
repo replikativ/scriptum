@@ -24,7 +24,7 @@
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
             MatchAllDocsQuery KnnFloatVectorQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
-           [org.apache.lucene.store FSDirectory]
+           [org.apache.lucene.store Directory FSDirectory]
            [org.replikativ.scriptum BranchIndexWriter BranchedDirectory]))
 
 (defn- ->path
@@ -41,6 +41,16 @@
   ;; branch TOPOLOGY — fork, branch discovery, collection — differs, because a
   ;; branch is a directory in one model and a manifest in the other.
   )
+
+(defrecord StoreSnapshot [snapshot-address directory reader]
+  java.io.Closeable
+  (close [_]
+    ;; A DirectoryReader retains the Directory, so release it first.  The
+    ;; directory is owned by this handle and is never shared with a writer.
+    (try
+      (.close ^DirectoryReader reader)
+      (finally
+        (.close ^Directory directory)))))
 
 (defn store-backed?
   "Is this writer backed by a konserve store rather than a directory tree?"
@@ -724,6 +734,51 @@
 
 ;; --- Search ---
 
+(defn- ->query
+  "Normalize Scriptum's public query forms against `reader`."
+  [^DirectoryReader reader query]
+  (cond
+    (instance? org.apache.lucene.search.Query query)
+    query
+
+    (map? query)
+    (let [[field value] (:term query)]
+      (TermQuery. (Term. (name field) (str value))))
+
+    (string? query)
+    (let [fields (into-array String
+                             (sort (org.apache.lucene.index.FieldInfos/getIndexedFields
+                                    reader)))]
+      (if (zero? (alength fields))
+        (MatchAllDocsQuery.)
+        (.parse (MultiFieldQueryParser. fields (StandardAnalyzer.)) ^String query)))
+
+    (= :all query)
+    (MatchAllDocsQuery.)
+
+    :else
+    (throw (ex-info (str "scriptum: unsupported query " (pr-str query)
+                         " — pass :all, {:term [field value]}, a string, "
+                         "or a Lucene Query")
+                    {:query query}))))
+
+(defn- hits->results
+  [^IndexSearcher searcher hits fields]
+  (let [sf (.storedFields searcher)
+        keep? (if (seq fields) (set (map name fields)) (constantly true))]
+    (mapv (fn [^ScoreDoc sd]
+            (let [stored (.document sf (.-doc sd))
+                  field-map (into {}
+                                  (comp (filter (fn [^IndexableField f]
+                                                  (keep? (.name f))))
+                                        (map (fn [^IndexableField f]
+                                               [(.name f) (.stringValue f)])))
+                                  (.getFields stored))]
+              (assoc field-map
+                     :doc-id (.-doc sd)
+                     :score (.-score sd))))
+          hits)))
+
 (defn search
   "Search a branch. Returns a vector of maps with :doc-id, :score, and field values.
 
@@ -771,65 +826,122 @@
          ^DirectoryReader reader (or reader (.openReader writer))]
      (try
        (let [searcher (IndexSearcher. reader)
-             q (cond
-                 (instance? org.apache.lucene.search.Query query)
-                 query
-
-                 (map? query)
-                 (let [[field value] (:term query)]
-                   (TermQuery. (Term. (name field) (str value))))
-
-                 ;; A STRING SEARCHES, it does not match everything. It was
-                 ;; documented as "matches all documents containing this term in
-                 ;; any field" and fell through to `MatchAllDocsQuery`, so a
-                 ;; caller searching for a word silently got the entire index —
-                 ;; wrong answers rather than an error.
-                 ;;
-                 ;; Parsed against the reader's indexed fields with the standard
-                 ;; analyzer, which matches how `add-doc` indexes `:text` fields.
-                 ;; A caller who indexed with a different analyzer should build
-                 ;; the Query themselves and pass it; that path is untouched.
-                 (string? query)
-                 (let [fields (into-array String
-                                          (sort (org.apache.lucene.index.FieldInfos/getIndexedFields
-                                                 reader)))]
-                   (if (zero? (alength fields))
-                     (MatchAllDocsQuery.)
-                     (.parse (MultiFieldQueryParser. fields (StandardAnalyzer.))
-                             ^String query)))
-
-                 (= :all query)
-                 (MatchAllDocsQuery.)
-
-                 :else
-                 (throw (ex-info (str "scriptum: unsupported query " (pr-str query)
-                                      " — pass :all, {:term [field value]}, a string, "
-                                      "or a Lucene Query")
-                                 {:query query})))
+             q (->query reader query)
              top-docs (.search searcher q (int limit))
-             hits (.-scoreDocs top-docs)
-             ;; Hoisted: this was built per HIT. It is a per-reader structure,
-             ;; not per-document, and rebuilding it for every result measured
-             ;; 1.8x on the extraction path at 100 hits.
-             sf (.storedFields searcher)]
-         (mapv (fn [^ScoreDoc sd]
-                 (let [stored (.document sf (.-doc sd))
-                       ;; `:fields` was destructured and then ignored, so every
-                       ;; stored field came back whatever was asked for.
-                       keep? (if (seq fields) (set (map name fields)) (constantly true))
-                       field-map (into {}
-                                       (comp (filter (fn [^IndexableField f] (keep? (.name f))))
-                                             (map (fn [^IndexableField f]
-                                                    [(.name f) (.stringValue f)])))
-                                       (.getFields stored))]
-                   (assoc field-map
-                          :doc-id (.-doc sd)
-                          :score (.-score sd))))
-               hits))
+             hits (.-scoreDocs top-docs)]
+         (hits->results searcher hits fields))
        ;; Close only what we opened. A caller-supplied reader outlives this
        ;; call by design — that is the whole point of passing one.
        (finally
          (when own-reader? (.close reader)))))))
+
+(defn open-store-snapshot
+  "Open the immutable konserve index state named by `address`.
+
+  Unlike `open-store-index`, this does not resolve or create a branch and never
+  opens an IndexWriter. The returned Closeable owns a read-only Directory and
+  DirectoryReader pinned to the exact snapshot address. Branch commits made
+  after this call cannot change what it sees.
+
+  The caller must keep `address` in the `extra-snapshots` root set passed to
+  `scriptum.konserve/gc!` for as long as the handle may need to be reopened.
+  An already-open reader remains usable from its materialized files, but an
+  unrooted snapshot is intentionally eligible for durable collection."
+  ^StoreSnapshot [store ^String cache address]
+  (let [^Directory directory (sk/snapshot-directory store cache address)]
+    (try
+      (->StoreSnapshot address directory (DirectoryReader/open directory))
+      (catch Throwable t
+        (.close directory)
+        (throw t)))))
+
+(defn search-store-snapshot
+  "Search an immutable `StoreSnapshot`, returning the same result vector as
+  `search` without requiring a live branch or writer.
+
+  Options are `:limit` (default 10) and `:fields`. For complete, resumable
+  candidate enumeration use `candidate-page` instead."
+  ([snapshot query]
+   (search-store-snapshot snapshot query {}))
+  ([^StoreSnapshot snapshot query {:keys [limit fields] :or {limit 10}}]
+   (let [^DirectoryReader reader (:reader snapshot)
+         searcher (IndexSearcher. reader)
+         top-docs (.search searcher (->query reader query) (int limit))]
+     (hits->results searcher (.-scoreDocs top-docs) fields))))
+
+(defn candidate-page
+  "Return one resumable page of scored candidates from an immutable snapshot.
+
+  The envelope is stable for the lifetime of the snapshot:
+
+    {:snapshot-address <address>
+     :candidates         [{:doc-id n :score f ...stored fields...} ...]
+     :continuation       {:version 1 :snapshot-address <address>
+                          :doc-id n :score f} ; nil when exhausted
+     :exhausted?         boolean
+     :ordering           :score-desc-doc-id-asc}
+
+  `:continuation` is passed back as `:after`. It is deliberately bound to the
+  snapshot address: resuming it against another generation throws instead of
+  silently skipping or repeating candidates. Lucene's `searchAfter` supplies
+  the ordering, so callers can keep requesting pages until `:exhausted?`
+  without imposing a fixed top-N cutoff.
+
+  Options:
+    :page-size - positive number of candidates to return (default 100)
+    :after     - continuation from the preceding page, or nil
+    :fields    - stored fields to include (default all)
+    :query-id  - optional caller-supplied stable query fingerprint
+
+  When `:query-id` is supplied it is copied into the continuation and checked
+  on resume. Scriptum cannot derive it reliably: arbitrary Lucene Query objects
+  have no canonical serialization. An adapter with a canonical query form
+  (such as PostgreSQL's normalized tsquery) should provide its own fingerprint;
+  without one, changing the query between pages remains a caller error."
+  ([snapshot query]
+   (candidate-page snapshot query {}))
+  ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id]
+                                   :or {page-size 100}}]
+   (when-not (and (integer? page-size)
+                  (pos? page-size)
+                  (< page-size Integer/MAX_VALUE))
+     (throw (ex-info "scriptum: page-size must be a positive integer below Integer/MAX_VALUE"
+                     {:page-size page-size})))
+   (let [address (:snapshot-address snapshot)]
+     (when (and after
+                (or (not= 1 (:version after))
+                    (not= address (:snapshot-address after))
+                    (not= query-id (:query-id after))
+                    (not (integer? (:doc-id after)))
+                    (not (number? (:score after)))))
+       (throw (ex-info "scriptum: continuation does not belong to this snapshot/query"
+                       {:snapshot-address address
+                        :query-id query-id
+                        :continuation after})))
+     (let [^DirectoryReader reader (:reader snapshot)
+           searcher (IndexSearcher. reader)
+           q (->query reader query)
+           ^ScoreDoc after-doc (when after
+                                 (ScoreDoc. (int (:doc-id after))
+                                            (float (:score after))))
+           ;; Ask for one extra candidate so exhaustion is exact even when the
+           ;; remaining hit count is exactly one full page.
+           top-docs (.searchAfter searcher after-doc q (int (inc page-size)))
+           score-docs (vec (.-scoreDocs top-docs))
+           more? (> (count score-docs) page-size)
+           page-hits (if more? (subvec score-docs 0 page-size) score-docs)
+           candidates (hits->results searcher page-hits fields)
+           last-hit (peek page-hits)]
+       {:snapshot-address address
+        :candidates candidates
+        :continuation (when more?
+                        {:version 1
+                         :snapshot-address address
+                         :query-id query-id
+                         :doc-id (.-doc ^ScoreDoc last-hit)
+                         :score (.-score ^ScoreDoc last-hit)})
+        :exhausted? (not more?)
+        :ordering :score-desc-doc-id-asc}))))
 
 ;; --- Snapshots & Time-Travel ---
 
@@ -1083,3 +1195,22 @@
     ;; again here on that basis threw AlreadyClosedException on any Directory
     ;; that reports being closed.
     (.close writer)))
+
+(defn abort!
+  "Discard uncommitted changes and close a writer without publishing them.
+
+  This is the failure-path counterpart to `close!`: ordinary close uses
+  Lucene's commit-on-close semantics, while abort delegates to
+  `IndexWriter.rollback`. For a konserve-backed writer its Directory is closed
+  without a `syncMetaData` flip, so the branch manifest remains at its last
+  successful commit. The writer must not be used afterwards."
+  [sw]
+  (let [^BranchIndexWriter writer (->writer sw)
+        mi (->metadata-index sw)]
+    ;; Rollback is the load-bearing action: a metadata close failure must not
+    ;; leave a commit-on-close writer alive for later accidental publication.
+    (try
+      (.rollback writer)
+      (finally
+        (when mi
+          (metadata/close-index! mi))))))
