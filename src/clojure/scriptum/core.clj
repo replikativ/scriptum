@@ -386,6 +386,14 @@
   [store address]
   (sk/mark-snapshot store address))
 
+(defn verify-generation
+  "Recompute an immutable generation's snapshot and blob addresses.
+
+  This is the branch-free audit entry point for embedded indices. See
+  `scriptum.konserve/verify-snapshot` for the structured result."
+  [store address]
+  (sk/verify-snapshot store address))
+
 (defn open-store-index-at
   "Open `branch` as a WRITABLE index at the state named by `address`.
 

@@ -1538,6 +1538,144 @@
   (-> #{format-key (snapshot-key address)}
       (into (map blob-key) (vals (snapshot-files store address)))))
 
+(defn- failure-error
+  [type address failure]
+  {:type type
+   :address address
+   :expected address
+   :recomputed nil
+   :details {:exception (.getName (class failure))
+             :message (.getMessage ^Throwable failure)}})
+
+(defn- verify-blob
+  [store address names]
+  (try
+    (let [actual (k/bget store (blob-key address)
+                         (fn [{:keys [input-stream]}]
+                           (when input-stream
+                             (ContentHash/hashInputStream input-stream)))
+                         {:sync? true :streaming? true})]
+      (cond
+        (nil? actual)
+        {:error {:type :audit/missing-blob
+                 :address address
+                 :expected address
+                 :recomputed nil
+                 :details {:files names}}}
+
+        (not= address actual)
+        {:error {:type :audit/blob-mismatch
+                 :address address
+                 :expected address
+                 :recomputed actual
+                 :details {:files names}}}
+
+        :else
+        {:verified address}))
+    (catch Throwable failure
+      (let [error (failure-error :audit/blob-read-failed address failure)]
+        {:error (-> error
+                    (update :details assoc :files names))}))))
+
+(defn verify-snapshot
+  "Verify immutable snapshot `address` directly against `store`.
+
+  Recomputes the snapshot address from its canonical file map and parents, then
+  streams every DISTINCT referenced blob and recomputes its content address.
+  It opens no Lucene writer or branch and never moves a ref. Parent addresses
+  participate in the snapshot hash but their records are not traversed: an
+  exact generation does not retain history, and those records may legitimately
+  have been collected.
+
+  Returns, without throwing for missing or corrupt immutable objects:
+
+    {:status :ok|:mismatch
+     :root <requested-address>
+     :recomputed-root <address-or-nil>
+     :objects {:snapshots 0|1 :blobs n :verified-blobs n}
+     :errors [{:type :address :expected :recomputed :details} ...]}
+
+  Blob bytes are hashed through a fixed-size buffer, so memory is independent
+  of Lucene segment size."
+  [store address]
+  (try
+    (if-let [snapshot (k/get store (snapshot-key address) nil {:sync? true})]
+      (let [files (:files snapshot)
+            parents (:parents snapshot)
+            shape-errors
+            (cond-> []
+              (not (map? snapshot))
+              (conj {:type :audit/invalid-snapshot
+                     :address address
+                     :details {:reason :not-a-map}})
+
+              (not (map? files))
+              (conj {:type :audit/invalid-snapshot
+                     :address address
+                     :details {:reason :files-not-a-map}})
+
+              (and (map? files) (not (every? string? (keys files))))
+              (conj {:type :audit/invalid-snapshot
+                     :address address
+                     :details {:reason :non-string-filename}})
+
+              (and (map? files) (some nil? (vals files)))
+              (conj {:type :audit/invalid-snapshot
+                     :address address
+                     :details {:reason :nil-blob-address}})
+
+              (not (vector? parents))
+              (conj {:type :audit/invalid-snapshot
+                     :address address
+                     :details {:reason :parents-not-a-vector}}))
+            valid-shape? (empty? shape-errors)
+            recomputed (when valid-shape?
+                         (try
+                           (snapshot-address files parents)
+                           (catch Throwable _ nil)))
+            root-errors (cond-> shape-errors
+                          (and valid-shape? (not= address recomputed))
+                          (conj {:type :audit/snapshot-mismatch
+                                 :address address
+                                 :expected address
+                                 :recomputed recomputed
+                                 :details {:files (count files)
+                                           :parents (count parents)}}))
+            by-address (if (map? files)
+                         (reduce-kv (fn [m filename blob-address]
+                                      (if blob-address
+                                        (update m blob-address (fnil conj []) filename)
+                                        m))
+                                    {} files)
+                         {})
+            blob-results (mapv (fn [[blob-address names]]
+                                 (verify-blob store blob-address (vec (sort-by str names))))
+                               (sort-by (comp str key) by-address))
+            blob-errors (into [] (keep :error) blob-results)
+            errors (into root-errors blob-errors)
+            verified (count (keep :verified blob-results))]
+        {:status (if (empty? errors) :ok :mismatch)
+         :root address
+         :recomputed-root recomputed
+         :objects {:snapshots 1
+                   :blobs (count by-address)
+                   :verified-blobs verified}
+         :errors errors})
+      {:status :mismatch
+       :root address
+       :recomputed-root nil
+       :objects {:snapshots 0 :blobs 0 :verified-blobs 0}
+       :errors [{:type :audit/missing-snapshot
+                 :address address
+                 :expected address
+                 :recomputed nil}]})
+    (catch Throwable failure
+      {:status :mismatch
+       :root address
+       :recomputed-root nil
+       :objects {:snapshots 0 :blobs 0 :verified-blobs 0}
+       :errors [(failure-error :audit/snapshot-read-failed address failure)]})))
+
 (defn mark
   "Every store key scriptum needs kept — the mark half of a mark-and-sweep.
 

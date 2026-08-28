@@ -2286,3 +2286,74 @@
         (is (= #{"marked"} (bodies-at s c address))
             "an embedding collector preserves the detached generation by address"))
       (finally (sc/close! generation)))))
+
+(deftest immutable-generation-audit-verifies-snapshot-and-blobs
+  (let [s (store)
+        c (cache)
+        generation (sc/begin-generation s c nil {:workspace-id "generation-audit"})]
+    (try
+      (sc/add-doc generation {:body "audited"})
+      (let [address (sc/seal-generation! generation)
+            report (sc/verify-generation s address)]
+        (is (= :ok (:status report)))
+        (is (= address (:root report)))
+        (is (= address (:recomputed-root report)))
+        (is (empty? (:errors report)))
+        (is (pos? (get-in report [:objects :blobs])))
+        (is (= (get-in report [:objects :blobs])
+               (get-in report [:objects :verified-blobs])))
+        (sc/release-generation! generation))
+      (finally (sc/close! generation)))))
+
+(deftest immutable-generation-audit-detects-snapshot-tampering
+  (let [s (store)
+        c (cache)
+        generation (sc/begin-generation s c nil {:workspace-id "generation-snapshot-audit"})]
+    (try
+      (sc/add-doc generation {:body "audited"})
+      (let [address (sc/seal-generation! generation)
+            snapshot (sk/read-snapshot s address)]
+        (sc/release-generation! generation)
+        ;; Corrupt the immutable value in place while retaining its old key.
+        (k/assoc s (sk/snapshot-key address)
+                 (update snapshot :parents conj (random-uuid)) {:sync? true})
+        (let [report (sc/verify-generation s address)]
+          (is (= :mismatch (:status report)))
+          (is (= address (:root report)))
+          (is (not= address (:recomputed-root report)))
+          (is (some #(= :audit/snapshot-mismatch (:type %)) (:errors report)))))
+      (finally (sc/close! generation)))))
+
+(deftest immutable-generation-audit-detects-corrupt-and-missing-blobs
+  (let [s (store)
+        c (cache)
+        generation (sc/begin-generation s c nil {:workspace-id "generation-blob-audit"})]
+    (try
+      (sc/add-doc generation {:body "audited"})
+      (let [address (sc/seal-generation! generation)
+            blob-address (first (vals (sk/snapshot-files s address)))]
+        (sc/release-generation! generation)
+        (k/bassoc s (sk/blob-key blob-address) (byte-array [1 2 3 4]) {:sync? true})
+        (let [report (sc/verify-generation s address)]
+          (is (= :mismatch (:status report)))
+          (is (= address (:recomputed-root report))
+              "the snapshot map remains intact")
+          (is (some #(= :audit/blob-mismatch (:type %)) (:errors report))))
+        (k/dissoc s (sk/blob-key blob-address) {:sync? true})
+        (let [report (sc/verify-generation s address)]
+          (is (= :mismatch (:status report)))
+          (is (some #(= :audit/missing-blob (:type %)) (:errors report)))))
+      (finally (sc/close! generation)))))
+
+(deftest immutable-generation-audit-reports-a-missing-snapshot
+  (let [address (random-uuid)
+        report (sc/verify-generation (store) address)]
+    (is (= {:status :mismatch
+            :root address
+            :recomputed-root nil
+            :objects {:snapshots 0 :blobs 0 :verified-blobs 0}
+            :errors [{:type :audit/missing-snapshot
+                      :address address
+                      :expected address
+                      :recomputed nil}]}
+           report))))
