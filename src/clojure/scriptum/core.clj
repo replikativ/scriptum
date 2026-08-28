@@ -10,7 +10,8 @@
   - Branch: COW overlay sharing base segments with the trunk
   - GC: explicit cleanup of old snapshots respecting branch references"
   (:require [scriptum.konserve :as sk]
-            [scriptum.metadata :as metadata])
+            [scriptum.metadata :as metadata]
+            [konserve.gc-guard :as guard])
   (:import [java.nio.file Path Paths]
            [java.time Instant Duration]
            [org.apache.lucene.analysis Analyzer]
@@ -51,6 +52,27 @@
       (.close ^DirectoryReader reader)
       (finally
         (.close ^Directory directory)))))
+
+(defn generation?
+  "Whether `sw` is a detached immutable-generation writer."
+  [sw]
+  (boolean (and (instance? ScriptumWriter sw)
+                (= :generation (get-in sw [:backing :mode])))))
+
+(defn- generation-backing
+  [sw]
+  (when-not (generation? sw)
+    (throw (ex-info "scriptum: operation requires a detached generation"
+                    {:value-type (type sw)})))
+  (:backing sw))
+
+(defn- release-generation-guard!
+  [sw]
+  (let [{:keys [store-id guard-token lifecycle]} (generation-backing sw)]
+    (when-let [token @guard-token]
+      (guard/done! store-id token)
+      (reset! guard-token nil))
+    (swap! lifecycle assoc :released? true)))
 
 (defn store-backed?
   "Is this writer backed by a konserve store rather than a directory tree?"
@@ -264,6 +286,76 @@
                         :max-merged-segment-mb max-merged-segment-mb
                         :ram-buffer-mb ram-buffer-mb}))))
 
+(defn begin-generation
+  "Begin a private, writable generation derived from `base-address`.
+
+  Unlike `open-store-index`, this creates no branch, branch-registry entry or
+  mutable Scriptum ref. A successful `seal-generation!` writes immutable blobs
+  and a snapshot and returns its content address. The caller publishes that
+  address through its own root and then calls `release-generation!`.
+
+  A GC guard is held for the complete lifecycle, including the interval after
+  sealing and before external publication. `base-address` itself must already
+  be rooted while this call begins; for an embedded secondary that is normally
+  the currently published database root.
+
+  Options are the tuning options of `open-store-index`, plus:
+    :workspace-id - unique local cache/lock identity (default random UUID)
+    :logical-name - commit metadata name (default \"detached\")
+    :store-id     - shared konserve GC identity (defaults from store)."
+  ([store cache base-address]
+   (begin-generation store cache base-address {}))
+  ([store ^String cache base-address
+    {:keys [analyzer store-id workspace-id logical-name
+            max-merged-segment-mb ram-buffer-mb]
+     :as opts}]
+   (let [store-id (or store-id (sk/store-id-for store))
+         _ (when-not store-id
+             (throw (ex-info
+                     "scriptum: a detached generation requires a konserve store id"
+                     {:store-type (type store)})))
+         analyzer (or analyzer (StandardAnalyzer.))
+         workspace (str (or workspace-id (random-uuid)))
+         token (guard/writing! store-id)
+         guard-token (atom token)
+         lifecycle (atom {:status :open :released? false})]
+     (try
+       (let [{:keys [directory state pending-parents]}
+             (sk/detached-directory store cache workspace base-address
+                                    (cond-> {:store-id store-id}
+                                      (:pending-parents opts)
+                                      (assoc :pending-parents (:pending-parents opts))))
+             writer (try (BranchIndexWriter/createOver
+                          directory (str (or logical-name "detached")) analyzer)
+                         (catch Throwable failure
+                           (try (.close ^java.io.Closeable directory) (catch Throwable _))
+                           (throw failure)))
+             _ (try
+                 (tune! writer max-merged-segment-mb ram-buffer-mb)
+                 (catch Throwable failure
+                   (try (.rollback ^BranchIndexWriter writer) (catch Throwable _))
+                   (throw failure)))]
+         (->ScriptumWriter
+          writer nil
+          {:mode :generation
+           :store store
+           :cache cache
+           :workspace workspace
+           :directory directory
+           :state state
+           :store-id store-id
+           :pending-parents pending-parents
+           :guard-token guard-token
+           :lifecycle lifecycle
+           :analyzer analyzer
+           :max-merged-segment-mb max-merged-segment-mb
+           :ram-buffer-mb ram-buffer-mb}))
+       (catch Throwable failure
+         (when-let [held @guard-token]
+           (guard/done! store-id held)
+           (reset! guard-token nil))
+         (throw failure))))))
+
 (defn snapshot-address
   "The immutable address of this branch's current index state, or nil.
 
@@ -282,7 +374,17 @@
   buffered writes are not in it. Store-backed indices only; nil otherwise."
   [sw]
   (when (store-backed? sw)
-    (sk/branch-snapshot (:store (:backing sw)) (.getBranchName (->writer sw)))))
+    (let [{:keys [mode state store]} (:backing sw)]
+      (if (= :generation mode)
+        (:pointer @state)
+        (sk/branch-snapshot store (.getBranchName (->writer sw)))))))
+
+(defn mark-generation
+  "The exact konserve keys required to open immutable generation `address`.
+
+  Intended for an embedding collector that unions marks from all of its roots."
+  [store address]
+  (sk/mark-snapshot store address))
 
 (defn open-store-index-at
   "Open `branch` as a WRITABLE index at the state named by `address`.
@@ -635,6 +737,76 @@
         :commit-id commit-id
         :content-hash content-hash}
        gen))))
+
+(defn seal-generation!
+  "Seal a detached generation and return its immutable snapshot address.
+
+  The writer is closed, but its GC guard remains held. Publish the address in
+  the embedding system's root and then call `release-generation!`. On failure,
+  the guard is released and any written-but-unreachable objects are left for
+  ordinary content-addressed GC."
+  ([sw]
+   (seal-generation! sw nil nil))
+  ([sw message]
+   (seal-generation! sw message nil))
+  ([sw message metadata]
+   (let [{:keys [lifecycle]} (generation-backing sw)]
+     (when-not (= :open (:status @lifecycle))
+       (throw (ex-info "scriptum: detached generation is not open"
+                       {:lifecycle @lifecycle})))
+     (try
+       (commit! sw message metadata)
+       (let [address (snapshot-address sw)]
+         (when-not address
+           (throw (ex-info "scriptum: detached generation sealed without an address" {})))
+         ;; There must be no writable handle after preparation. An explicit
+         ;; commit leaves no buffered changes, so close performs no second seal.
+         (.close ^BranchIndexWriter (->writer sw))
+         (reset! lifecycle {:status :sealed
+                            :address address
+                            :released? false})
+         address)
+       (catch Throwable failure
+         (try (.rollback ^BranchIndexWriter (->writer sw)) (catch Throwable _))
+         (release-generation-guard! sw)
+         (reset! lifecycle {:status :failed
+                            :failure failure
+                            :released? true})
+         (throw failure))))))
+
+(defn release-generation!
+  "Release a sealed generation's GC guard after an external root names it.
+
+  Idempotent. This does not move or delete any Scriptum ref; the immutable
+  generation remains live exactly while the embedding root marks its address."
+  [sw]
+  (let [{:keys [lifecycle]} (generation-backing sw)
+        {:keys [status released?]} @lifecycle]
+    (when-not (or (= :sealed status) released?)
+      (throw (ex-info "scriptum: only a sealed generation can be released"
+                      {:lifecycle @lifecycle})))
+    (when-not released?
+      (release-generation-guard! sw))
+    nil))
+
+(defn abort-generation!
+  "Discard an open detached writer and release its GC guard.
+
+  Already sealed generations cannot be unwritten; aborting one merely releases
+  its guard so the unreachable snapshot can be collected. Idempotent."
+  [sw]
+  (let [{:keys [lifecycle]} (generation-backing sw)
+        {:keys [status released?]} @lifecycle]
+    (when-not released?
+      (try
+        (when (= :open status)
+          (.rollback ^BranchIndexWriter (->writer sw))
+          (swap! lifecycle assoc :status :aborted))
+        (finally
+          ;; A rollback failure must not pin every future collection at this
+          ;; generation's start time. Its objects are unreachable garbage.
+          (release-generation-guard! sw))))
+    nil))
 
 (defn verify-commit
   "Verify the cryptographic integrity of a commit by recomputing its merkle hash.
@@ -1186,15 +1358,23 @@
 (defn close!
   "Close a branch writer and its resources."
   [sw]
-  (let [^BranchIndexWriter writer (->writer sw)
-        mi (->metadata-index sw)]
-    (when mi
-      (metadata/close-index! mi))
-    ;; ONE close. `BranchIndexWriter.close` closes the Directory it was given —
-    ;; `createOver`'s javadoc used to claim the caller owned it, and closing it
-    ;; again here on that basis threw AlreadyClosedException on any Directory
-    ;; that reports being closed.
-    (.close writer)))
+  (if (generation? sw)
+    (let [{:keys [status]} @(get-in sw [:backing :lifecycle])]
+      ;; Closing an unsealed private generation must never invoke Lucene's
+      ;; commit-on-close. A sealed one has already closed its writer and only
+      ;; retains the publication guard.
+      (if (= :open status)
+        (abort-generation! sw)
+        (release-generation! sw)))
+    (let [^BranchIndexWriter writer (->writer sw)
+          mi (->metadata-index sw)]
+      (when mi
+        (metadata/close-index! mi))
+      ;; ONE close. `BranchIndexWriter.close` closes the Directory it was given —
+      ;; `createOver`'s javadoc used to claim the caller owned it, and closing it
+      ;; again here on that basis threw AlreadyClosedException on any Directory
+      ;; that reports being closed.
+      (.close writer))))
 
 (defn abort!
   "Discard uncommitted changes and close a writer without publishing them.
@@ -1205,12 +1385,14 @@
   without a `syncMetaData` flip, so the branch manifest remains at its last
   successful commit. The writer must not be used afterwards."
   [sw]
-  (let [^BranchIndexWriter writer (->writer sw)
-        mi (->metadata-index sw)]
-    ;; Rollback is the load-bearing action: a metadata close failure must not
-    ;; leave a commit-on-close writer alive for later accidental publication.
-    (try
-      (.rollback writer)
-      (finally
-        (when mi
-          (metadata/close-index! mi))))))
+  (if (generation? sw)
+    (abort-generation! sw)
+    (let [^BranchIndexWriter writer (->writer sw)
+          mi (->metadata-index sw)]
+      ;; Rollback is the load-bearing action: a metadata close failure must not
+      ;; leave a commit-on-close writer alive for later accidental publication.
+      (try
+        (.rollback writer)
+        (finally
+          (when mi
+            (metadata/close-index! mi)))))))

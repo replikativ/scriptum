@@ -2186,3 +2186,103 @@
       (let [w2 (sc/open-store-index s (cache) "main")]
         (try (is (= 4 (sc/num-docs w2)) "and the branch reopens cold")
              (finally (sc/close! w2)))))))
+
+(deftest detached-generations-seal-without-moving-a-ref
+  (testing "a private generation derives from an immutable address and only the
+            embedding root can publish the result"
+    (let [s (store)
+          c (cache)
+          source (sc/open-store-index s c "source")]
+      (try
+        (sc/add-doc source {:body "base"})
+        (sc/commit! source "base")
+        (let [base (sc/snapshot-address source)
+              before-branches (sk/branches s)
+              generation (sc/begin-generation s c base {:workspace-id "generation-one"})]
+          (try
+            (sc/add-doc generation {:body "private"})
+            (let [sealed (sc/seal-generation! generation "private")]
+              (is (not= base sealed))
+              (is (= #{"base" "private"} (bodies-at s c sealed))
+                  "the exact returned address opens independently of a branch")
+              (is (= #{"base"} (bodies-at s c base))
+                  "the immutable source generation is untouched")
+              (is (= base (sk/branch-snapshot s "source"))
+                  "the source ref is untouched")
+              (is (= before-branches (sk/branches s))
+                  "sealing does not register a native branch")
+              (is (not (k/exists? s (sk/manifest-key "generation-one") {:sync? true}))
+                  "and does not create a hidden mutable manifest")
+              ;; Model the embedding root now naming the immutable address.
+              (sc/release-generation! generation)
+              (is (= #{"base" "private"} (bodies-at s c sealed))))
+            (finally (sc/close! generation))))
+        (finally (sc/close! source))))))
+
+(deftest detached-generation-abort-has-no-ref-side-effect
+  (let [s (store)
+        c (cache)
+        source (sc/open-store-index s c "source")]
+    (try
+      (sc/add-doc source {:body "base"})
+      (sc/commit! source)
+      (let [base (sc/snapshot-address source)
+            branches (sk/branches s)
+            generation (sc/begin-generation s c base {:workspace-id "aborted-generation"})]
+        (sc/add-doc generation {:body "must-not-land"})
+        (sc/abort-generation! generation)
+        (is (= base (sk/branch-snapshot s "source")))
+        (is (= branches (sk/branches s)))
+        (is (not (k/exists? s (sk/manifest-key "aborted-generation") {:sync? true})))
+        (is (= #{"base"} (bodies-at s c base))))
+      (finally (sc/close! source)))))
+
+(deftest detached-generations-from-one-base-are-isolated
+  (let [s (store)
+        c (cache)
+        source (sc/open-store-index s c "source")]
+    (try
+      (sc/add-doc source {:body "base"})
+      (sc/commit! source)
+      (let [base (sc/snapshot-address source)
+            a (sc/begin-generation s c base {:workspace-id "generation-a"})
+            b (sc/begin-generation s c base {:workspace-id "generation-b"})]
+        (try
+          (sc/add-doc a {:body "only-a"})
+          (sc/add-doc b {:body "only-b"})
+          (let [aa (sc/seal-generation! a)
+                ba (sc/seal-generation! b)]
+            (is (= #{"base" "only-a"} (bodies-at s c aa)))
+            (is (= #{"base" "only-b"} (bodies-at s c ba)))
+            (is (= #{"base"} (bodies-at s c base)))
+            (is (= #{"source"} (sk/branches s)))
+            (sc/release-generation! a)
+            (sc/release-generation! b))
+          (finally
+            (sc/close! a)
+            (sc/close! b))))
+      (finally (sc/close! source)))))
+
+(deftest detached-generation-has-an-exact-gc-mark
+  (let [s (store-at (str *root* "/detached-store"))
+        c (str *root* "/detached-cache")
+        generation (sc/begin-generation s c nil {:workspace-id "generation-mark"})]
+    (try
+      (sc/add-doc generation {:body "marked"})
+      (let [address (sc/seal-generation! generation)
+            files (sk/snapshot-files s address)
+            expected (-> #{sk/format-key (sk/snapshot-key address)}
+                         (into (map sk/blob-key) (vals files)))]
+        (is (empty? (sk/branches s)))
+        (is (= expected (sc/mark-generation s address))
+            "the external address roots exactly its snapshot and blobs")
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s (sk/store-id-for s))
+        (is (= #{"marked"} (bodies-at s c address))
+            "the generation guard protects the sealed-but-unpublished address")
+        (sc/release-generation! generation)
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s (sk/store-id-for s) (ku/now) [address])
+        (is (= #{"marked"} (bodies-at s c address))
+            "an embedding collector preserves the detached generation by address"))
+      (finally (sc/close! generation)))))

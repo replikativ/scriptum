@@ -746,6 +746,10 @@
   (^Directory [store ^String cache ^String branch store-id]
    (konserve-directory store cache branch store-id (atom #{})))
   (^Directory [store ^String cache ^String branch store-id pending-parents]
+   (konserve-directory store cache branch store-id pending-parents {}))
+  (^Directory [store ^String cache ^String branch store-id pending-parents
+               {:keys [publish-ref? base-address state]
+                :or {publish-ref? true}}]
    (check-branch-name branch)
    (.mkdirs (io/file cache branch))
    ;; Refuse a layout we cannot read before touching anything, then register the
@@ -754,12 +758,15 @@
    ;; — not per commit. See `register-branch!` for why the ordering there is the
    ;; inverse of the values-then-pointer rule.
    (ensure-format! store)
-   (register-branch! store branch)
+   (when publish-ref?
+     (register-branch! store branch))
    ;; READ THE BRANCH BEFORE OPENING ANYTHING. `read-snapshot` throws on a branch
    ;; whose snapshot is gone, and doing that after `MMapDirectory/open` leaked the
    ;; directory — nothing closes it on the way out, and its mapped arena outlives
    ;; the failed call.
-   (let [initial (let [a (branch-snapshot store branch)]
+   (let [initial (let [a (if publish-ref?
+                           (branch-snapshot store branch)
+                           base-address)]
                    {:pointer a :files (if a (snapshot-files store a) {})})
          live (MMapDirectory/open (->path (str cache "/" branch)))
          ;; ONE atom holding BOTH halves, and that is a correctness requirement
@@ -771,7 +778,8 @@
          ;; one it holds, re-reads nothing, and the Directory is blind to every
          ;; subsequent commit. That is precisely the failure the CAS was added to
          ;; prevent, reintroduced one level up. One atom, one CAS, no window.
-         state (atom initial)
+         state (or state (atom initial))
+         _ (reset! state initial)
          files-now (fn [] (:files @state))
          ;; Has the in-memory map moved off `pointer`? Set by every edit,
          ;; cleared by the flip in `syncMetaData`. A flag rather than comparing
@@ -874,7 +882,12 @@
                        ;; an identical snapshot is harmless.
                        (k/assoc store (snapshot-key address)
                                 {:files files :parents parents} {:sync? true})
-                       (k/assoc store (manifest-key branch) address {:sync? true})
+                       ;; A detached generation stops here. Its embedder makes
+                       ;; `address` visible by placing it in its own immutable
+                       ;; root; Scriptum must not introduce another mutable
+                       ;; publication point underneath that transaction.
+                       (when publish-ref?
+                         (k/assoc store (manifest-key branch) address {:sync? true}))
                        (swap! state assoc :pointer address)
                        (reset! dirty false)
                        ;; Consumed: they belong to the commit just written, not
@@ -962,7 +975,7 @@
          ;; manifest OLDER than one a commit just installed. Claiming the
          ;; pointer first means a racing poll loses the CAS and installs
          ;; nothing, rather than winning with a stale map.
-         (when-not @dirty
+         (when (and publish-ref? (not @dirty))
            (let [before @state
                  a (branch-snapshot store branch)]
              (when (not= a (:pointer before))
@@ -1160,6 +1173,43 @@
          (close-guard!)
          (.close live))
        (getPendingDeletions [] (.getPendingDeletions live))))))
+
+(defn detached-directory
+  "A writable Lucene `Directory` derived from immutable `base-address`.
+
+  Commits upload blobs and seal immutable Scriptum snapshots, but NEVER create,
+  register or move a named branch. `workspace` names only an isolated local
+  cache/lock directory; it is not a durable ref. The returned `:state` atom's
+  `:pointer` is the newest sealed snapshot address.
+
+  The caller owns publication and GC protection. In particular, keep a
+  `konserve.gc-guard` write sequence open from before the first write until an
+  external root names the returned address. `scriptum.core/begin-generation`
+  provides that guarded lifecycle.
+
+  Options:
+    :store-id       - the shared konserve GC identity; resolved from the store
+                      when omitted. Explicit nil opts out for an uncollected store.
+    :pending-parents - atom of additional merge parents (default empty)."
+  ([store cache workspace base-address]
+   (detached-directory store cache workspace base-address {}))
+  ([store ^String cache ^String workspace base-address opts]
+   (let [store-id (if (contains? opts :store-id)
+                    (:store-id opts)
+                    (or (store-id-for store)
+                        (throw (ex-info
+                                "scriptum: a detached generation requires a konserve store id"
+                                {:store-type (type store)}))))
+         pending-parents (or (:pending-parents opts) (atom #{}))
+         state (atom nil)
+         directory (konserve-directory store cache workspace store-id pending-parents
+                                       {:publish-ref? false
+                                        :base-address base-address
+                                        :state state})]
+     {:directory directory
+      :state state
+      :store-id store-id
+      :pending-parents pending-parents})))
 
 ;; =============================================================================
 ;; Branch operations
@@ -1474,6 +1524,19 @@
   ([store] (reachable-addresses store nil))
   ([store extra-snapshots]
    (:addresses (reachable store extra-snapshots))))
+
+(defn mark-snapshot
+  "The exact store keys needed to open immutable snapshot `address`.
+
+  This is the object-level mark for an embedding root: the layout stamp, the
+  snapshot record and every blob in its file map. It deliberately excludes the
+  branch registry, manifests and unrelated snapshots. Union their marks
+  separately when detached generations and native Scriptum branches share one
+  store. Parent snapshot records are retention history, not needed to read this
+  exact state; an owner retaining history must mark those addresses too."
+  [store address]
+  (-> #{format-key (snapshot-key address)}
+      (into (map blob-key) (vals (snapshot-files store address)))))
 
 (defn mark
   "Every store key scriptum needs kept — the mark half of a mark-and-sweep.
