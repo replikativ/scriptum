@@ -1,5 +1,9 @@
 {:paths ["src/clojure" "src/java" "classes"]
 
+ :deps/prep-lib {:alias :build
+                 :fn compile-java
+                 :ensure "classes/org/replikativ/scriptum/ContentHash.class"}
+
  :mvn/repos {"clojars" {:url "https://repo.clojars.org/"}}
 
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
