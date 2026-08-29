@@ -1208,6 +1208,18 @@
          top-docs (.search searcher (->query reader query) (int limit))]
      (hits->results searcher (.-scoreDocs top-docs) fields))))
 
+(defn count-store-snapshot
+  "Return the exact number of documents matching `query` in an immutable
+  `StoreSnapshot` without materializing hits.
+
+  This is the selectivity primitive for callers choosing between an inverted
+  index and a primary scan.  It uses the snapshot's already-open reader, so the
+  estimate names exactly the same generation as a subsequent candidate scan."
+  [^StoreSnapshot snapshot query]
+  (let [^DirectoryReader reader (:reader snapshot)
+        searcher (IndexSearcher. reader)]
+    (.count searcher (->query reader query))))
+
 (defn candidate-page
   "Return one resumable page of candidates from an immutable snapshot.
 

@@ -714,13 +714,20 @@
                                                       (sc/text-query :body "common")
                                                       {:limit 20
                                                        :fields [:id]}))))
+            (is (= 5 (sc/count-store-snapshot
+                      snapshot (sc/text-query :body "common"))))
+            (is (= 0 (sc/count-store-snapshot
+                      snapshot (sc/text-query :body "absent"))))
             (sc/add-doc w {:id {:type :string :value "later"}
                            :body {:type :text :value "common text"}})
             (sc/commit! w "branch advances")
             (is (= 5 (count (sc/search-store-snapshot snapshot
                                                       (sc/text-query :body "common")
                                                       {:limit 20})))
-                "the held snapshot cannot move with the branch")))
+                "the held snapshot cannot move with the branch")
+            (is (= 5 (sc/count-store-snapshot
+                      snapshot (sc/text-query :body "common")))
+                "the count is pinned to the same immutable generation")))
         (finally (sc/close! w))))))
 
 (deftest immutable-snapshot-leases-have-independent-lifetimes
