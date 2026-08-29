@@ -24,11 +24,12 @@
             KnnFloatVectorField]
            [org.apache.lucene.index DirectoryReader IndexableField Term
             VectorSimilarityFunction]
-           [org.apache.lucene.search IndexSearcher TermQuery PrefixQuery ConstantScoreQuery BooleanQuery
+           [org.apache.lucene.search IndexSearcher TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
-            MatchAllDocsQuery KnnFloatVectorQuery]
+            FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
            [org.apache.lucene.store Directory FSDirectory]
+           [org.apache.lucene.util BytesRef]
            [org.replikativ.scriptum BranchIndexWriter BranchedDirectory]))
 
 (defn- ->path
@@ -1051,6 +1052,21 @@
   (ConstantScoreQuery.
    (TermQuery. (Term. (name field) (str term)))))
 
+(defn terms-query
+  "Build an analyzer-free exact query matching any value in `values`.
+
+  This is the set counterpart of `term-query`, intended for `:string`
+  (`StringField`) values. Lucene builds one automaton-backed query rather than
+  one Boolean clause per value, so this also avoids `BooleanQuery`'s clause
+  limit. It is useful for intersecting a full-text candidate scan with a set of
+  externally selected document identities before collection. Empty input is a
+  valid query matching no documents. Like `term-query`, the result is constant
+  score; application-visible ranking remains the caller's responsibility."
+  [field values]
+  (TermInSetQuery.
+   (name field)
+   (mapv #(BytesRef. (str %)) values)))
+
 (defn prefix-query
   "Build an analyzer-free prefix query over indexed terms.
 
@@ -1326,6 +1342,14 @@
     :after     - continuation from the preceding page, or nil
     :fields    - stored fields to include (default all)
     :query-id  - optional caller-supplied stable query fingerprint
+    :order     - :score (default) or :doc-id
+
+  `:doc-id` uses Lucene's exact index order without computing scores. It is the
+  cheaper collector for callers that need a complete candidate set and apply
+  their own authoritative predicate/ranking afterwards. Its continuation is
+  still snapshot- and query-bound, but its candidates have NaN `:score` values
+  because no score was computed. Index order is stable only within the named
+  immutable snapshot; never carry this ordering across generations.
 
   When `:query-id` is supplied it is copied into the continuation and checked
   on resume. Scriptum cannot derive it reliably: arbitrary Lucene Query objects
@@ -1334,33 +1358,46 @@
   without one, changing the query between pages remains a caller error."
   ([snapshot query]
    (candidate-page snapshot query {}))
-  ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id]
-                                   :or {page-size 100}}]
+  ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id order]
+                                   :or {page-size 100 order :score}}]
    (when-not (and (integer? page-size)
                   (pos? page-size)
                   (< page-size Integer/MAX_VALUE))
      (throw (ex-info "scriptum: page-size must be a positive integer below Integer/MAX_VALUE"
                      {:page-size page-size})))
+   (when-not (contains? #{:score :doc-id} order)
+     (throw (ex-info "scriptum: candidate order must be :score or :doc-id"
+                     {:order order})))
    (let [address (:snapshot-address snapshot)]
      (when (and after
-                (or (not= 1 (:version after))
+                (or (not= (if (= :doc-id order) 2 1) (:version after))
                     (not= address (:snapshot-address after))
                     (not= query-id (:query-id after))
                     (not (integer? (:doc-id after)))
-                    (not (number? (:score after)))))
+                    (if (= :doc-id order)
+                      (not= :doc-id (:order after))
+                      (not (number? (:score after))))))
        (throw (ex-info "scriptum: continuation does not belong to this snapshot/query"
                        {:snapshot-address address
                         :query-id query-id
+                        :order order
                         :continuation after})))
      (let [^DirectoryReader reader (:reader snapshot)
            searcher (IndexSearcher. reader)
            q (->query reader query)
            ^ScoreDoc after-doc (when after
-                                 (ScoreDoc. (int (:doc-id after))
-                                            (float (:score after))))
+                                 (if (= :doc-id order)
+                                   (FieldDoc. (int (:doc-id after)) Float/NaN
+                                              (object-array
+                                               [(int (:doc-id after))]))
+                                   (ScoreDoc. (int (:doc-id after))
+                                              (float (:score after)))))
            ;; Ask for one extra candidate so exhaustion is exact even when the
            ;; remaining hit count is exactly one full page.
-           top-docs (.searchAfter searcher after-doc q (int (inc page-size)))
+           top-docs (if (= :doc-id order)
+                      (.searchAfter searcher after-doc q (int (inc page-size))
+                                    Sort/INDEXORDER false)
+                      (.searchAfter searcher after-doc q (int (inc page-size))))
            score-docs (vec (.-scoreDocs top-docs))
            more? (> (count score-docs) page-size)
            page-hits (if more? (subvec score-docs 0 page-size) score-docs)
@@ -1369,13 +1406,18 @@
        {:snapshot-address address
         :candidates candidates
         :continuation (when more?
-                        {:version 1
-                         :snapshot-address address
-                         :query-id query-id
-                         :doc-id (.-doc ^ScoreDoc last-hit)
-                         :score (.-score ^ScoreDoc last-hit)})
+                        (cond->
+                         {:version (if (= :doc-id order) 2 1)
+                          :snapshot-address address
+                          :query-id query-id
+                          :doc-id (.-doc ^ScoreDoc last-hit)}
+                          (= :doc-id order) (assoc :order :doc-id)
+                          (= :score order)
+                          (assoc :score (.-score ^ScoreDoc last-hit))))
         :exhausted? (not more?)
-        :ordering :score-desc-doc-id-asc}))))
+        :ordering (if (= :doc-id order)
+                    :doc-id-asc
+                    :score-desc-doc-id-asc)}))))
 
 ;; --- Snapshots & Time-Travel ---
 

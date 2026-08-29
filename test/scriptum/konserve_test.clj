@@ -827,6 +827,59 @@
                                                          {:after old-cursor})))))))
         (finally (sc/close! w))))))
 
+(deftest candidates-can-page-without-computing-relevance-scores
+  (testing "doc-id order is a complete generation-bound candidate collector"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [i (range 23)]
+          (sc/add-doc w {:id {:type :string :value (format "%02d" i)}
+                         :body {:type :text
+                                :value (if (even? i)
+                                         "common common"
+                                         "common")}}))
+        (sc/commit! w "unranked candidate generation")
+        (with-open [snapshot (sc/open-store-snapshot
+                              s (cache) (sc/snapshot-address w))]
+          (let [query (sc/text-query :body "common")
+                ranked (sc/candidate-page snapshot query
+                                          {:page-size 5
+                                           :query-id :ranked})]
+            (loop [after nil
+                   doc-ids []
+                   ids []]
+              (let [{:keys [candidates continuation exhausted? ordering]}
+                    (sc/candidate-page snapshot query
+                                       {:page-size 5
+                                        :after after
+                                        :fields [:id]
+                                        :query-id :unranked
+                                        :order :doc-id})
+                    doc-ids' (into doc-ids (map :doc-id) candidates)
+                    ids' (into ids (map #(get % "id")) candidates)]
+                (is (= :doc-id-asc ordering))
+                (is (every? #(Float/isNaN (float (:score %))) candidates))
+                (if exhausted?
+                  (do
+                    (is (nil? continuation))
+                    (is (= 23 (count doc-ids')))
+                    (is (apply < doc-ids'))
+                    (is (= (set (map #(format "%02d" %) (range 23)))
+                           (set ids'))))
+                  (do
+                    (is (= 2 (:version continuation)))
+                    (is (= :doc-id (:order continuation)))
+                    (recur continuation doc-ids' ids')))))
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"continuation does not belong"
+                 (sc/candidate-page snapshot query
+                                    {:page-size 5
+                                     :after (:continuation ranked)
+                                     :query-id :ranked
+                                     :order :doc-id})))))
+        (finally (sc/close! w))))))
+
 (deftest analyzer-free-term-builders-query-multi-valued-string-fields
   (testing "exact and prefix builders operate on complete StringField values,
             not analyzer output, and a multi-valued document remains one hit"
@@ -851,6 +904,11 @@
                 "exact means one complete indexed term")
             (is (empty? (ids (sc/term-query :lexeme "ca")))
                 "the exact builder does not analyze or expand a prefix")
+            (is (= #{"one" "three"}
+                   (ids (sc/terms-query :lexeme ["cat" "run"])))
+                "a term set intersects exact multi-valued fields without Boolean clauses")
+            (is (empty? (ids (sc/terms-query :lexeme [])))
+                "an empty external identity set matches nothing")
             (is (= #{"one" "two"} (ids (sc/prefix-query :lexeme "cat")))
                 "two matching values in document one still produce one hit")
             (is (= #{"three"} (ids (sc/prefix-query :lexeme "Cat")))
