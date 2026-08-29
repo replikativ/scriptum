@@ -2492,6 +2492,77 @@
             "an embedding collector preserves the detached generation by address"))
       (finally (sc/close! generation)))))
 
+(deftest detached-generation-uses-the-live-konserve-identity
+  (let [s (store-at (str *root* "/generation-store-id"))
+        actual (sk/store-id-for s)
+        configured (random-uuid)
+        failure (try
+                  (sc/begin-generation
+                   s (str *root* "/generation-store-id-cache") nil
+                   {:store-id configured})
+                  nil
+                  (catch clojure.lang.ExceptionInfo failure failure))]
+    (is (= :scriptum/generation-store-id-mismatch
+           (:type (ex-data failure))))
+    (is (= configured (:configured (ex-data failure))))
+    (is (= actual (:actual (ex-data failure))))
+    (is (not (guard/in-flight? configured)))
+    (is (not (guard/in-flight? actual)))))
+
+(deftest detached-generation-publication-hold-is-lightweight-and-transferable
+  (let [s (store-at (str *root* "/publication-hold-store"))
+        c (str *root* "/publication-hold-cache")
+        store-id (sk/store-id-for s)
+        generation (sc/begin-generation
+                    s c nil {:workspace-id "publication-hold"})
+        hold* (atom nil)]
+    (try
+      (sc/add-doc generation {:body "held"})
+      (let [address (sc/seal-generation! generation)
+            hold (sc/take-generation-publication-hold! generation)]
+        (reset! hold* hold)
+        (is (= address (:generation-address hold)))
+        (is (nil? (:writer hold)))
+        (is (nil? (:directory hold)))
+        (is (guard/in-flight? store-id))
+        (is (= :scriptum/generation-publication-hold-transferred
+               (:type
+                (ex-data
+                 (try
+                   (sc/release-generation! generation)
+                   nil
+                   (catch clojure.lang.ExceptionInfo failure failure))))))
+        (sc/close! generation)
+        (is (guard/in-flight? store-id)
+            "ordinary writer cleanup leaves the transferred publication hold alone")
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s store-id)
+        (is (= #{"held"} (bodies-at s c address))
+            "collection cannot remove a generation protected only by the transferred hold")
+        (let [original-done guard/done!
+              failure (ex-info "injected durable completion failure"
+                               {:reason :injected-completion-failure})]
+          (is (identical?
+               failure
+               (try
+                 (with-redefs [guard/done! (fn [& _] (throw failure))]
+                   (sc/root-generation-publication! hold))
+                 nil
+                 (catch Throwable thrown thrown))))
+          (is (false? @(:completed? hold)))
+          (is (guard/in-flight? store-id))
+          (with-redefs [guard/done! original-done]
+            (sc/root-generation-publication! hold)))
+        (sc/root-generation-publication! hold)
+        (is (= :committed @(:outcome hold)))
+        (is (not (guard/in-flight? store-id)))
+        (is (= #{"held"} (bodies-at s c address))))
+      (finally
+        (when (and @hold* (not @(:completed? @hold*)))
+          (sc/abort-generation-publication! @hold*))
+        (when-not @hold*
+          (sc/abort-generation! generation))))))
+
 (deftest immutable-generation-audit-verifies-snapshot-and-blobs
   (let [s (store)
         c (cache)

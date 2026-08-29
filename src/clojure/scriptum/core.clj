@@ -148,13 +148,17 @@
                     {:value-type (type sw)})))
   (:backing sw))
 
+(defrecord GenerationPublicationHold
+           [store-id guard-token generation-address completed? outcome])
+
 (defn- release-generation-guard!
   [sw]
   (let [{:keys [store-id guard-token lifecycle]} (generation-backing sw)]
-    (when-let [token @guard-token]
-      (guard/done! store-id token)
-      (reset! guard-token nil))
-    (swap! lifecycle assoc :released? true)))
+    (locking guard-token
+      (when-let [token @guard-token]
+        (guard/done! store-id token)
+        (reset! guard-token nil))
+      (swap! lifecycle assoc :released? true))))
 
 (defn- cleanup-generation-workspace!
   [sw]
@@ -399,7 +403,14 @@
     {:keys [analyzer store-id workspace-id logical-name
             max-merged-segment-mb ram-buffer-mb]
      :as opts}]
-   (let [store-id (or store-id (sk/store-id-for store))
+   (let [live-store-id (sk/store-id-for store)
+         _ (when (and store-id live-store-id (not= store-id live-store-id))
+             (throw (ex-info
+                     "scriptum: detached generation store id differs from its live Konserve identity"
+                     {:type :scriptum/generation-store-id-mismatch
+                      :configured store-id
+                      :actual live-store-id})))
+         store-id (or live-store-id store-id)
          _ (when-not store-id
              (throw (ex-info
                      "scriptum: a detached generation requires a konserve store id"
@@ -409,6 +420,7 @@
          token (guard/writing! store-id)
          guard-token (atom token)
          lifecycle (atom {:status :open :released? false})
+         publication-hold-transferred? (atom false)
          workspace-cleaned? (atom false)]
      (try
        (let [{:keys [directory state pending-parents]}
@@ -437,6 +449,7 @@
            :store-id store-id
            :pending-parents pending-parents
            :guard-token guard-token
+           :publication-hold-transferred? publication-hold-transferred?
            :lifecycle lifecycle
            :workspace-cleaned? workspace-cleaned?
            :analyzer analyzer
@@ -892,15 +905,22 @@
   Idempotent. This does not move or delete any Scriptum ref; the immutable
   generation remains live exactly while the embedding root marks its address."
   [sw]
-  (let [{:keys [lifecycle]} (generation-backing sw)
-        {:keys [status released?]} @lifecycle]
-    (when-not (or (= :sealed status) released?)
-      (throw (ex-info "scriptum: only a sealed generation can be released"
-                      {:lifecycle @lifecycle})))
-    (when-not released?
-      (release-generation-guard! sw))
-    (cleanup-generation-workspace! sw)
-    nil))
+  (let [{:keys [lifecycle publication-hold-transferred?]}
+        (generation-backing sw)
+        guard-token (:guard-token (generation-backing sw))]
+    (locking guard-token
+      (let [{:keys [status released?]} @lifecycle]
+        (when @publication-hold-transferred?
+          (throw (ex-info "scriptum: generation publication hold belongs to another owner"
+                          {:type :scriptum/generation-publication-hold-transferred
+                           :address (:address @lifecycle)})))
+        (when-not (or (= :sealed status) released?)
+          (throw (ex-info "scriptum: only a sealed generation can be released"
+                          {:lifecycle @lifecycle})))
+        (when-not released?
+          (release-generation-guard! sw))
+        (cleanup-generation-workspace! sw)
+        nil))))
 
 (defn abort-generation!
   "Discard an open detached writer and release its GC guard.
@@ -908,21 +928,78 @@
   Already sealed generations cannot be unwritten; aborting one merely releases
   its guard so the unreachable snapshot can be collected. Idempotent."
   [sw]
-  (let [{:keys [lifecycle]} (generation-backing sw)
-        {:keys [status released?]} @lifecycle]
-    (when-not released?
-      (try
-        (when (= :open status)
-          (.rollback ^BranchIndexWriter (->writer sw))
-          (swap! lifecycle assoc :status :aborted))
-        (finally
+  (let [{:keys [lifecycle publication-hold-transferred?]}
+        (generation-backing sw)
+        guard-token (:guard-token (generation-backing sw))]
+    (locking guard-token
+      (let [{:keys [status released?]} @lifecycle]
+        (when @publication-hold-transferred?
+          (throw (ex-info "scriptum: generation publication hold belongs to another owner"
+                          {:type :scriptum/generation-publication-hold-transferred
+                           :address (:address @lifecycle)})))
+        (when-not released?
           (try
-            (cleanup-generation-workspace! sw)
+            (when (= :open status)
+              (.rollback ^BranchIndexWriter (->writer sw))
+              (swap! lifecycle assoc :status :aborted))
             (finally
-              ;; A rollback failure must not pin every future collection at this
-              ;; generation's start time. Its objects are unreachable garbage.
-              (release-generation-guard! sw))))))
-    nil))
+              (try
+                (cleanup-generation-workspace! sw)
+                (finally
+                  ;; A rollback failure must not pin every future collection at this
+                  ;; generation's start time. Its objects are unreachable garbage.
+                  (release-generation-guard! sw))))))
+        nil))))
+
+(defn take-generation-publication-hold!
+  "Detach a sealed generation's lightweight GC hold from its closed writer.
+
+   Carry this value until the embedding owner publishes the snapshot address.
+   It retains no Lucene writer, Directory, reader, or local cache. Complete it
+   with `root-generation-publication!` after publication or
+   `abort-generation-publication!` after a definitive abort. An ambiguous
+   publication must retain the hold."
+  [sw]
+  (let [{:keys [store-id guard-token lifecycle
+                publication-hold-transferred?]}
+        (generation-backing sw)]
+    (locking guard-token
+      (let [{:keys [status address released?]} @lifecycle]
+        (when-not (and (= :sealed status) (not released?))
+          (throw (ex-info "scriptum: only a live sealed generation can transfer its publication hold"
+                          {:type :scriptum/invalid-generation-publication-hold
+                           :lifecycle @lifecycle})))
+        (when-not (compare-and-set! publication-hold-transferred? false true)
+          (throw (ex-info "scriptum: generation publication hold was already transferred"
+                          {:type :scriptum/generation-publication-hold-transferred
+                           :address address})))
+        (let [token @guard-token]
+          (when-not token
+            (throw (ex-info "scriptum: sealed generation has no publication guard"
+                            {:type :scriptum/missing-generation-publication-guard
+                             :address address})))
+          (reset! guard-token nil)
+          (->GenerationPublicationHold store-id token address
+                                       (atom false) (atom nil)))))))
+
+(defn- complete-generation-publication!
+  [^GenerationPublicationHold hold completion]
+  (locking hold
+    (when-not @(:completed? hold)
+      (guard/done! (:store-id hold) (:guard-token hold))
+      (reset! (:outcome hold) completion)
+      (reset! (:completed? hold) true)))
+  hold)
+
+(defn root-generation-publication!
+  "Complete a transferred hold after the owner root durably names its address."
+  [hold]
+  (complete-generation-publication! hold :committed))
+
+(defn abort-generation-publication!
+  "Complete a transferred hold after publication is definitively aborted."
+  [hold]
+  (complete-generation-publication! hold :aborted))
 
 (defn verify-commit
   "Verify the cryptographic integrity of a commit by recomputing its merkle hash.
@@ -1544,13 +1621,15 @@
   "Close a branch writer and its resources."
   [sw]
   (if (generation? sw)
-    (let [{:keys [status]} @(get-in sw [:backing :lifecycle])]
+    (let [{:keys [status]} @(get-in sw [:backing :lifecycle])
+          transferred? @(get-in sw [:backing :publication-hold-transferred?])]
       ;; Closing an unsealed private generation must never invoke Lucene's
       ;; commit-on-close. A sealed one has already closed its writer and only
       ;; retains the publication guard.
-      (if (= :open status)
-        (abort-generation! sw)
-        (release-generation! sw)))
+      (cond
+        transferred? (do (cleanup-generation-workspace! sw) nil)
+        (= :open status) (abort-generation! sw)
+        :else (release-generation! sw)))
     (let [^BranchIndexWriter writer (->writer sw)
           mi (->metadata-index sw)]
       (when mi
