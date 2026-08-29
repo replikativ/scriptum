@@ -816,6 +816,20 @@
                                     (sc/candidate-page snapshot :all
                                                        {:after old-cursor
                                                         :query-id :different-query})))
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                    #"continuation does not belong"
+                                    (sc/candidate-page snapshot
+                                                       (sc/term-query :id "00")
+                                                       {:after old-cursor
+                                                        :query-id :match-all})))
+              (is (= 3
+                     (count
+                      (:candidates
+                       (sc/candidate-page snapshot :all
+                                          {:page-size 3
+                                           :after old-cursor
+                                           :query-id :match-all}))))
+                  "an equivalent reconstructed query can resume its cursor")
               (sc/add-doc w {:id {:type :string :value "new"}
                              :body {:type :text :value "same score"}})
               (sc/commit! w "new snapshot")
@@ -867,7 +881,7 @@
                     (is (= (set (map #(format "%02d" %) (range 23)))
                            (set ids'))))
                   (do
-                    (is (= 2 (:version continuation)))
+                    (is (= 4 (:version continuation)))
                     (is (= :doc-id (:order continuation)))
                     (recur continuation doc-ids' ids')))))
             (is (thrown-with-msg?

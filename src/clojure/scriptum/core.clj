@@ -1320,7 +1320,8 @@
 
     {:snapshot-address <address>
      :candidates         [{:doc-id n :score f ...stored fields...} ...]
-     :continuation       {:version 1 :snapshot-address <address>
+     :continuation       {:version 3 :snapshot-address <address>
+                          :query <lucene-query>
                           :doc-id n :score f} ; nil when exhausted
      :exhausted?         boolean
      :ordering           :score-desc-doc-id-asc}
@@ -1351,11 +1352,12 @@
   because no score was computed. Index order is stable only within the named
   immutable snapshot; never carry this ordering across generations.
 
-  When `:query-id` is supplied it is copied into the continuation and checked
-  on resume. Scriptum cannot derive it reliably: arbitrary Lucene Query objects
-  have no canonical serialization. An adapter with a canonical query form
-  (such as PostgreSQL's normalized tsquery) should provide its own fingerprint;
-  without one, changing the query between pages remains a caller error."
+  The opaque continuation stores Lucene's normalized Query and checks its
+  structural equality on resume. This makes changing the actual query between
+  pages an error even when `:query-id` is omitted or accidentally reused.
+  `:query-id` remains useful as an adapter-owned semantic fingerprint in
+  addition to that structural check; it is copied into the continuation and
+  checked on resume."
   ([snapshot query]
    (candidate-page snapshot query {}))
   ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id order]
@@ -1368,24 +1370,26 @@
    (when-not (contains? #{:score :doc-id} order)
      (throw (ex-info "scriptum: candidate order must be :score or :doc-id"
                      {:order order})))
-   (let [address (:snapshot-address snapshot)]
+   (let [address (:snapshot-address snapshot)
+         ^DirectoryReader reader (:reader snapshot)
+         searcher (IndexSearcher. reader)
+         q (->query reader query)]
      (when (and after
-                (or (not= (if (= :doc-id order) 2 1) (:version after))
+                (or (not= (if (= :doc-id order) 4 3) (:version after))
                     (not= address (:snapshot-address after))
                     (not= query-id (:query-id after))
+                    (not= q (:query after))
                     (not (integer? (:doc-id after)))
                     (if (= :doc-id order)
                       (not= :doc-id (:order after))
                       (not (number? (:score after))))))
        (throw (ex-info "scriptum: continuation does not belong to this snapshot/query"
-                       {:snapshot-address address
+                       {:type :scriptum/continuation-mismatch
+                        :snapshot-address address
                         :query-id query-id
                         :order order
                         :continuation after})))
-     (let [^DirectoryReader reader (:reader snapshot)
-           searcher (IndexSearcher. reader)
-           q (->query reader query)
-           ^ScoreDoc after-doc (when after
+     (let [^ScoreDoc after-doc (when after
                                  (if (= :doc-id order)
                                    (FieldDoc. (int (:doc-id after)) Float/NaN
                                               (object-array
@@ -1407,9 +1411,10 @@
         :candidates candidates
         :continuation (when more?
                         (cond->
-                         {:version (if (= :doc-id order) 2 1)
+                         {:version (if (= :doc-id order) 4 3)
                           :snapshot-address address
                           :query-id query-id
+                          :query q
                           :doc-id (.-doc ^ScoreDoc last-hit)}
                           (= :doc-id order) (assoc :order :doc-id)
                           (= :score order)
