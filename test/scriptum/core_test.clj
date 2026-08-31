@@ -8,7 +8,9 @@
             [yggdrasil.protocols :as p])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
-           [java.time Instant Duration]))
+           [java.time Instant Duration]
+           [org.apache.lucene.document Document Field$Store LongField StringField
+            TextField]))
 
 (defn- temp-dir []
   (str (Files/createTempDirectory "scriptum-core-test-"
@@ -54,6 +56,23 @@
         (let [results (sc/search writer :all {:limit 1})]
           (is (= 1 (count results)))))
 
+      (finally
+        (sc/close! writer)
+        (delete-dir-recursive path)))))
+
+(deftest add-prebuilt-document
+  (let [path (temp-dir)
+        writer (sc/create-index path "main")]
+    (try
+      (let [doc (Document.)]
+        (.add doc (StringField. "id" "candidate-1" Field$Store/YES))
+        (.add doc (TextField. "body" "lean database candidate"
+                              Field$Store/NO))
+        (sc/add-document writer doc))
+      (sc/commit! writer)
+      (is (= "candidate-1"
+             (get (first (sc/search writer {:term [:body "database"]}))
+                  "id")))
       (finally
         (sc/close! writer)
         (delete-dir-recursive path)))))
@@ -248,6 +267,25 @@
       (let [results (sc/search writer {:term [:id "keep"]})]
         (is (= 1 (count results))))
 
+      (finally
+        (sc/close! writer)
+        (delete-dir-recursive path)))))
+
+(deftest delete-documents-by-query
+  (let [path (temp-dir)
+        writer (sc/create-index path "main")]
+    (try
+      (doseq [id [1 2]]
+        (let [doc (Document.)]
+          (.add doc (LongField. "id" id Field$Store/YES))
+          (.add doc (TextField. "body" "candidate" Field$Store/NO))
+          (sc/add-document writer doc)))
+      (sc/commit! writer)
+      (sc/delete-query writer (LongField/newExactQuery "id" 2))
+      (sc/commit! writer)
+      (is (= ["1"]
+             (mapv #(get % "id")
+                   (sc/search writer (LongField/newRangeQuery "id" 0 10)))))
       (finally
         (sc/close! writer)
         (delete-dir-recursive path)))))

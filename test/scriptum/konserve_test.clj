@@ -714,13 +714,53 @@
                                                       (sc/text-query :body "common")
                                                       {:limit 20
                                                        :fields [:id]}))))
+            (is (= 5 (sc/count-store-snapshot
+                      snapshot (sc/text-query :body "common"))))
+            (is (= 0 (sc/count-store-snapshot
+                      snapshot (sc/text-query :body "absent"))))
             (sc/add-doc w {:id {:type :string :value "later"}
                            :body {:type :text :value "common text"}})
             (sc/commit! w "branch advances")
             (is (= 5 (count (sc/search-store-snapshot snapshot
                                                       (sc/text-query :body "common")
                                                       {:limit 20})))
-                "the held snapshot cannot move with the branch")))
+                "the held snapshot cannot move with the branch")
+            (is (= 5 (sc/count-store-snapshot
+                      snapshot (sc/text-query :body "common")))
+                "the count is pinned to the same immutable generation")))
+        (finally (sc/close! w))))))
+
+(deftest immutable-snapshot-leases-have-independent-lifetimes
+  (testing "overlapping immutable DB values share the read-only Lucene resource,
+            but closing either logical lease cannot invalidate the other"
+    (let [s (store)
+          c (cache)
+          w (sc/open-store-index s c "main")]
+      (try
+        (sc/add-doc w {:body {:type :text :value "shared snapshot"}})
+        (sc/commit! w)
+        (let [address (sc/snapshot-address w)
+              first (sc/open-store-snapshot s c address)
+              second (sc/open-store-snapshot s c address)
+              retained (sc/retain-store-snapshot first)]
+          (try
+            (is (identical? (:reader first) (:reader second)))
+            (is (identical? (:directory first) (:directory retained)))
+            (.close ^java.io.Closeable first)
+            (.close ^java.io.Closeable first)
+            (is (= 1 (count (sc/search-store-snapshot
+                             second (sc/text-query :body "shared") {}))))
+            (.close ^java.io.Closeable second)
+            (is (= 1 (count (sc/search-store-snapshot
+                             retained (sc/text-query :body "snapshot") {})))
+                "the last retained lease still owns the physical reader")
+            (finally
+              (.close ^java.io.Closeable first)
+              (.close ^java.io.Closeable second)
+              (.close ^java.io.Closeable retained)))
+          (with-open [reopened (sc/open-store-snapshot s c address)]
+            (is (= 1 (count (sc/search-store-snapshot reopened :all {})))
+                "the final close released enough state for a clean reopen")))
         (finally (sc/close! w))))))
 
 (deftest candidates-page-through-an-entire-pinned-snapshot
@@ -776,6 +816,20 @@
                                     (sc/candidate-page snapshot :all
                                                        {:after old-cursor
                                                         :query-id :different-query})))
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                    #"continuation does not belong"
+                                    (sc/candidate-page snapshot
+                                                       (sc/term-query :id "00")
+                                                       {:after old-cursor
+                                                        :query-id :match-all})))
+              (is (= 3
+                     (count
+                      (:candidates
+                       (sc/candidate-page snapshot :all
+                                          {:page-size 3
+                                           :after old-cursor
+                                           :query-id :match-all}))))
+                  "an equivalent reconstructed query can resume its cursor")
               (sc/add-doc w {:id {:type :string :value "new"}
                              :body {:type :text :value "same score"}})
               (sc/commit! w "new snapshot")
@@ -785,6 +839,148 @@
                                       #"continuation does not belong"
                                       (sc/candidate-page new-snapshot :all
                                                          {:after old-cursor})))))))
+        (finally (sc/close! w))))))
+
+(deftest candidates-can-page-without-computing-relevance-scores
+  (testing "doc-id order is a complete generation-bound candidate collector"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [i (range 23)]
+          (sc/add-doc w {:id {:type :string :value (format "%02d" i)}
+                         :body {:type :text
+                                :value (if (even? i)
+                                         "common common"
+                                         "common")}}))
+        (sc/commit! w "unranked candidate generation")
+        (with-open [snapshot (sc/open-store-snapshot
+                              s (cache) (sc/snapshot-address w))]
+          (let [query (sc/text-query :body "common")
+                ranked (sc/candidate-page snapshot query
+                                          {:page-size 5
+                                           :query-id :ranked})]
+            (loop [after nil
+                   doc-ids []
+                   ids []]
+              (let [{:keys [candidates continuation exhausted? ordering]}
+                    (sc/candidate-page snapshot query
+                                       {:page-size 5
+                                        :after after
+                                        :fields [:id]
+                                        :query-id :unranked
+                                        :order :doc-id})
+                    doc-ids' (into doc-ids (map :doc-id) candidates)
+                    ids' (into ids (map #(get % "id")) candidates)]
+                (is (= :doc-id-asc ordering))
+                (is (every? #(Float/isNaN (float (:score %))) candidates))
+                (if exhausted?
+                  (do
+                    (is (nil? continuation))
+                    (is (= 23 (count doc-ids')))
+                    (is (apply < doc-ids'))
+                    (is (= (set (map #(format "%02d" %) (range 23)))
+                           (set ids'))))
+                  (do
+                    (is (= 4 (:version continuation)))
+                    (is (= :doc-id (:order continuation)))
+                    (recur continuation doc-ids' ids')))))
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"continuation does not belong"
+                 (sc/candidate-page snapshot query
+                                    {:page-size 5
+                                     :after (:continuation ranked)
+                                     :query-id :ranked
+                                     :order :doc-id})))))
+        (finally (sc/close! w))))))
+
+(deftest analyzer-free-term-builders-query-multi-valued-string-fields
+  (testing "exact and prefix builders operate on complete StringField values,
+            not analyzer output, and a multi-valued document remains one hit"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [[id lexemes]
+                [["one" ["cat" "cater" "running"]]
+                 ["two" ["catalog" "dog"]]
+                 ["three" ["Cat" "run"]]]]
+          (sc/add-doc w {:id {:type :string :value id}
+                         :lexeme {:type :string :value lexemes :store? false}}))
+        (sc/commit! w "exact lexeme generation")
+        (with-open [snapshot (sc/open-store-snapshot
+                              s (cache) (sc/snapshot-address w))]
+          (letfn [(ids [query]
+                    (set (map #(get % "id")
+                              (sc/search-store-snapshot snapshot query
+                                                        {:limit 20
+                                                         :fields [:id]}))))]
+            (is (= #{"one"} (ids (sc/term-query :lexeme "cat")))
+                "exact means one complete indexed term")
+            (is (empty? (ids (sc/term-query :lexeme "ca")))
+                "the exact builder does not analyze or expand a prefix")
+            (is (= #{"one" "three"}
+                   (ids (sc/terms-query :lexeme ["cat" "run"])))
+                "a term set intersects exact multi-valued fields without Boolean clauses")
+            (is (empty? (ids (sc/terms-query :lexeme [])))
+                "an empty external identity set matches nothing")
+            (is (= #{"one" "two"} (ids (sc/prefix-query :lexeme "cat")))
+                "two matching values in document one still produce one hit")
+            (is (= #{"three"} (ids (sc/prefix-query :lexeme "Cat")))
+                "no analyzer lower-cases an already-normalized term")))
+        (finally (sc/close! w))))))
+
+(deftest analyzer-free-prefix-candidates-page-through-one-immutable-snapshot
+  (testing "candidate continuation stays on its snapshot while the branch
+            advances; constant Lucene scores are cursor data, not ranking"
+    (let [s (store)
+          w (sc/open-store-index s (cache) "main")]
+      (try
+        (doseq [[id lexemes]
+                [["one" ["cat" "cater"]]
+                 ["two" ["catalog"]]
+                 ["miss" ["dog"]]]]
+          (sc/add-doc w {:id {:type :string :value id}
+                         :lexeme {:type :string :value lexemes :store? false}}))
+        (sc/commit! w "pinned prefix generation")
+        (let [old-address (sc/snapshot-address w)
+              query (sc/prefix-query :lexeme "cat")]
+          (with-open [snapshot (sc/open-store-snapshot s (cache) old-address)]
+            (let [first-page (sc/candidate-page snapshot query
+                                                {:page-size 1
+                                                 :fields [:id]
+                                                 :query-id [:prefix :lexeme "cat"]})]
+              (is (false? (:exhausted? first-page)))
+              (is (= 1 (count (:candidates first-page))))
+              (sc/add-doc w {:id {:type :string :value "later"}
+                             :lexeme {:type :string
+                                      :value ["catfish" "category"]
+                                      :store? false}})
+              (sc/commit! w "branch advances past held candidate snapshot")
+              (loop [after (:continuation first-page)
+                     candidates (:candidates first-page)]
+                (let [page (sc/candidate-page snapshot query
+                                              {:page-size 1
+                                               :after after
+                                               :fields [:id]
+                                               :query-id [:prefix :lexeme "cat"]})
+                      candidates' (into candidates (:candidates page))]
+                  (if (:exhausted? page)
+                    (do
+                      (is (= #{"one" "two"}
+                             (set (map #(get % "id") candidates')))
+                          "the old snapshot neither sees the later document nor
+                           repeats the multi-valued document")
+                      (is (= 1 (count (set (map :score candidates'))))
+                          "constant score is stable paging state, not relevance"))
+                    (recur (:continuation page) candidates'))))))
+          (with-open [new-snapshot (sc/open-store-snapshot
+                                    s (cache) (sc/snapshot-address w))]
+            (is (= #{"one" "two" "later"}
+                   (set (map #(get % "id")
+                             (sc/search-store-snapshot new-snapshot query
+                                                       {:limit 20
+                                                        :fields [:id]}))))
+                "a new snapshot sees the branch's later matching document")))
         (finally (sc/close! w))))))
 
 (deftest a-commit-that-never-finished-does-not-move-the-branch
@@ -2186,3 +2382,326 @@
       (let [w2 (sc/open-store-index s (cache) "main")]
         (try (is (= 4 (sc/num-docs w2)) "and the branch reopens cold")
              (finally (sc/close! w2)))))))
+
+(deftest detached-generations-seal-without-moving-a-ref
+  (testing "a private generation derives from an immutable address and only the
+            embedding root can publish the result"
+    (let [s (store)
+          c (cache)
+          source (sc/open-store-index s c "source")]
+      (try
+        (sc/add-doc source {:body "base"})
+        (sc/commit! source "base")
+        (let [base (sc/snapshot-address source)
+              before-branches (sk/branches s)
+              generation (sc/begin-generation s c base {:workspace-id "generation-one"})]
+          (try
+            (sc/add-doc generation {:body "private"})
+            (let [sealed (sc/seal-generation! generation "private")]
+              (is (not= base sealed))
+              (is (= #{"base" "private"} (bodies-at s c sealed))
+                  "the exact returned address opens independently of a branch")
+              (is (= #{"base"} (bodies-at s c base))
+                  "the immutable source generation is untouched")
+              (is (= base (sk/branch-snapshot s "source"))
+                  "the source ref is untouched")
+              (is (= before-branches (sk/branches s))
+                  "sealing does not register a native branch")
+              (is (not (k/exists? s (sk/manifest-key "generation-one") {:sync? true}))
+                  "and does not create a hidden mutable manifest")
+              ;; Model the embedding root now naming the immutable address.
+              (sc/release-generation! generation)
+              (is (= #{"base" "private"} (bodies-at s c sealed))))
+            (finally (sc/close! generation))))
+        (finally (sc/close! source))))))
+
+(deftest detached-generation-abort-has-no-ref-side-effect
+  (let [s (store)
+        c (cache)
+        source (sc/open-store-index s c "source")]
+    (try
+      (sc/add-doc source {:body "base"})
+      (sc/commit! source)
+      (let [base (sc/snapshot-address source)
+            branches (sk/branches s)
+            generation (sc/begin-generation s c base {:workspace-id "aborted-generation"})]
+        (sc/add-doc generation {:body "must-not-land"})
+        (sc/abort-generation! generation)
+        (is (= base (sk/branch-snapshot s "source")))
+        (is (= branches (sk/branches s)))
+        (is (not (k/exists? s (sk/manifest-key "aborted-generation") {:sync? true})))
+        (is (= #{"base"} (bodies-at s c base))))
+      (finally (sc/close! source)))))
+
+(deftest detached-generations-from-one-base-are-isolated
+  (let [s (store)
+        c (cache)
+        source (sc/open-store-index s c "source")]
+    (try
+      (sc/add-doc source {:body "base"})
+      (sc/commit! source)
+      (let [base (sc/snapshot-address source)
+            a (sc/begin-generation s c base {:workspace-id "generation-a"})
+            b (sc/begin-generation s c base {:workspace-id "generation-b"})]
+        (try
+          (sc/add-doc a {:body "only-a"})
+          (sc/add-doc b {:body "only-b"})
+          (let [aa (sc/seal-generation! a)
+                ba (sc/seal-generation! b)]
+            (is (= #{"base" "only-a"} (bodies-at s c aa)))
+            (is (= #{"base" "only-b"} (bodies-at s c ba)))
+            (is (= #{"base"} (bodies-at s c base)))
+            (is (= #{"source"} (sk/branches s)))
+            (sc/release-generation! a)
+            (sc/release-generation! b))
+          (finally
+            (sc/close! a)
+            (sc/close! b))))
+      (finally (sc/close! source)))))
+
+(defn- segment-commit-files [store address]
+  (into #{}
+        (filter #(.startsWith ^String % "segments_"))
+        (keys (sk/snapshot-files store address))))
+
+(deftest detached-generations-keep-only-the-latest-lucene-commit
+  (testing "external snapshot roots own history; a derived generation does not
+            copy every old Lucene commit point into its current file map"
+    (let [s (store)
+          c (cache)
+          source (sc/open-store-index s c "source")]
+      (try
+        ;; A native Scriptum branch deliberately retains its commit points. This
+        ;; makes the source a strong regression fixture rather than assuming a
+        ;; single-commit base.
+        (dotimes [n 3]
+          (sc/add-doc source {:body (str "base-" n)})
+          (sc/commit! source (str "base-" n)))
+        (let [base (sc/snapshot-address source)]
+          (is (= 3 (count (segment-commit-files s base)))
+              "precondition: the native source carries three commit points")
+          (loop [address base
+                 n 0]
+            (when (< n 3)
+              (let [workspace (str "latest-only-" n)
+                    generation (sc/begin-generation
+                                s c address {:workspace-id workspace})
+                    next-address
+                    (try
+                      (sc/add-doc generation {:body (str "derived-" n)})
+                      (let [sealed (sc/seal-generation! generation)]
+                        (sc/release-generation! generation)
+                        sealed)
+                      (finally
+                        (sc/close! generation)))]
+                (let [segments (segment-commit-files s next-address)]
+                  (is (= 1 (count segments))
+                      (str "the new immutable state contains only its current segments_N: "
+                           (pr-str segments))))
+                (is (= (+ 4 n) (count (bodies-at s c next-address))))
+                (is (= (+ 3 n) (count (bodies-at s c address)))
+                    "deriving does not rewrite the exact source snapshot")
+                (recur next-address (inc n))))))
+        (finally
+          (sc/close! source))))))
+
+(deftest detached-generation-workspaces-clean-up-idempotently
+  (let [s (store)
+        c (cache)
+        sealed-workspace "sealed-workspace"
+        sealed-path (io/file c sealed-workspace)
+        sealed-generation
+        (sc/begin-generation s c nil {:workspace-id sealed-workspace})]
+    (is (.isDirectory sealed-path))
+    (sc/add-doc sealed-generation {:body "durable"})
+    (let [address (sc/seal-generation! sealed-generation)]
+      (is (not (.exists sealed-path))
+          "sealing closes and removes the private hard-link view")
+      ;; Every lifecycle operation is safe to repeat and must not make the
+      ;; immutable result unreadable.
+      (dotimes [_ 2]
+        (sc/release-generation! sealed-generation)
+        (sc/abort-generation! sealed-generation)
+        (sc/close! sealed-generation))
+      (is (= #{"durable"} (bodies-at s c address)))
+      (is (not (.exists sealed-path))))
+
+    (let [aborted-workspace "aborted-workspace"
+          aborted-path (io/file c aborted-workspace)
+          aborted-generation
+          (sc/begin-generation s c nil {:workspace-id aborted-workspace})]
+      (is (.isDirectory aborted-path))
+      (sc/add-doc aborted-generation {:body "discarded"})
+      (dotimes [_ 2]
+        (sc/abort-generation! aborted-generation)
+        (sc/close! aborted-generation))
+      (is (not (.exists aborted-path))
+          "rollback closes and removes the private hard-link view")
+      (is (empty? (sk/branches s)))
+      (is (not (k/exists? s (sk/manifest-key aborted-workspace) {:sync? true}))))))
+
+(deftest detached-generation-has-an-exact-gc-mark
+  (let [s (store-at (str *root* "/detached-store"))
+        c (str *root* "/detached-cache")
+        generation (sc/begin-generation s c nil {:workspace-id "generation-mark"})]
+    (try
+      (sc/add-doc generation {:body "marked"})
+      (let [address (sc/seal-generation! generation)
+            files (sk/snapshot-files s address)
+            expected (-> #{sk/format-key (sk/snapshot-key address)}
+                         (into (map sk/blob-key) (vals files)))]
+        (is (empty? (sk/branches s)))
+        (is (= expected (sc/mark-generation s address))
+            "the external address roots exactly its snapshot and blobs")
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s (sk/store-id-for s))
+        (is (= #{"marked"} (bodies-at s c address))
+            "the generation guard protects the sealed-but-unpublished address")
+        (sc/release-generation! generation)
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s (sk/store-id-for s) (ku/now) [address])
+        (is (= #{"marked"} (bodies-at s c address))
+            "an embedding collector preserves the detached generation by address"))
+      (finally (sc/close! generation)))))
+
+(deftest detached-generation-uses-the-live-konserve-identity
+  (let [s (store-at (str *root* "/generation-store-id"))
+        actual (sk/store-id-for s)
+        configured (random-uuid)
+        failure (try
+                  (sc/begin-generation
+                   s (str *root* "/generation-store-id-cache") nil
+                   {:store-id configured})
+                  nil
+                  (catch clojure.lang.ExceptionInfo failure failure))]
+    (is (= :scriptum/generation-store-id-mismatch
+           (:type (ex-data failure))))
+    (is (= configured (:configured (ex-data failure))))
+    (is (= actual (:actual (ex-data failure))))
+    (is (not (guard/in-flight? configured)))
+    (is (not (guard/in-flight? actual)))))
+
+(deftest detached-generation-publication-hold-is-lightweight-and-transferable
+  (let [s (store-at (str *root* "/publication-hold-store"))
+        c (str *root* "/publication-hold-cache")
+        store-id (sk/store-id-for s)
+        generation (sc/begin-generation
+                    s c nil {:workspace-id "publication-hold"})
+        hold* (atom nil)]
+    (try
+      (sc/add-doc generation {:body "held"})
+      (let [address (sc/seal-generation! generation)
+            hold (sc/take-generation-publication-hold! generation)]
+        (reset! hold* hold)
+        (is (= address (:generation-address hold)))
+        (is (nil? (:writer hold)))
+        (is (nil? (:directory hold)))
+        (is (guard/in-flight? store-id))
+        (is (= :scriptum/generation-publication-hold-transferred
+               (:type
+                (ex-data
+                 (try
+                   (sc/release-generation! generation)
+                   nil
+                   (catch clojure.lang.ExceptionInfo failure failure))))))
+        (sc/close! generation)
+        (is (guard/in-flight? store-id)
+            "ordinary writer cleanup leaves the transferred publication hold alone")
+        (let-the-millisecond-turn-over!)
+        (sk/gc! s store-id)
+        (is (= #{"held"} (bodies-at s c address))
+            "collection cannot remove a generation protected only by the transferred hold")
+        (let [original-done guard/done!
+              failure (ex-info "injected durable completion failure"
+                               {:reason :injected-completion-failure})]
+          (is (identical?
+               failure
+               (try
+                 (with-redefs [guard/done! (fn [& _] (throw failure))]
+                   (sc/root-generation-publication! hold))
+                 nil
+                 (catch Throwable thrown thrown))))
+          (is (false? @(:completed? hold)))
+          (is (guard/in-flight? store-id))
+          (with-redefs [guard/done! original-done]
+            (sc/root-generation-publication! hold)))
+        (sc/root-generation-publication! hold)
+        (is (= :committed @(:outcome hold)))
+        (is (not (guard/in-flight? store-id)))
+        (is (= #{"held"} (bodies-at s c address))))
+      (finally
+        (when (and @hold* (not @(:completed? @hold*)))
+          (sc/abort-generation-publication! @hold*))
+        (when-not @hold*
+          (sc/abort-generation! generation))))))
+
+(deftest immutable-generation-audit-verifies-snapshot-and-blobs
+  (let [s (store)
+        c (cache)
+        generation (sc/begin-generation s c nil {:workspace-id "generation-audit"})]
+    (try
+      (sc/add-doc generation {:body "audited"})
+      (let [address (sc/seal-generation! generation)
+            report (sc/verify-generation s address)]
+        (is (= :ok (:status report)))
+        (is (= address (:root report)))
+        (is (= address (:recomputed-root report)))
+        (is (empty? (:errors report)))
+        (is (pos? (get-in report [:objects :blobs])))
+        (is (= (get-in report [:objects :blobs])
+               (get-in report [:objects :verified-blobs])))
+        (sc/release-generation! generation))
+      (finally (sc/close! generation)))))
+
+(deftest immutable-generation-audit-detects-snapshot-tampering
+  (let [s (store)
+        c (cache)
+        generation (sc/begin-generation s c nil {:workspace-id "generation-snapshot-audit"})]
+    (try
+      (sc/add-doc generation {:body "audited"})
+      (let [address (sc/seal-generation! generation)
+            snapshot (sk/read-snapshot s address)]
+        (sc/release-generation! generation)
+        ;; Corrupt the immutable value in place while retaining its old key.
+        (k/assoc s (sk/snapshot-key address)
+                 (update snapshot :parents conj (random-uuid)) {:sync? true})
+        (let [report (sc/verify-generation s address)]
+          (is (= :mismatch (:status report)))
+          (is (= address (:root report)))
+          (is (not= address (:recomputed-root report)))
+          (is (some #(= :audit/snapshot-mismatch (:type %)) (:errors report)))))
+      (finally (sc/close! generation)))))
+
+(deftest immutable-generation-audit-detects-corrupt-and-missing-blobs
+  (let [s (store)
+        c (cache)
+        generation (sc/begin-generation s c nil {:workspace-id "generation-blob-audit"})]
+    (try
+      (sc/add-doc generation {:body "audited"})
+      (let [address (sc/seal-generation! generation)
+            blob-address (first (vals (sk/snapshot-files s address)))]
+        (sc/release-generation! generation)
+        (k/bassoc s (sk/blob-key blob-address) (byte-array [1 2 3 4]) {:sync? true})
+        (let [report (sc/verify-generation s address)]
+          (is (= :mismatch (:status report)))
+          (is (= address (:recomputed-root report))
+              "the snapshot map remains intact")
+          (is (some #(= :audit/blob-mismatch (:type %)) (:errors report))))
+        (k/dissoc s (sk/blob-key blob-address) {:sync? true})
+        (let [report (sc/verify-generation s address)]
+          (is (= :mismatch (:status report)))
+          (is (some #(= :audit/missing-blob (:type %)) (:errors report)))))
+      (finally (sc/close! generation)))))
+
+(deftest immutable-generation-audit-reports-a-missing-snapshot
+  (let [address (random-uuid)
+        report (sc/verify-generation (store) address)]
+    (is (= {:status :mismatch
+            :root address
+            :recomputed-root nil
+            :objects {:snapshots 0 :blobs 0 :verified-blobs 0}
+            :errors [{:type :audit/missing-snapshot
+                      :address address
+                      :expected address
+                      :recomputed nil}]}
+           report))))

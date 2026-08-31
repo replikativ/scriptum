@@ -10,9 +10,13 @@
   - Branch: COW overlay sharing base segments with the trunk
   - GC: explicit cleanup of old snapshots respecting branch references"
   (:require [scriptum.konserve :as sk]
-            [scriptum.metadata :as metadata])
-  (:import [java.nio.file Path Paths]
+            [scriptum.metadata :as metadata]
+            [konserve.gc-guard :as guard])
+  (:import [java.io File]
+           [java.lang.ref Cleaner Cleaner$Cleanable]
+           [java.nio.file Path Paths]
            [java.time Instant Duration]
+           [java.util IdentityHashMap]
            [org.apache.lucene.analysis Analyzer]
            [org.apache.lucene.analysis.standard StandardAnalyzer]
            [org.apache.lucene.document Document Field$Store TextField StringField
@@ -20,11 +24,12 @@
             KnnFloatVectorField]
            [org.apache.lucene.index DirectoryReader IndexableField Term
             VectorSimilarityFunction]
-           [org.apache.lucene.search IndexSearcher TermQuery BooleanQuery
+           [org.apache.lucene.search IndexSearcher Query TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
-            MatchAllDocsQuery KnnFloatVectorQuery]
+            FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
            [org.apache.lucene.store Directory FSDirectory]
+           [org.apache.lucene.util BytesRef]
            [org.replikativ.scriptum BranchIndexWriter BranchedDirectory]))
 
 (defn- ->path
@@ -42,15 +47,127 @@
   ;; branch is a directory in one model and a manifest in the other.
   )
 
-(defrecord StoreSnapshot [snapshot-address directory reader]
+(defonce ^:private ^Cleaner snapshot-cleaner (Cleaner/create))
+(defonce ^:private snapshot-resource-lock (Object.))
+(defonce ^:private ^IdentityHashMap snapshot-resources (IdentityHashMap.))
+
+(defrecord StoreSnapshotResource [store resource-key directory reader refs])
+
+(defn- release-snapshot-resource! [^StoreSnapshotResource resource]
+  (locking snapshot-resource-lock
+    (let [store (:store resource)
+          resource-key (:resource-key resource)
+          resources (.get snapshot-resources store)
+          registered (get resources resource-key)]
+      (when-not (identical? resource registered)
+        (throw (ex-info "scriptum: snapshot lease resource is no longer registered"
+                        {:snapshot-resource resource-key})))
+      (if (> (long @(:refs resource)) 1)
+        (swap! (:refs resource) dec)
+        (try
+          ;; A DirectoryReader retains the Directory, so release it first.
+          (try
+            (.close ^DirectoryReader (:reader resource))
+            (finally
+              (.close ^Directory (:directory resource))))
+          (finally
+            (let [remaining (dissoc resources resource-key)]
+              (if (seq remaining)
+                (.put snapshot-resources store remaining)
+                (.remove snapshot-resources store)))))))))
+
+(defrecord SnapshotLeaseCleanup [resource closed?]
+  Runnable
+  (run [_]
+    (when (compare-and-set! closed? false true)
+      (try
+        (release-snapshot-resource! resource)
+        ;; Cleaner fallback cannot report to a caller. Explicit close invokes
+        ;; the same action synchronously and therefore still surfaces failures.
+        (catch Throwable _)))))
+
+(defrecord StoreSnapshot [snapshot-address directory reader resource cleanable*
+                          closed?]
   java.io.Closeable
   (close [_]
-    ;; A DirectoryReader retains the Directory, so release it first.  The
-    ;; directory is owned by this handle and is never shared with a writer.
+    (locking closed?
+      (when-not @closed?
+        ;; Explicit close is synchronous and reports native/Lucene failures.
+        (try
+          (release-snapshot-resource! resource)
+          (finally
+            ;; Native close is not a safely retryable protocol after partial
+            ;; progress. Mark this logical lease consumed either way.
+            (reset! closed? true)
+            (.clean ^Cleaner$Cleanable @cleanable*)))))))
+
+(defn- snapshot-resource-key [^String cache address]
+  [(.getCanonicalPath (File. cache)) address])
+
+(defn- acquire-snapshot-resource! [store ^String cache address]
+  (let [resource-key (snapshot-resource-key cache address)]
+    (locking snapshot-resource-lock
+      (let [resources (or (.get snapshot-resources store) {})]
+        (if-let [resource (get resources resource-key)]
+          (do
+            (swap! (:refs resource) inc)
+            resource)
+          (let [^Directory directory (sk/snapshot-directory store cache address)]
+            (try
+              (let [resource (->StoreSnapshotResource
+                              store resource-key directory
+                              (DirectoryReader/open directory) (atom 1))]
+                (.put snapshot-resources store (assoc resources resource-key resource))
+                resource)
+              (catch Throwable failure
+                (.close directory)
+                (throw failure)))))))))
+
+(defn- snapshot-lease [^StoreSnapshotResource resource address]
+  (let [cleanable* (atom nil)
+        closed? (atom false)
+        snapshot (->StoreSnapshot address (:directory resource) (:reader resource)
+                                  resource cleanable* closed?)
+        cleanup (->SnapshotLeaseCleanup resource closed?)]
     (try
-      (.close ^DirectoryReader reader)
-      (finally
-        (.close ^Directory directory)))))
+      (reset! cleanable* (.register snapshot-cleaner snapshot cleanup))
+      snapshot
+      (catch Throwable failure
+        (release-snapshot-resource! resource)
+        (throw failure)))))
+
+(defn generation?
+  "Whether `sw` is a detached immutable-generation writer."
+  [sw]
+  (boolean (and (instance? ScriptumWriter sw)
+                (= :generation (get-in sw [:backing :mode])))))
+
+(defn- generation-backing
+  [sw]
+  (when-not (generation? sw)
+    (throw (ex-info "scriptum: operation requires a detached generation"
+                    {:value-type (type sw)})))
+  (:backing sw))
+
+(defrecord GenerationPublicationHold
+           [store-id guard-token generation-address completed? outcome])
+
+(defn- release-generation-guard!
+  [sw]
+  (let [{:keys [store-id guard-token lifecycle]} (generation-backing sw)]
+    (locking guard-token
+      (when-let [token @guard-token]
+        (guard/done! store-id token)
+        (reset! guard-token nil))
+      (swap! lifecycle assoc :released? true))))
+
+(defn- cleanup-generation-workspace!
+  [sw]
+  (let [{:keys [cache workspace workspace-cleaned?]} (generation-backing sw)]
+    (when-not @workspace-cleaned?
+      (when (sk/cleanup-detached-workspace! cache workspace)
+        (reset! workspace-cleaned? true)))
+    @workspace-cleaned?))
 
 (defn store-backed?
   "Is this writer backed by a konserve store rather than a directory tree?"
@@ -264,6 +381,90 @@
                         :max-merged-segment-mb max-merged-segment-mb
                         :ram-buffer-mb ram-buffer-mb}))))
 
+(defn begin-generation
+  "Begin a private, writable generation derived from `base-address`.
+
+  Unlike `open-store-index`, this creates no branch, branch-registry entry or
+  mutable Scriptum ref. A successful `seal-generation!` writes immutable blobs
+  and a snapshot and returns its content address. The caller publishes that
+  address through its own root and then calls `release-generation!`.
+
+  A GC guard is held for the complete lifecycle, including the interval after
+  sealing and before external publication. `base-address` itself must already
+  be rooted while this call begins; for an embedded secondary that is normally
+  the currently published database root.
+
+  Options are the tuning options of `open-store-index`, plus:
+    :workspace-id - unique local cache/lock identity (default random UUID)
+    :logical-name - commit metadata name (default \"detached\")
+    :store-id     - shared konserve GC identity (defaults from store)."
+  ([store cache base-address]
+   (begin-generation store cache base-address {}))
+  ([store ^String cache base-address
+    {:keys [analyzer store-id workspace-id logical-name
+            max-merged-segment-mb ram-buffer-mb]
+     :as opts}]
+   (let [live-store-id (sk/store-id-for store)
+         _ (when (and store-id live-store-id (not= store-id live-store-id))
+             (throw (ex-info
+                     "scriptum: detached generation store id differs from its live Konserve identity"
+                     {:type :scriptum/generation-store-id-mismatch
+                      :configured store-id
+                      :actual live-store-id})))
+         store-id (or live-store-id store-id)
+         _ (when-not store-id
+             (throw (ex-info
+                     "scriptum: a detached generation requires a konserve store id"
+                     {:store-type (type store)})))
+         analyzer (or analyzer (StandardAnalyzer.))
+         workspace (str (or workspace-id (random-uuid)))
+         token (guard/writing! store-id)
+         guard-token (atom token)
+         lifecycle (atom {:status :open :released? false})
+         publication-hold-transferred? (atom false)
+         workspace-cleaned? (atom false)]
+     (try
+       (let [{:keys [directory state pending-parents]}
+             (sk/detached-directory store cache workspace base-address
+                                    (cond-> {:store-id store-id}
+                                      (:pending-parents opts)
+                                      (assoc :pending-parents (:pending-parents opts))))
+             writer (try (BranchIndexWriter/createDetachedOver
+                          directory (str (or logical-name "detached")) analyzer)
+                         (catch Throwable failure
+                           (try (.close ^java.io.Closeable directory) (catch Throwable _))
+                           (throw failure)))
+             _ (try
+                 (tune! writer max-merged-segment-mb ram-buffer-mb)
+                 (catch Throwable failure
+                   (try (.rollback ^BranchIndexWriter writer) (catch Throwable _))
+                   (throw failure)))]
+         (->ScriptumWriter
+          writer nil
+          {:mode :generation
+           :store store
+           :cache cache
+           :workspace workspace
+           :directory directory
+           :state state
+           :store-id store-id
+           :pending-parents pending-parents
+           :guard-token guard-token
+           :publication-hold-transferred? publication-hold-transferred?
+           :lifecycle lifecycle
+           :workspace-cleaned? workspace-cleaned?
+           :analyzer analyzer
+           :max-merged-segment-mb max-merged-segment-mb
+           :ram-buffer-mb ram-buffer-mb}))
+       (catch Throwable failure
+         (try
+           (sk/cleanup-detached-workspace! cache workspace)
+           (finally
+             (when-let [held @guard-token]
+               (guard/done! store-id held)
+               (reset! guard-token nil))))
+         (throw failure))))))
+
 (defn snapshot-address
   "The immutable address of this branch's current index state, or nil.
 
@@ -282,7 +483,25 @@
   buffered writes are not in it. Store-backed indices only; nil otherwise."
   [sw]
   (when (store-backed? sw)
-    (sk/branch-snapshot (:store (:backing sw)) (.getBranchName (->writer sw)))))
+    (let [{:keys [mode state store]} (:backing sw)]
+      (if (= :generation mode)
+        (:pointer @state)
+        (sk/branch-snapshot store (.getBranchName (->writer sw)))))))
+
+(defn mark-generation
+  "The exact konserve keys required to open immutable generation `address`.
+
+  Intended for an embedding collector that unions marks from all of its roots."
+  [store address]
+  (sk/mark-snapshot store address))
+
+(defn verify-generation
+  "Recompute an immutable generation's snapshot and blob addresses.
+
+  This is the branch-free audit entry point for embedded indices. See
+  `scriptum.konserve/verify-snapshot` for the structured result."
+  [store address]
+  (sk/verify-snapshot store address))
 
 (defn open-store-index-at
   "Open `branch` as a WRITABLE index at the state named by `address`.
@@ -404,6 +623,16 @@
 
 ;; --- Document Operations ---
 
+(defn add-document
+  "Add a pre-built Lucene document or other iterable of IndexableField values.
+
+   This is the allocation-conscious integration path for callers with a fixed
+   schema. `add-doc` remains the convenient data-driven map API. Keeping this
+   operation here avoids exposing BranchIndexWriter as part of an adapter's
+   mutation protocol."
+  [sw doc]
+  (.addDocument ^BranchIndexWriter (->writer sw) doc))
+
 (defn add-doc
   "Add a document to the branch.
 
@@ -521,6 +750,16 @@
   (let [^BranchIndexWriter writer (->writer sw)]
     (.deleteDocuments writer (into-array Term [(Term. field value)]))))
 
+(defn delete-query
+  "Delete documents matching a pre-built Lucene query.
+
+   This is the typed counterpart to `delete-docs`: integrations using numeric,
+   point, or other non-Term fields can keep their native representation without
+   reaching through Scriptum to its BranchIndexWriter."
+  [sw ^Query query]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.deleteDocuments writer (into-array Query [query]))))
+
 (defn update-doc
   "Update a document identified by the given term.
 
@@ -636,6 +875,153 @@
         :content-hash content-hash}
        gen))))
 
+(defn seal-generation!
+  "Seal a detached generation and return its immutable snapshot address.
+
+  The writer is closed, but its GC guard remains held. Publish the address in
+  the embedding system's root and then call `release-generation!`. On failure,
+  the guard is released and any written-but-unreachable objects are left for
+  ordinary content-addressed GC."
+  ([sw]
+   (seal-generation! sw nil nil))
+  ([sw message]
+   (seal-generation! sw message nil))
+  ([sw message metadata]
+   (let [{:keys [lifecycle directory]} (generation-backing sw)]
+     (when-not (= :open (:status @lifecycle))
+       (throw (ex-info "scriptum: detached generation is not open"
+                       {:lifecycle @lifecycle})))
+     (try
+       (commit! sw message metadata)
+       ;; Latest-only deletion runs from Lucene's post-commit policy callback.
+       ;; It removes the superseded segments_N after the commit's first metadata
+       ;; sync. Lucene has no reason to sync again after its deletion policy
+       ;; returns, so explicitly publish the deletion-only file map before the
+       ;; Directory is closed. The detached outer guard covers both immutable
+       ;; snapshots, and only this final address escapes to the embedder.
+       (.syncMetaData ^Directory directory)
+       (.close ^BranchIndexWriter (->writer sw))
+       (let [address (snapshot-address sw)]
+         (when-not address
+           (throw (ex-info "scriptum: detached generation sealed without an address" {})))
+         (cleanup-generation-workspace! sw)
+         (reset! lifecycle {:status :sealed
+                            :address address
+                            :released? false})
+         address)
+       (catch Throwable failure
+         (try (.rollback ^BranchIndexWriter (->writer sw)) (catch Throwable _))
+         (try
+           (cleanup-generation-workspace! sw)
+           (finally
+             (release-generation-guard! sw)))
+         (reset! lifecycle {:status :failed
+                            :failure failure
+                            :released? true})
+         (throw failure))))))
+
+(defn release-generation!
+  "Release a sealed generation's GC guard after an external root names it.
+
+  Idempotent. This does not move or delete any Scriptum ref; the immutable
+  generation remains live exactly while the embedding root marks its address."
+  [sw]
+  (let [{:keys [lifecycle publication-hold-transferred?]}
+        (generation-backing sw)
+        guard-token (:guard-token (generation-backing sw))]
+    (locking guard-token
+      (let [{:keys [status released?]} @lifecycle]
+        (when @publication-hold-transferred?
+          (throw (ex-info "scriptum: generation publication hold belongs to another owner"
+                          {:type :scriptum/generation-publication-hold-transferred
+                           :address (:address @lifecycle)})))
+        (when-not (or (= :sealed status) released?)
+          (throw (ex-info "scriptum: only a sealed generation can be released"
+                          {:lifecycle @lifecycle})))
+        (when-not released?
+          (release-generation-guard! sw))
+        (cleanup-generation-workspace! sw)
+        nil))))
+
+(defn abort-generation!
+  "Discard an open detached writer and release its GC guard.
+
+  Already sealed generations cannot be unwritten; aborting one merely releases
+  its guard so the unreachable snapshot can be collected. Idempotent."
+  [sw]
+  (let [{:keys [lifecycle publication-hold-transferred?]}
+        (generation-backing sw)
+        guard-token (:guard-token (generation-backing sw))]
+    (locking guard-token
+      (let [{:keys [status released?]} @lifecycle]
+        (when @publication-hold-transferred?
+          (throw (ex-info "scriptum: generation publication hold belongs to another owner"
+                          {:type :scriptum/generation-publication-hold-transferred
+                           :address (:address @lifecycle)})))
+        (when-not released?
+          (try
+            (when (= :open status)
+              (.rollback ^BranchIndexWriter (->writer sw))
+              (swap! lifecycle assoc :status :aborted))
+            (finally
+              (try
+                (cleanup-generation-workspace! sw)
+                (finally
+                  ;; A rollback failure must not pin every future collection at this
+                  ;; generation's start time. Its objects are unreachable garbage.
+                  (release-generation-guard! sw))))))
+        nil))))
+
+(defn take-generation-publication-hold!
+  "Detach a sealed generation's lightweight GC hold from its closed writer.
+
+   Carry this value until the embedding owner publishes the snapshot address.
+   It retains no Lucene writer, Directory, reader, or local cache. Complete it
+   with `root-generation-publication!` after publication or
+   `abort-generation-publication!` after a definitive abort. An ambiguous
+   publication must retain the hold."
+  [sw]
+  (let [{:keys [store-id guard-token lifecycle
+                publication-hold-transferred?]}
+        (generation-backing sw)]
+    (locking guard-token
+      (let [{:keys [status address released?]} @lifecycle]
+        (when-not (and (= :sealed status) (not released?))
+          (throw (ex-info "scriptum: only a live sealed generation can transfer its publication hold"
+                          {:type :scriptum/invalid-generation-publication-hold
+                           :lifecycle @lifecycle})))
+        (when-not (compare-and-set! publication-hold-transferred? false true)
+          (throw (ex-info "scriptum: generation publication hold was already transferred"
+                          {:type :scriptum/generation-publication-hold-transferred
+                           :address address})))
+        (let [token @guard-token]
+          (when-not token
+            (throw (ex-info "scriptum: sealed generation has no publication guard"
+                            {:type :scriptum/missing-generation-publication-guard
+                             :address address})))
+          (reset! guard-token nil)
+          (->GenerationPublicationHold store-id token address
+                                       (atom false) (atom nil)))))))
+
+(defn- complete-generation-publication!
+  [^GenerationPublicationHold hold completion]
+  (locking hold
+    (when-not @(:completed? hold)
+      (guard/done! (:store-id hold) (:guard-token hold))
+      (reset! (:outcome hold) completion)
+      (reset! (:completed? hold) true)))
+  hold)
+
+(defn root-generation-publication!
+  "Complete a transferred hold after the owner root durably names its address."
+  [hold]
+  (complete-generation-publication! hold :committed))
+
+(defn abort-generation-publication!
+  "Complete a transferred hold after publication is definitively aborted."
+  [hold]
+  (complete-generation-publication! hold :aborted))
+
 (defn verify-commit
   "Verify the cryptographic integrity of a commit by recomputing its merkle hash.
 
@@ -668,6 +1054,54 @@
     (.flush writer)))
 
 ;; --- Query Builders ---
+
+(defn term-query
+  "Build an analyzer-free exact query for one indexed term.
+
+  This is the query counterpart of a `:string` (`StringField`) value: the term
+  is used exactly as supplied, with no tokenization, stemming, case folding or
+  stop-word removal. It is therefore suitable for already-normalized tokens
+  such as PostgreSQL lexemes. It is not a shortcut for querying `:text`
+  (`TextField`) values; callers of analyzed fields should use `text-query`.
+
+  The query is constant-score deliberately. Scriptum still exposes Lucene's
+  score in search results and candidate continuations, because `searchAfter`
+  needs the complete sort cursor, but that score has no semantic meaning here:
+  it is neither PostgreSQL text-search rank nor evidence of a better match."
+  [field term]
+  (ConstantScoreQuery.
+   (TermQuery. (Term. (name field) (str term)))))
+
+(defn terms-query
+  "Build an analyzer-free exact query matching any value in `values`.
+
+  This is the set counterpart of `term-query`, intended for `:string`
+  (`StringField`) values. Lucene builds one automaton-backed query rather than
+  one Boolean clause per value, so this also avoids `BooleanQuery`'s clause
+  limit. It is useful for intersecting a full-text candidate scan with a set of
+  externally selected document identities before collection. Empty input is a
+  valid query matching no documents. Like `term-query`, the result is constant
+  score; application-visible ranking remains the caller's responsibility."
+  [field values]
+  (TermInSetQuery.
+   (name field)
+   (mapv #(BytesRef. (str %)) values)))
+
+(defn prefix-query
+  "Build an analyzer-free prefix query over indexed terms.
+
+  Like `term-query`, this is intended for `:string` (`StringField`) values and
+  already-normalized tokens. `prefix` is matched byte-for-byte at the start of
+  each complete indexed term; no analyzer runs and case is preserved. A
+  multi-valued StringField document is returned once when one or more of its
+  values match.
+
+  The constant Lucene score is intentionally non-semantic. It exists in
+  candidate pages only as part of the immutable `searchAfter` cursor; callers
+  implementing PostgreSQL ranking must compute that rank themselves."
+  [field prefix]
+  (ConstantScoreQuery.
+   (PrefixQuery. (Term. (name field) (str prefix)))))
 
 (defn text-query
   "Parse a text query string against a single field using the given analyzer.
@@ -839,21 +1273,39 @@
   "Open the immutable konserve index state named by `address`.
 
   Unlike `open-store-index`, this does not resolve or create a branch and never
-  opens an IndexWriter. The returned Closeable owns a read-only Directory and
-  DirectoryReader pinned to the exact snapshot address. Branch commits made
-  after this call cannot change what it sees.
+  opens an IndexWriter. The returned Closeable owns one logical lease on a
+  read-only Directory and DirectoryReader pinned to the exact snapshot address.
+  Opens of the same store/cache/address share that physical resource safely;
+  it closes after the last lease. Branch commits cannot change what it sees.
 
   The caller must keep `address` in the `extra-snapshots` root set passed to
   `scriptum.konserve/gc!` for as long as the handle may need to be reopened.
   An already-open reader remains usable from its materialized files, but an
   unrooted snapshot is intentionally eligible for durable collection."
   ^StoreSnapshot [store ^String cache address]
-  (let [^Directory directory (sk/snapshot-directory store cache address)]
-    (try
-      (->StoreSnapshot address directory (DirectoryReader/open directory))
-      (catch Throwable t
-        (.close directory)
-        (throw t)))))
+  (snapshot-lease (acquire-snapshot-resource! store cache address) address))
+
+(defn retain-store-snapshot
+  "Return an independent closeable lease on the same immutable snapshot.
+
+  The physical Directory and DirectoryReader remain open until every retained
+  lease closes. This is the operation immutable DB wrappers use when preparation
+  returns a new wrapper over an unchanged generation: sharing the same
+  StoreSnapshot object gives two owners one close bit and lets either invalidate
+  the other. A Cleaner releases an abandoned logical lease eventually, but
+  callers should close explicitly for deterministic cache/resource reclamation."
+  ^StoreSnapshot [^StoreSnapshot snapshot]
+  (let [resource (:resource snapshot)]
+    (locking snapshot-resource-lock
+      (when @(:closed? snapshot)
+        (throw (ex-info "scriptum: cannot retain a closed snapshot lease"
+                        {:snapshot-address (:snapshot-address snapshot)})))
+      (let [resources (.get snapshot-resources (:store resource))]
+        (when-not (identical? resource (get resources (:resource-key resource)))
+          (throw (ex-info "scriptum: snapshot resource is no longer registered"
+                          {:snapshot-address (:snapshot-address snapshot)})))
+        (swap! (:refs resource) inc)))
+    (snapshot-lease resource (:snapshot-address snapshot))))
 
 (defn search-store-snapshot
   "Search an immutable `StoreSnapshot`, returning the same result vector as
@@ -869,14 +1321,27 @@
          top-docs (.search searcher (->query reader query) (int limit))]
      (hits->results searcher (.-scoreDocs top-docs) fields))))
 
+(defn count-store-snapshot
+  "Return the exact number of documents matching `query` in an immutable
+  `StoreSnapshot` without materializing hits.
+
+  This is the selectivity primitive for callers choosing between an inverted
+  index and a primary scan.  It uses the snapshot's already-open reader, so the
+  estimate names exactly the same generation as a subsequent candidate scan."
+  [^StoreSnapshot snapshot query]
+  (let [^DirectoryReader reader (:reader snapshot)
+        searcher (IndexSearcher. reader)]
+    (.count searcher (->query reader query))))
+
 (defn candidate-page
-  "Return one resumable page of scored candidates from an immutable snapshot.
+  "Return one resumable page of candidates from an immutable snapshot.
 
   The envelope is stable for the lifetime of the snapshot:
 
     {:snapshot-address <address>
      :candidates         [{:doc-id n :score f ...stored fields...} ...]
-     :continuation       {:version 1 :snapshot-address <address>
+     :continuation       {:version 3 :snapshot-address <address>
+                          :query <lucene-query>
                           :doc-id n :score f} ; nil when exhausted
      :exhausted?         boolean
      :ordering           :score-desc-doc-id-asc}
@@ -887,46 +1352,76 @@
   the ordering, so callers can keep requesting pages until `:exhausted?`
   without imposing a fixed top-N cutoff.
 
+  `:score` and the score-first `:ordering` describe Lucene's paging cursor,
+  not application semantics. In particular, the analyzer-free `term-query`
+  and `prefix-query` builders use constant scores. A PostgreSQL adapter must
+  recheck candidates and compute `ts_rank` or any other user-visible rank from
+  PostgreSQL semantics rather than interpreting this score.
+
   Options:
     :page-size - positive number of candidates to return (default 100)
     :after     - continuation from the preceding page, or nil
     :fields    - stored fields to include (default all)
     :query-id  - optional caller-supplied stable query fingerprint
+    :order     - :score (default) or :doc-id
 
-  When `:query-id` is supplied it is copied into the continuation and checked
-  on resume. Scriptum cannot derive it reliably: arbitrary Lucene Query objects
-  have no canonical serialization. An adapter with a canonical query form
-  (such as PostgreSQL's normalized tsquery) should provide its own fingerprint;
-  without one, changing the query between pages remains a caller error."
+  `:doc-id` uses Lucene's exact index order without computing scores. It is the
+  cheaper collector for callers that need a complete candidate set and apply
+  their own authoritative predicate/ranking afterwards. Its continuation is
+  still snapshot- and query-bound, but its candidates have NaN `:score` values
+  because no score was computed. Index order is stable only within the named
+  immutable snapshot; never carry this ordering across generations.
+
+  The opaque continuation stores Lucene's normalized Query and checks its
+  structural equality on resume. This makes changing the actual query between
+  pages an error even when `:query-id` is omitted or accidentally reused.
+  `:query-id` remains useful as an adapter-owned semantic fingerprint in
+  addition to that structural check; it is copied into the continuation and
+  checked on resume."
   ([snapshot query]
    (candidate-page snapshot query {}))
-  ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id]
-                                   :or {page-size 100}}]
+  ([^StoreSnapshot snapshot query {:keys [page-size after fields query-id order]
+                                   :or {page-size 100 order :score}}]
    (when-not (and (integer? page-size)
                   (pos? page-size)
                   (< page-size Integer/MAX_VALUE))
      (throw (ex-info "scriptum: page-size must be a positive integer below Integer/MAX_VALUE"
                      {:page-size page-size})))
-   (let [address (:snapshot-address snapshot)]
+   (when-not (contains? #{:score :doc-id} order)
+     (throw (ex-info "scriptum: candidate order must be :score or :doc-id"
+                     {:order order})))
+   (let [address (:snapshot-address snapshot)
+         ^DirectoryReader reader (:reader snapshot)
+         searcher (IndexSearcher. reader)
+         q (->query reader query)]
      (when (and after
-                (or (not= 1 (:version after))
+                (or (not= (if (= :doc-id order) 4 3) (:version after))
                     (not= address (:snapshot-address after))
                     (not= query-id (:query-id after))
+                    (not= q (:query after))
                     (not (integer? (:doc-id after)))
-                    (not (number? (:score after)))))
+                    (if (= :doc-id order)
+                      (not= :doc-id (:order after))
+                      (not (number? (:score after))))))
        (throw (ex-info "scriptum: continuation does not belong to this snapshot/query"
-                       {:snapshot-address address
+                       {:type :scriptum/continuation-mismatch
+                        :snapshot-address address
                         :query-id query-id
+                        :order order
                         :continuation after})))
-     (let [^DirectoryReader reader (:reader snapshot)
-           searcher (IndexSearcher. reader)
-           q (->query reader query)
-           ^ScoreDoc after-doc (when after
-                                 (ScoreDoc. (int (:doc-id after))
-                                            (float (:score after))))
+     (let [^ScoreDoc after-doc (when after
+                                 (if (= :doc-id order)
+                                   (FieldDoc. (int (:doc-id after)) Float/NaN
+                                              (object-array
+                                               [(int (:doc-id after))]))
+                                   (ScoreDoc. (int (:doc-id after))
+                                              (float (:score after)))))
            ;; Ask for one extra candidate so exhaustion is exact even when the
            ;; remaining hit count is exactly one full page.
-           top-docs (.searchAfter searcher after-doc q (int (inc page-size)))
+           top-docs (if (= :doc-id order)
+                      (.searchAfter searcher after-doc q (int (inc page-size))
+                                    Sort/INDEXORDER false)
+                      (.searchAfter searcher after-doc q (int (inc page-size))))
            score-docs (vec (.-scoreDocs top-docs))
            more? (> (count score-docs) page-size)
            page-hits (if more? (subvec score-docs 0 page-size) score-docs)
@@ -935,13 +1430,19 @@
        {:snapshot-address address
         :candidates candidates
         :continuation (when more?
-                        {:version 1
-                         :snapshot-address address
-                         :query-id query-id
-                         :doc-id (.-doc ^ScoreDoc last-hit)
-                         :score (.-score ^ScoreDoc last-hit)})
+                        (cond->
+                         {:version (if (= :doc-id order) 4 3)
+                          :snapshot-address address
+                          :query-id query-id
+                          :query q
+                          :doc-id (.-doc ^ScoreDoc last-hit)}
+                          (= :doc-id order) (assoc :order :doc-id)
+                          (= :score order)
+                          (assoc :score (.-score ^ScoreDoc last-hit))))
         :exhausted? (not more?)
-        :ordering :score-desc-doc-id-asc}))))
+        :ordering (if (= :doc-id order)
+                    :doc-id-asc
+                    :score-desc-doc-id-asc)}))))
 
 ;; --- Snapshots & Time-Travel ---
 
@@ -1186,15 +1687,25 @@
 (defn close!
   "Close a branch writer and its resources."
   [sw]
-  (let [^BranchIndexWriter writer (->writer sw)
-        mi (->metadata-index sw)]
-    (when mi
-      (metadata/close-index! mi))
-    ;; ONE close. `BranchIndexWriter.close` closes the Directory it was given —
-    ;; `createOver`'s javadoc used to claim the caller owned it, and closing it
-    ;; again here on that basis threw AlreadyClosedException on any Directory
-    ;; that reports being closed.
-    (.close writer)))
+  (if (generation? sw)
+    (let [{:keys [status]} @(get-in sw [:backing :lifecycle])
+          transferred? @(get-in sw [:backing :publication-hold-transferred?])]
+      ;; Closing an unsealed private generation must never invoke Lucene's
+      ;; commit-on-close. A sealed one has already closed its writer and only
+      ;; retains the publication guard.
+      (cond
+        transferred? (do (cleanup-generation-workspace! sw) nil)
+        (= :open status) (abort-generation! sw)
+        :else (release-generation! sw)))
+    (let [^BranchIndexWriter writer (->writer sw)
+          mi (->metadata-index sw)]
+      (when mi
+        (metadata/close-index! mi))
+      ;; ONE close. `BranchIndexWriter.close` closes the Directory it was given —
+      ;; `createOver`'s javadoc used to claim the caller owned it, and closing it
+      ;; again here on that basis threw AlreadyClosedException on any Directory
+      ;; that reports being closed.
+      (.close writer))))
 
 (defn abort!
   "Discard uncommitted changes and close a writer without publishing them.
@@ -1205,12 +1716,14 @@
   without a `syncMetaData` flip, so the branch manifest remains at its last
   successful commit. The writer must not be used afterwards."
   [sw]
-  (let [^BranchIndexWriter writer (->writer sw)
-        mi (->metadata-index sw)]
-    ;; Rollback is the load-bearing action: a metadata close failure must not
-    ;; leave a commit-on-close writer alive for later accidental publication.
-    (try
-      (.rollback writer)
-      (finally
-        (when mi
-          (metadata/close-index! mi))))))
+  (if (generation? sw)
+    (abort-generation! sw)
+    (let [^BranchIndexWriter writer (->writer sw)
+          mi (->metadata-index sw)]
+      ;; Rollback is the load-bearing action: a metadata close failure must not
+      ;; leave a commit-on-close writer alive for later accidental publication.
+      (try
+        (.rollback writer)
+        (finally
+          (when mi
+            (metadata/close-index! mi)))))))

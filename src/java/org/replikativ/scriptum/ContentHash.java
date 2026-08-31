@@ -72,14 +72,30 @@ public class ContentHash {
    * @throws IOException if file cannot be read
    */
   public static UUID hashFile(Path filePath) throws IOException {
+    try (java.io.InputStream in = Files.newInputStream(filePath)) {
+      return hashInputStream(in);
+    }
+  }
+
+  /**
+   * Hash an input stream's remaining bytes to UUID5, using bounded memory.
+   *
+   * <p>The stream is NOT closed. This makes the method safe inside a storage API's streaming
+   * callback, where the provider owns the stream lifecycle. It is also the immutable-object audit
+   * counterpart to {@link #hashFile}: a remote blob can be verified without first materializing it
+   * in a local cache or allocating an array the size of the segment.
+   *
+   * @param in stream positioned at the first byte to hash
+   * @return UUID5 of all remaining bytes
+   * @throws IOException if the stream cannot be read
+   */
+  public static UUID hashInputStream(java.io.InputStream in) throws IOException {
     try {
       MessageDigest md = MessageDigest.getInstance("SHA-512");
-      try (java.io.InputStream in = Files.newInputStream(filePath)) {
-        byte[] buf = new byte[HASH_BUFFER_SIZE];
-        int n;
-        while ((n = in.read(buf)) != -1) {
-          md.update(buf, 0, n);
-        }
+      byte[] buf = new byte[HASH_BUFFER_SIZE];
+      int n;
+      while ((n = in.read(buf)) != -1) {
+        md.update(buf, 0, n);
       }
       return bytesToUUID5(md.digest());
     } catch (NoSuchAlgorithmException e) {

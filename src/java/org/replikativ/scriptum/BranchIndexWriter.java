@@ -321,7 +321,33 @@ public class BranchIndexWriter implements Closeable {
    */
   public static BranchIndexWriter createOver(Directory directory, String branchName, Analyzer analyzer)
       throws IOException {
-    BranchDeletionPolicy deletionPolicy = new BranchDeletionPolicy();
+    return createOver(directory, branchName, analyzer, new BranchDeletionPolicy());
+  }
+
+  /**
+   * Open a writer for a detached immutable generation.
+   *
+   * <p>Unlike {@link #createOver}, this keeps only the latest Lucene commit point. The external
+   * embedder owns history through immutable snapshot addresses, so retaining old {@code
+   * segments_N} files in every derived generation would duplicate that history and keep it live
+   * after the external roots dropped it.
+   *
+   * @param directory the private detached Directory; this writer closes it
+   * @param logicalName a diagnostic name, never a mutable Scriptum branch
+   * @param analyzer analyzer for this generation
+   * @return a latest-only writer with no base path
+   */
+  public static BranchIndexWriter createDetachedOver(
+      Directory directory, String logicalName, Analyzer analyzer) throws IOException {
+    return createOver(directory, logicalName, analyzer, new LatestOnlyBranchDeletionPolicy());
+  }
+
+  private static BranchIndexWriter createOver(
+      Directory directory,
+      String branchName,
+      Analyzer analyzer,
+      BranchDeletionPolicy deletionPolicy)
+      throws IOException {
     BranchAwareMergePolicy mergePolicy =
         new BranchAwareMergePolicy(new org.apache.lucene.index.TieredMergePolicy());
 

@@ -30,7 +30,7 @@
 (defn- delete-dir-recursive [path]
   (let [d (java.io.File. ^String path)]
     (when (.exists d)
-      (doseq [f (reverse (file-seq d))]
+      (doseq [^java.io.File f (reverse (file-seq d))]
         (.delete f)))))
 
 (defn- bootstrap-clean
