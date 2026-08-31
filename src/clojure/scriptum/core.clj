@@ -623,6 +623,16 @@
 
 ;; --- Document Operations ---
 
+(defn add-document
+  "Add a pre-built Lucene document or other iterable of IndexableField values.
+
+   This is the allocation-conscious integration path for callers with a fixed
+   schema. `add-doc` remains the convenient data-driven map API. Keeping this
+   operation here avoids exposing BranchIndexWriter as part of an adapter's
+   mutation protocol."
+  [sw doc]
+  (.addDocument ^BranchIndexWriter (->writer sw) doc))
+
 (defn add-doc
   "Add a document to the branch.
 
