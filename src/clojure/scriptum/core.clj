@@ -24,7 +24,7 @@
             KnnFloatVectorField]
            [org.apache.lucene.index DirectoryReader IndexableField Term
             VectorSimilarityFunction]
-           [org.apache.lucene.search IndexSearcher TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
+           [org.apache.lucene.search IndexSearcher Query TermQuery TermInSetQuery PrefixQuery ConstantScoreQuery BooleanQuery
             BooleanQuery$Builder BooleanClause$Occur TopDocs ScoreDoc
             FieldDoc Sort MatchAllDocsQuery KnnFloatVectorQuery]
            [org.apache.lucene.queryparser.classic QueryParser MultiFieldQueryParser]
@@ -749,6 +749,16 @@
   [sw ^String field ^String value]
   (let [^BranchIndexWriter writer (->writer sw)]
     (.deleteDocuments writer (into-array Term [(Term. field value)]))))
+
+(defn delete-query
+  "Delete documents matching a pre-built Lucene query.
+
+   This is the typed counterpart to `delete-docs`: integrations using numeric,
+   point, or other non-Term fields can keep their native representation without
+   reaching through Scriptum to its BranchIndexWriter."
+  [sw ^Query query]
+  (let [^BranchIndexWriter writer (->writer sw)]
+    (.deleteDocuments writer (into-array Query [query]))))
 
 (defn update-doc
   "Update a document identified by the given term.
