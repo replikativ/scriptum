@@ -169,6 +169,7 @@ workflows:
             - build-and-test
             - format
             - build
+            - backward-compatibility
       - release:
           context:
             - github-token
